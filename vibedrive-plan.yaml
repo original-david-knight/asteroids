@@ -1,0 +1,715 @@
+project:
+  name: asteroids-vector-museum
+  objective: Build a faithful single-player 1979 Atari Asteroids clone in Rust that simulates a vector display (beam, phosphor, bloom) and synthesizes its audio in real time, run as a native Linux binary on the user's machine with no distribution surface.
+  source_docs:
+    - DESIGN.md
+    - IDEA.md
+    - PLAN.md
+  constraint_files:
+    - DESIGN.md
+    - PLAN.md
+tasks:
+  - id: capability-probe
+    title: Throwaway capability probe binary
+    details: |
+      Validate every assumption from DESIGN.md (Display & Timing Model, Audio Realtime Contract) and PLAN.md step 0 before committing to architecture.
+      Build the probe in its own subdirectory (capability_probe/) as a standalone Cargo project so it stays throwaway and does not pollute the main crate.
+      The probe must be a one-shot non-interactive binary: it opens the window, runs one display frame and one audio block to capture measurements, writes capability_probe/PROBE_NOTES.md, and exits with status 0 on success (or non-zero if a hard required assumption like Rgba16Float is missing). This is required so cargo run can be invoked from automation without hanging.
+      Measurements to capture and record:
+        - Monitor refresh rate and physical resolution (HiDPI scale).
+        - wgpu surface formats with explicit Rgba16Float availability check and Rgba8Unorm fallback noted.
+        - GPU time for a single 4K full-screen blit so the post-processing budget at 144Hz is measured rather than assumed (covers the reviewer concern about 4K @ 144Hz GPU budget).
+        - cpal default output actual block size and sample rate (target 256 samples @ 48kHz) and which backend was selected (PipeWire vs ALSA - covers that reviewer concern).
+        - SCHED_FIFO promotion via rtkit DBus result (acceptable degradation if unavailable, per DESIGN.md).
+        - On Hyprland (Wayland), borderless fullscreen vsync/tearing behavior so the X11 fallback decision is made from real measurement (covers the Hyprland reviewer concern).
+      Anything the probe finds wrong (e.g. PipeWire absent, Rgba16Float not advertised, vsync broken on the user's compositor) must be recorded so the next task can choose the right paths instead of guessing.
+    workflow: implement
+    status: todo
+    deps: []
+    context_files:
+      - DESIGN.md
+      - PLAN.md
+    acceptance:
+      - 'capability_probe/ contains a standalone Cargo project that compiles and runs as a one-shot non-interactive binary that exits cleanly after capturing measurements.'
+      - 'Probe writes capability_probe/PROBE_NOTES.md containing: monitor refresh rate, supported surface formats with Rgba16Float verified or Rgba8Unorm fallback noted, 4K full-screen blit GPU time, cpal default block size + sample rate + backend (PipeWire vs ALSA), SCHED_FIFO outcome, and Hyprland borderless fullscreen vsync result.'
+      - Reviewer concerns from PLAN.md about PipeWire vs ALSA selection, Hyprland Wayland fallback, and 4K @ 144Hz post-processing GPU budget each have an explicit measured answer in PROBE_NOTES.md.
+      - Probe exit code reflects whether hard required assumptions (Rgba16Float availability, vsync behavior on the user's compositor) hold.
+      - Manual verification (the user confirms the window appeared and the probe terminated) - call this out in notes since fullscreen window appearance is not automatable.
+      - Record short notes capturing what was learned in this phase, including any measured value that should change architecture choices in the main crate if the project is re-planned and rerun in a fresh environment.
+    verify_commands:
+      - cargo build --manifest-path capability_probe/Cargo.toml
+      - cargo run --manifest-path capability_probe/Cargo.toml
+    commit_message: Add throwaway capability probe to validate display, GPU, and audio assumptions
+
+  - id: project-skeleton
+    title: Initialize main Rust crate with fullscreen window and audio module shape
+    details: |
+      Per PLAN.md step 1 and DESIGN.md premise 6, this task lays down the project skeleton with the audio module shape pre-built so step 8 is wiring, not design.
+      Initialize the main crate at the repo root. The repo root already contains DESIGN.md, IDEA.md, PLAN.md, vibedrive.yaml, and vibedrive-plan.yaml. cargo init runs on non-empty directories without overwriting docs, so use `cargo init --name asteroids --vcs none --bin` (or equivalent) and verify the doc files are untouched.
+      Add dependencies: wgpu, winit, cpal, fundsp, ringbuf, bytemuck, pollster. Pin to current stable releases compatible with Rust 1.90.
+      Open a borderless fullscreen black window with vsync enabled per DESIGN.md Display & Timing Model (no exclusive fullscreen - modern monitors do not need it for tearing avoidance with vsync). Render at native physical resolution; respect HiDPI scale; explicitly no supersampling for v1 (DESIGN.md Display & Timing Model).
+      Use the display server choice informed by capability_probe/PROBE_NOTES.md: X11 first; if Hyprland Wayland borderless fullscreen behaves correctly per the probe, no fallback needed. Esc closes the window and the process exits cleanly.
+      Carve out the audio module shape now even though it is not wired (DESIGN.md premise 6 - architecture from day 0, wiring at step 8):
+        - Define an AudioMsg enum matching DESIGN.md Audio Realtime Contract: SetParam(VoiceId, ParamId, f32), Trigger(VoiceId), Release(VoiceId), GameState(GameSnapshot).
+        - Define VoiceId, ParamId, and a GameSnapshot POD (asteroid count, alive flag, score).
+        - Stand up a lockfree ringbuffer (ringbuf crate) of capacity 1024 messages from the game thread to the audio side, with try-push that drops oldest non-critical SetParam messages but preserves Trigger/Release.
+        - Sketch a Voice trait or struct family that pre-allocates DSP nodes once at app startup and exposes parameter mutation through AtomicF32 cells (no allocation in the audio callback).
+        - Leave a placeholder cpal stream creation behind a feature flag or function that the audio-scaffolding task wires for real.
+      Constraint reminder: the project is single-player only; no alternating 2-player even for v2 per DESIGN.md Constraints. Do not introduce 2-player abstractions.
+    workflow: implement
+    status: todo
+    deps:
+      - capability-probe
+    context_files:
+      - DESIGN.md
+      - PLAN.md
+      - capability_probe/PROBE_NOTES.md
+    acceptance:
+      - 'Cargo.toml lists wgpu, winit, cpal, fundsp, ringbuf, bytemuck, and pollster with versions compatible with Rust 1.90 stable.'
+      - DESIGN.md, IDEA.md, PLAN.md, vibedrive.yaml, vibedrive-plan.yaml, and capability_probe/ are all preserved unchanged after cargo init.
+      - 'Manual verification: cargo run opens a borderless fullscreen black window at native physical resolution with vsync on (no exclusive fullscreen), and Esc exits cleanly with status 0. Note the verification was done because window appearance is not automatable.'
+      - 'The audio module exists with: AudioMsg enum (SetParam/Trigger/Release/GameState), VoiceId, ParamId, GameSnapshot POD, a lockfree ringbuf channel of capacity 1024 with the documented drop-oldest-SetParam policy, and a Voice abstraction that pre-allocates DSP nodes and uses AtomicF32 for parameter mutation.'
+      - cpal is added as a dependency but no audio thread is spawned yet; the spawn entry point is gated until the audio-scaffolding task wires it.
+      - Display-server choice (X11 vs Wayland borderless) reflects the probe finding from PROBE_NOTES.md.
+      - Single-player constraint is preserved (no 2-player abstractions introduced).
+      - Record short notes capturing what was learned in this phase, including dependency version pins, Wayland/X11 result, and any platform quirks that would matter if the project is re-planned and rerun in a fresh environment.
+    verify_commands:
+      - cargo build
+      - cargo clippy --all-targets -- -D warnings
+    commit_message: Initialize asteroids crate with fullscreen window and audio module shape
+
+  - id: hello-triangle
+    title: Render a hello triangle through the wgpu pipeline
+    details: |
+      Per PLAN.md step 2, prove the wgpu render pipeline end-to-end with a throwaway triangle.
+      Create a render pipeline with a vertex/fragment shader pair, a vertex buffer, and a single draw call into the swap-chain.
+      Keep the triangle behind a debug feature flag or simply remove it once the next step starts replacing it with real beam-emission rendering.
+    workflow: implement
+    status: todo
+    deps:
+      - project-skeleton
+    context_files:
+      - DESIGN.md
+      - PLAN.md
+    acceptance:
+      - The triangle pipeline uses the same swap-chain format selected for the main app (informed by the probe and project-skeleton).
+      - Code is structured so the triangle can be deleted in the beam-emit-api task without leaving cruft.
+      - 'Manual verification: cargo run shows a clearly visible triangle on the black background. Note this is manual because the rendered output is not automatable from the verify gate.'
+      - Record short notes capturing what was learned in this phase, including wgpu pipeline gotchas (bind groups, vertex layout, surface format selection) that matter for future render passes.
+    verify_commands:
+      - cargo build
+      - cargo clippy --all-targets -- -D warnings
+    commit_message: Render hello triangle through the wgpu render pipeline
+
+  - id: beam-emit-api
+    title: Beam-emission API and per-frame line segment vertex buffer
+    details: |
+      Per PLAN.md step 3 and DESIGN.md Beam Rasterizer Spec, define the beam-draw command type and the per-frame upload path.
+      Define BeamCommand with fields start (Vec2), end (Vec2), intensity (f32, normalized 0..1), and dwell_us (f32). Document that dwell_us is set per-segment by the emitter (no virtual beam-rate model in v1).
+      Implement default dwell rules as named constants in one tunable module: ship outline segment 30us, asteroid hull segment 25us, bullet dot 40us, endpoint dwell bonus ~10us.
+      Each frame: collect a Vec<BeamCommand>, expand each command into a small quad (two triangles) bounding the segment, and upload to a wgpu vertex buffer (re-used across frames; resize as needed).
+      Replace the hello triangle pipeline with this beam-line pipeline. At this step the fragment shader can be a simple solid-white pass; the next task introduces the analytic line SDF and dwell coupling.
+      Add a minimal unit test for the quad-expansion math (perpendicular vector direction, half-width offset) so the geometry is locked in before adding shader complexity on top.
+    workflow: implement
+    status: todo
+    deps:
+      - hello-triangle
+    context_files:
+      - DESIGN.md
+      - PLAN.md
+    acceptance:
+      - 'Rust types: BeamCommand and a builder/emitter API exist with the documented fields and per-segment dwell.'
+      - Default dwell constants for ship segments (30us), asteroid hull (25us), bullet dot (40us), endpoint bonus (~10us) are named constants in one tunable module.
+      - Per-frame Vec<BeamCommand> is uploaded into a wgpu vertex buffer of expanded quads and rendered with a placeholder white-line pass, replacing the hello triangle.
+      - Unit test for quad-expansion math passes (perpendicular direction and half-width offset are correct for axis-aligned and diagonal segments).
+      - 'Manual verification: cargo run shows a handful of test beam commands (e.g. an X across the screen) drawn as white lines.'
+      - Record short notes capturing what was learned in this phase, including buffer resize strategy and any decisions about quad-expansion math.
+    verify_commands:
+      - cargo build
+      - cargo clippy --all-targets -- -D warnings
+      - cargo test --quiet
+    commit_message: Add BeamCommand emission API and per-frame line segment vertex buffer
+
+  - id: phosphor-accumulator
+    title: Phosphor accumulator with Rgba16Float ping-pong textures
+    details: |
+      Per PLAN.md step 4 and DESIGN.md Beam Rasterizer Spec, implement the magic-milestone phosphor accumulator.
+      Create two Rgba16Float textures matching the native render resolution and ping-pong them per frame. No supersampling for v1 (DESIGN.md Display & Timing Model).
+      Render-pass order each frame:
+        1. Draw current beam commands into the target phosphor texture using the analytic line SDF in the fragment shader.
+           - 'Per-pixel brightness: intensity * dwell_factor * exp(-distance^2 / sigma^2), where sigma is the beam-spot radius (~1.0 physical pixel) and slow beam (high dwell) increases sigma slightly to bloom the spot when stationary.'
+        2. Blend with the previous frame's phosphor texture using exponential decay: out = clamp(in_beam + in_previous * exp(-frame_dt / tau), 0, MAX_LUMA), with MAX_LUMA = 8.0 (HDR-like headroom).
+        3. Tone-map at composite using Reinhard x / (x + 1) followed by gamma 2.2 before writing to the swap chain.
+      Default tau = 70ms. Expose tau as a debug F-key slider so it can be tuned with the renderer running (also covers DESIGN.md Open Question 3 about persistence-of-vision target).
+      With hard white lines and beam-driven dwell coupling, the trail effect must be visible at this step.
+      If Rgba16Float was not supported per the probe, fall back to Rgba8Unorm with reduced MAX_LUMA and document the loss in notes.
+    workflow: implement
+    status: todo
+    deps:
+      - beam-emit-api
+    context_files:
+      - DESIGN.md
+      - PLAN.md
+      - capability_probe/PROBE_NOTES.md
+    acceptance:
+      - Two Rgba16Float ping-pong textures (or Rgba8Unorm fallback if probe required it) are allocated at native render resolution and bound correctly in the per-frame render graph.
+      - Fragment shader implements the analytic line SDF with the documented brightness formula and dwell-coupled sigma growth.
+      - Phosphor blend pass implements exponential decay with MAX_LUMA = 8.0 and tau default 70ms.
+      - Composite pass applies Reinhard tone-map and gamma 2.2 to the swap-chain output.
+      - A debug F-key slider lets tau be changed live in the 50-100ms range without recompiling.
+      - 'Manual verification: cargo run with moving test beam commands produces a visible phosphor trail (the magic-milestone effect).'
+      - Record short notes capturing what was learned in this phase, including any wgpu binding-group surprises, sigma tuning notes, and any fallback to Rgba8Unorm if it was needed.
+    verify_commands:
+      - cargo build
+      - cargo clippy --all-targets -- -D warnings
+      - cargo test --quiet
+    commit_message: Add phosphor accumulator with Rgba16Float ping-pong textures
+
+  - id: checkpoint-phosphor-trail
+    title: Checkpoint - phosphor trail effect is real
+    details: |
+      Verification gate before adding bloom on top of phosphor.
+      Sit with the renderer running and confirm the trail effect actually feels like a vector display (not just a frame-blend smear).
+      Tune tau live with the F-key slider and pick a default in the 50-100ms range that looks like persistence-of-vision rather than motion blur.
+      If the effect is wrong (sigma too small, decay misshapen, MAX_LUMA causing clipping), loop back to phosphor-accumulator before continuing. PLAN.md is explicit that this is a "the magic is real" gate, not a "it works" gate.
+    workflow: checkpoint
+    status: todo
+    deps:
+      - phosphor-accumulator
+    context_files:
+      - DESIGN.md
+      - PLAN.md
+    acceptance:
+      - 'Manual verification: cargo run --release produces a visible phosphor trail behind moving test segments that subjectively reads as vector phosphor (not raster blur).'
+      - tau default chosen in the 50-100ms range and recorded in code as the new default constant.
+      - 'Lines drawn at varying dwell_us values show clearly different brightness and faint sigma growth at high dwell (verifies the dwell-coupling model).'
+      - Reviewer or the user confirms the effect before continuing; if subjective gate fails, document the gap and loop back to phosphor-accumulator instead of moving on.
+      - Record short notes capturing what was learned in this phase, including the tau value chosen, sigma tuning observations, and any Open Question 3 decision impact.
+    verify_commands:
+      - cargo build --release
+      - cargo clippy --all-targets -- -D warnings
+      - cargo test --quiet
+    commit_message: Checkpoint phosphor trail magic milestone
+
+  - id: bloom-pass
+    title: Bloom pass via Gaussian downsample-upsample chain
+    details: |
+      Per PLAN.md step 5, add a bloom pass on top of the phosphor texture so the lines start to glow.
+      Implement a Gaussian downsample chain (e.g. 4 mip levels via successive blits) followed by an upsample chain that accumulates back, written in WGSL.
+      Add the bloom output to the phosphor output before the composite tone-map step.
+      Expose bloom intensity and threshold as debug-tunable values (so the polish-pass step can dial them in).
+      Bloom strength must be subtle enough that vector lines still read as lines, not as smeared blobs - tune by feel and record the default values chosen.
+    workflow: implement
+    status: todo
+    deps:
+      - checkpoint-phosphor-trail
+    context_files:
+      - DESIGN.md
+      - PLAN.md
+    acceptance:
+      - WGSL shaders implement the Gaussian downsample and upsample passes with at least 3-4 mip levels.
+      - Bloom output is added to the phosphor texture in the render graph, ahead of the tone-map.
+      - Bloom intensity and threshold are tunable via debug controls or named constants.
+      - 'Manual verification: cargo run shows glow on a static white test line as visibly soft and gradual, not a hard edge.'
+      - Record short notes capturing what was learned in this phase, including default bloom intensity/threshold values and any Open Question 5 (CRT curvature) signal you noticed at this point.
+    verify_commands:
+      - cargo build
+      - cargo clippy --all-targets -- -D warnings
+      - cargo test --quiet
+    commit_message: Add Gaussian downsample-upsample bloom pass
+
+  - id: aspect-ratio-decision
+    title: Aspect-ratio strategy decision and implementation
+    details: |
+      DESIGN.md Open Question 1 and PLAN.md step 5 decision point - this decision must be made AFTER bloom is up so a real glowing line is on the user's actual monitor for reference, and BEFORE the spinning ship milestone.
+      Live options:
+        - (a) Letterbox the original 4:3 playfield with black bars on the sides.
+        - (b) Stretch the playfield to widescreen (more space, asteroids spread out, slightly easier game).
+        - (c) Keep gameplay 4:3 in the center, fill side margins with vector-art bezels (score + lives readouts only for v1; no cabinet art). Default lean per DESIGN.md.
+      Pick one option with the bloom + phosphor view as visual reference.
+      Implement the chosen mapping in the renderer: define a playfield rectangle in screen-space, build any required bezel beam commands for option (c), and route all subsequent gameplay beam commands through the playfield mapping.
+    workflow: implement
+    status: todo
+    deps:
+      - bloom-pass
+    context_files:
+      - DESIGN.md
+      - PLAN.md
+    acceptance:
+      - One of the three aspect-ratio options is selected with the chosen option recorded in code comments and notes, with a one-line rationale tied to the on-screen reference.
+      - Renderer maps gameplay coordinates into the chosen playfield rectangle, with letterbox bars or bezel margins drawn as needed.
+      - 'If option (c) is chosen, vector-art bezels for score and lives readouts are stubbed in (no cabinet art); other options leave that surface empty.'
+      - 'Subsequent beam emitters (ship, asteroids, bullets, UFO) will use the playfield-space coordinate transform installed here.'
+      - Record short notes capturing what was learned in this phase, including the chosen option, why it was chosen, and any margin/bezel tuning notes.
+    verify_commands:
+      - cargo build
+      - cargo clippy --all-targets -- -D warnings
+      - cargo test --quiet
+    commit_message: Decide and implement aspect-ratio strategy for widescreen playfield
+
+  - id: spinning-ship
+    title: One spinning ship - soul-visible milestone
+    details: |
+      Per PLAN.md step 6, this is the soul-visible milestone. Stop here and look at it before adding gameplay.
+      Define the original Asteroids 4-vertex (open triangular) ship outline and emit beam commands per frame to draw it.
+      Rotate the ship around its center on a simple frame-time clock (the full fixed-timestep simulation lands at game-loop-physics).
+      Watch the phosphor trail behind motion - this is the project's soul made visible.
+      DESIGN.md Open Question 2 (color: pure white-on-black vs warm phosphor green/amber tint) is decided here by feel; pick a default and note it.
+      DESIGN.md Premise 4 soft deadline: ~3-4 weekends to reach this milestone is a planning-time heuristic about expected breadth, not a measured fact. If bloom-and-phosphor work has overrun the budget, course-correct rather than scope-creep further; the deadline is an anti-rabbit-hole guard, not a shipping deadline. If you arrive here over-budget, capture the overrun in notes and consider what to descope rather than expanding.
+    workflow: implement
+    status: todo
+    deps:
+      - aspect-ratio-decision
+    context_files:
+      - DESIGN.md
+      - PLAN.md
+    acceptance:
+      - Ship outline beam commands use the dwell defaults from beam-emit-api and route through the playfield transform from aspect-ratio-decision.
+      - Color choice (pure white vs warm phosphor tint) is decided and recorded in code as the default beam color, with a short rationale (DESIGN.md Open Question 2).
+      - 'Manual verification: cargo run --release shows the original 4-vertex Asteroids ship outline rotating smoothly with a visibly trailing phosphor glow on the user''s monitor.'
+      - Soft-deadline check is acknowledged in notes - if the project arrived here over the 3-4 weekend planning estimate, list what would be descoped rather than expanded.
+      - Record short notes capturing what was learned in this phase, including the color choice, the soft-deadline status, and anything that would change if re-planned in a fresh environment.
+    verify_commands:
+      - cargo build --release
+      - cargo clippy --all-targets -- -D warnings
+      - cargo test --quiet
+    commit_message: Render spinning Asteroids ship outline with phosphor trail
+
+  - id: checkpoint-soul-visible
+    title: Checkpoint - soul of the project is visible
+    details: |
+      DESIGN.md Success Criteria gate - the spinning wireframe ship on a black background with phosphor glow that visibly trails behind motion must be present by this milestone.
+      Sit with the renderer for several minutes. Confirm the museum-piece illusion holds for the visual half of the project (audio comes later). If the illusion breaks, loop back to bloom-pass or phosphor-accumulator before continuing into the audio path.
+    workflow: checkpoint
+    status: todo
+    deps:
+      - spinning-ship
+    context_files:
+      - DESIGN.md
+      - PLAN.md
+    acceptance:
+      - 'Manual verification: cargo run --release verifies the first DESIGN.md success criterion ("Spinning wireframe ship on black background with phosphor glow that visibly trails behind motion").'
+      - The visual identity (color, glow falloff, trail length) is confirmed at the level the user wants to defend in screenshots later.
+      - If gates fail, follow-up loops back to the relevant earlier task instead of pressing on.
+      - Record short notes capturing what was learned in this phase, including any subjective tuning notes and any decisions to revisit during the polish-pass.
+    verify_commands:
+      - cargo build --release
+      - cargo clippy --all-targets -- -D warnings
+      - cargo test --quiet
+    commit_message: Checkpoint soul-visible spinning ship milestone
+
+  - id: final-composite
+    title: Final composite of phosphor + bloom into the swap-chain
+    details: |
+      Per PLAN.md step 7, finalize the composite path that combines phosphor and bloom into the swap-chain texture.
+      DESIGN.md Open Question 5 (CRT curvature) is decided here by deferral - vector tubes had little geometric distortion, so v1 explicitly skips curvature and ships without it. Leave a TODO comment in the composite shader about adding subtle curvature later only if reference photos warrant it.
+      Confirm tone-mapping, gamma, and bloom mix happen in the composite stage in the right order so colors are consistent across the gameplay.
+    workflow: implement
+    status: todo
+    deps:
+      - checkpoint-soul-visible
+    context_files:
+      - DESIGN.md
+      - PLAN.md
+    acceptance:
+      - Composite WGSL shader takes phosphor texture + bloom texture, applies Reinhard tone-map then gamma 2.2, and writes to the swap-chain.
+      - CRT curvature explicitly deferred per Open Question 5 with a clear comment in the composite shader explaining the reasoning.
+      - 'Manual verification: cargo run shows visual output is consistent and saturated correctly across the playfield with no visible banding.'
+      - Record short notes capturing what was learned in this phase, including final composite ordering and any future-curvature notes.
+    verify_commands:
+      - cargo build
+      - cargo clippy --all-targets -- -D warnings
+      - cargo test --quiet
+    commit_message: Finalize phosphor-bloom composite into swap-chain
+
+  - id: audio-scaffolding
+    title: Wire cpal output stream to the fundsp DSP graph
+    details: |
+      Per PLAN.md step 8 and DESIGN.md Audio Realtime Contract, wire cpal to the existing audio module shape created in project-skeleton. This is wiring, not designing.
+      Open the cpal default output stream (request 256 samples @ 48kHz; accept whatever the backend gives). Prefer PipeWire on modern Linux per the probe; fall back to ALSA direct.
+      Spawn the audio thread, attempt SCHED_FIFO via rtkit (DBus) at startup, log on failure and continue with default priority (acceptable for a personal-use binary; xruns will be visible).
+      Drain AudioMsg messages from the lockfree ringbuf at the start of each callback, applying SetParam writes to AtomicF32 cells; do not allocate in the callback.
+      Build the fundsp DSP graph once at startup with all voice nodes pre-allocated and run them block-size-agnostic against whatever buffer length cpal supplies.
+      At this step a silent (0.0 sample) graph is acceptable - the next task brings the first audible voice. Verify zero xruns under idle on the user's machine.
+      Constraint reminder: synthesis only, no sample WAVs (DESIGN.md Constraints). The cpal stream feeds samples computed by fundsp, never decoded from disk.
+      Input-latency target: the audio block is ~5.3ms @ 256/48kHz, contributing to the DESIGN.md "low input latency" constraint. Do not increase the block size beyond what the backend chooses.
+    workflow: implement
+    status: todo
+    deps:
+      - final-composite
+    context_files:
+      - DESIGN.md
+      - PLAN.md
+      - capability_probe/PROBE_NOTES.md
+    acceptance:
+      - cpal output stream opens at 48kHz with block size 256 (or whatever backend reports), confirmed at startup log.
+      - Audio thread attempts SCHED_FIFO via rtkit and logs the outcome; success is preferred but failure is acceptable degradation per DESIGN.md.
+      - The audio callback drains the ringbuf, applies SetParam writes through AtomicF32 cells, and emits samples through the fundsp graph with zero allocations in the callback.
+      - 'Voice graph is built once at app startup; parameter mutation goes through Var/shared (AtomicF32) cells per DESIGN.md Audio Realtime Contract.'
+      - Backend selection (PipeWire vs ALSA) reflects the probe finding and is logged at startup.
+      - No sample WAV files are loaded; the DSP graph is the only sample source.
+      - 'Manual verification: cargo run idle for ~1 minute reports zero xruns on the user''s machine.'
+      - Record short notes capturing what was learned in this phase, including SCHED_FIFO outcome, backend selected, and any callback-thread surprises.
+    verify_commands:
+      - cargo build
+      - cargo clippy --all-targets -- -D warnings
+      - cargo test --quiet
+    commit_message: Wire cpal output stream to fundsp DSP graph
+
+  - id: thrust-voice
+    title: First voice - thrust - soul-visible-and-audible milestone
+    details: |
+      Per PLAN.md step 9 - this is the soul-visible-and-audible milestone.
+      Implement the thrust voice as a sawtooth oscillator through a low-pass filter with a simple ADSR envelope, gated by W (also Up arrow) per DESIGN.md Input Mapping.
+      Voice graph must be built once at startup with no allocations during press/release - parameter mutation flows through AtomicF32 cells from the game thread to the audio thread via the existing ringbuf.
+      Pressing W humming the thrust sound through the speakers is the second DESIGN.md success criterion ("Thrust sound humming through speakers as you press up - generated by real synthesis, not sample playback").
+    workflow: implement
+    status: todo
+    deps:
+      - audio-scaffolding
+    context_files:
+      - DESIGN.md
+      - PLAN.md
+    acceptance:
+      - Thrust voice is implemented in the fundsp graph as sawtooth -> low-pass -> envelope, pre-allocated at startup.
+      - W (and Up arrow) input gates the thrust voice on/off via Trigger/Release messages on the ringbuf, with no allocations in either thread during gating.
+      - DESIGN.md success criterion #2 (real synthesis, not sample playback) is verified by inspection of the voice graph code.
+      - 'Manual verification: cargo run produces a clean thrust hum through the speakers when W is held; releasing W lets the envelope decay naturally.'
+      - Record short notes capturing what was learned in this phase, including envelope timings, filter cutoff defaults, and any noise/clipping observations.
+    verify_commands:
+      - cargo build
+      - cargo clippy --all-targets -- -D warnings
+      - cargo test --quiet
+    commit_message: Add thrust synthesis voice gated by W
+
+  - id: checkpoint-soul-audible
+    title: Checkpoint - soul-visible-and-audible
+    details: |
+      DESIGN.md Success Criteria gate - both visual (spinning ship with phosphor trail) and the first synth voice (thrust hum on W) are alive together.
+      Verify both run together with no audio xruns and no visible frame judder. If either side regressed since its own checkpoint, loop back rather than pressing on.
+    workflow: checkpoint
+    status: todo
+    deps:
+      - thrust-voice
+    context_files:
+      - DESIGN.md
+      - PLAN.md
+    acceptance:
+      - 'Manual verification: cargo run --release shows the spinning ship with phosphor trail rendering correctly.'
+      - 'Manual verification: pressing W produces the thrust hum without xruns over a ~1 minute test session.'
+      - Frame rate stays at the monitor refresh rate (likely 144Hz on the user's machine) with no judder.
+      - Record short notes capturing what was learned in this phase, including any cross-thread interaction quirks discovered when the audio is running alongside the renderer.
+    verify_commands:
+      - cargo build --release
+      - cargo clippy --all-targets -- -D warnings
+      - cargo test --quiet
+    commit_message: Checkpoint soul-visible-and-audible milestone
+
+  - id: game-loop-physics
+    title: Game loop, ship physics, and fixed-timestep with spiral-of-death guard
+    details: |
+      Per PLAN.md step 10 and DESIGN.md Display & Timing Model + Game Constants, build the deterministic simulation.
+      Fixed-timestep at 1/240s for physics, decoupled from render and interpolated to the display rate.
+      Implement spiral-of-death guard with a max-substeps cap of 4 per render frame (covers the reviewer concern from PLAN.md).
+      Ship physics: inertia (no friction per original), screen wrap, rotation rate ~3 rad/sec, thrust acceleration ~0.05 units/frame at 60Hz scaled to the 1/240s sim step, max velocity ~6 units/sec (game-world units).
+      Wire input mapping from DESIGN.md: rotate left = A or Left, rotate right = D or Right, thrust = W or Up, fire = Space (placeholder), hyperspace = H or Shift (placeholder), pause = P, quit = Esc.
+      Hyperspace alt-key Shift can stomp platform shortcuts - flag this now, decide whether to keep, drop, or scope to plain Shift only when no modifier-needing key is also pressed; record the decision rather than deferring it to polish-pass.
+      Gamepad: not in v1, deferred per DESIGN.md Input Mapping. Do not introduce gamepad abstractions.
+      Update the GameSnapshot POD pushed to the audio side each tick (asteroid count placeholder until next task).
+      Input-latency target: total input-to-feedback budget ~16ms (sim step ~4.2ms + frame ~6.9ms at 144Hz + audio block ~5.3ms) per DESIGN.md "low input latency" constraint - do not add per-frame input batching that defers events.
+      Add unit tests for: spiral-of-death substep cap (cap=4 enforced), screen wrap (positions wrap at playfield edges), rotation rate (radians per second), thrust integration (acceleration accumulates and caps at max velocity), no-friction (idle ship retains velocity).
+    workflow: implement
+    status: todo
+    deps:
+      - checkpoint-soul-audible
+    context_files:
+      - DESIGN.md
+      - PLAN.md
+    acceptance:
+      - Physics runs at fixed 1/240s timestep with a max of 4 substeps per render frame (spiral-of-death guard) and is interpolated to the display rate.
+      - Ship rotates at ~3 rad/sec, accelerates per the documented thrust constants, caps at ~6 units/sec, has no friction, and wraps at playfield edges.
+      - 'All input bindings from DESIGN.md Input Mapping are wired (rotate left/right, thrust, fire placeholder, hyperspace placeholder, pause, quit) with the Shift-conflict decision recorded.'
+      - Gamepad code paths are absent (deferred per DESIGN.md).
+      - GameSnapshot is pushed to the audio thread each tick with current alive flag, score (0 for now), and asteroid count placeholder.
+      - Unit tests cover substep cap, screen wrap, rotation rate, thrust integration, max velocity cap, and no-friction inertia.
+      - 'Manual verification: cargo run shows frame rate stays at the monitor refresh rate during heavy turning + thrusting.'
+      - Record short notes capturing what was learned in this phase, including substep cap behavior under stress, the Shift-conflict decision, and any timestep tuning notes.
+    verify_commands:
+      - cargo build
+      - cargo clippy --all-targets -- -D warnings
+      - cargo test --quiet
+    commit_message: Add game loop with fixed-timestep physics and spiral-of-death guard
+
+  - id: asteroids
+    title: Asteroids - three size tiers with split-on-hit and original spawn pattern
+    details: |
+      Per PLAN.md step 11 and DESIGN.md Game Constants, implement the asteroids.
+      Three size tiers: large (radius ~30), medium (~15), small (~7). Each splits into two of the next size down.
+      Implement procedural irregular hull outlines per asteroid (a handful of vertices around the radius with random offsets), drawn via beam commands using the asteroid hull dwell default (25us).
+      Spawn pattern from the original: bookmark Norbert Kehrer's Asteroids disassembly and the computerarcheology.com annotated listing as references in code comments and notes (DESIGN.md Open Question 8). Match starting count and per-round count growth from the disassembly.
+      DESIGN.md Game Constants final bullet: "Tune all values against Norbert Kehrer's disassembly during step 11" - do this tuning now (not deferred to polish): asteroid radii, drift speeds, and per-round count growth. Polish-pass will re-validate but the disassembly-driven tuning starts here.
+      Asteroids drift with constant velocity, screen wrap, and survive collisions until shot.
+      Update GameSnapshot.asteroid_count each tick so the eventual heartbeat voice can read it.
+      Add unit tests for: split-into-2-smaller-on-hit rule (large -> 2 medium, medium -> 2 small, small -> destroyed) and per-round spawn count progression.
+    workflow: implement
+    status: todo
+    deps:
+      - game-loop-physics
+    context_files:
+      - DESIGN.md
+      - PLAN.md
+    acceptance:
+      - Three asteroid size tiers exist with the documented radii (~30, ~15, ~7) and the split-into-2-smaller-on-hit rule.
+      - Asteroids draw as irregular hull outlines via beam commands at the documented dwell.
+      - Spawn pattern (starting count, per-round growth) follows the original; the Norbert Kehrer disassembly and computerarcheology.com URLs are cited in code comments.
+      - Disassembly-driven tuning of asteroid constants is done in this task per DESIGN.md Game Constants final bullet (not deferred).
+      - GameSnapshot.asteroid_count is updated each sim tick and visible to the audio thread via the ringbuf.
+      - Unit tests cover the split rule and per-round spawn count progression.
+      - 'Manual verification: cargo run shows asteroids drifting and screen-wrapping at the correct sizes.'
+      - Record short notes capturing what was learned in this phase, including disassembly reference URLs and any spawn-pattern tuning notes.
+    verify_commands:
+      - cargo build
+      - cargo clippy --all-targets -- -D warnings
+      - cargo test --quiet
+    commit_message: Add asteroids with three size tiers, split-on-hit, and original spawn pattern
+
+  - id: bullets-collision-game-over
+    title: Bullets, circle-circle collision, and game-over flow
+    details: |
+      Per PLAN.md step 12 and DESIGN.md Open Question 7, implement the basic gameplay loop.
+      Bullets fire on Space, drawn as bright dots with the bullet dwell default (40us). Lifetime per the original (~1 second on screen, then despawn).
+      Collision model: circle vs circle using sprite-extent radii (modern, fast, accurate enough). Confirm the choice in code comments per DESIGN.md Open Question 7.
+      Detect bullet-asteroid hits (split or remove asteroid), bullet-UFO hits (defer until the UFO task), and ship-asteroid hits (decrement lives, respawn after a short delay, persistent score across deaths).
+      Implement game-over state when lives reach zero. Display a minimal vector text "GAME OVER" using beam-drawn glyphs or a placeholder (polish-pass replaces placeholders).
+      Add unit tests for: circle-circle collision (overlap and non-overlap cases, edge-touching), bullet lifetime expiry (despawn after the lifetime budget), and ship-death lives decrement.
+    workflow: implement
+    status: todo
+    deps:
+      - asteroids
+    context_files:
+      - DESIGN.md
+      - PLAN.md
+    acceptance:
+      - Space fires bullets with the documented bullet dwell, lifetime, and dot rendering.
+      - Circle vs circle collision is implemented and used for ship-asteroid and bullet-asteroid checks; comment in code documents the Open Question 7 decision.
+      - Asteroids split correctly on hit (large -> 2 medium, medium -> 2 small, small -> destroyed).
+      - Ship death decrements lives and respawns with a brief invulnerability or pause; lives reaching zero triggers the game-over state.
+      - GameSnapshot.alive flag flips correctly on death and respawn.
+      - Unit tests cover circle-circle collision (overlap, no-overlap, edge-touch), bullet lifetime expiry, and ship-death lives decrement.
+      - 'Manual verification: cargo run plays a basic loop - shoot, hit, split, die at zero lives.'
+      - Record short notes capturing what was learned in this phase, including collision-radius tuning notes and respawn timing observations.
+    verify_commands:
+      - cargo build
+      - cargo clippy --all-targets -- -D warnings
+      - cargo test --quiet
+    commit_message: Add bullets, circle-circle collision, and game-over flow
+
+  - id: synth-voices
+    title: Remaining synth voices - fire, explosion, UFO siren, heartbeat
+    details: |
+      Per PLAN.md step 13 and DESIGN.md Audio Realtime Contract, build out the remaining voices in the fundsp graph. All synthesis, no sample WAVs (DESIGN.md Constraints).
+      Fire: short percussive synth (square or triangle through fast envelope) triggered each Space-press.
+      Explosion: white noise through bandpass with envelope; vary timbre per asteroid size for the four-tone explosion feel from the original.
+      UFO siren: dual-oscillator wail with characteristic descending-then-ascending pattern (large vs small UFO variants - parameter difference, same voice).
+      Heartbeat: low thump that speeds up as remaining-asteroid count decreases. DESIGN.md Open Question 4 - confirm the exact tempo curve from Norbert Kehrer's Asteroids disassembly / computerarcheology.com listing during this task and document the curve in code comments. Heartbeat must keep running between deaths per DESIGN.md success criteria; only resets at game-over restart.
+      All voices pre-allocated at startup, all parameter mutation through AtomicF32. Verify zero xruns with all voices active under stress (many simultaneous explosions).
+    workflow: implement
+    status: todo
+    deps:
+      - bullets-collision-game-over
+    context_files:
+      - DESIGN.md
+      - PLAN.md
+    acceptance:
+      - Fire, explosion, UFO siren, and heartbeat voices are implemented in the fundsp graph and pre-allocated at startup.
+      - Fire triggers on Space; explosion triggers on asteroid destruction with size-dependent timbre.
+      - Heartbeat tempo is coupled to GameSnapshot.asteroid_count using the documented curve from the original disassembly (Open Question 4 confirmed).
+      - Heartbeat continues across ship deaths per the success criteria; only stops at game-over reset.
+      - No sample WAV files are loaded; voices are pure synthesis.
+      - 'Manual verification: cargo run with many overlapping explosions reports zero xruns over a ~1 minute play session.'
+      - Record short notes capturing what was learned in this phase, including the heartbeat tempo curve chosen and any voice-graph allocation gotchas.
+    verify_commands:
+      - cargo build
+      - cargo clippy --all-targets -- -D warnings
+      - cargo test --quiet
+    commit_message: Add fire, explosion, UFO, and heartbeat synth voices
+
+  - id: ufo-ai
+    title: UFO AI - large and small variants with score-driven spawn rate
+    details: |
+      Per PLAN.md step 14 and DESIGN.md Game Constants, implement UFO AI as the first slice of the step-14 mechanics.
+      Large UFO at score < 10k: random fire direction.
+      Small UFO at score >= 10k: aimed fire toward the player ship.
+      Spawn rate increases with score per the original (cite Norbert Kehrer's disassembly / computerarcheology.com for exact spawn timing curve).
+      UFO crosses the screen with periodic direction changes per the original; despawns when off-screen if not destroyed.
+      UFO collisions wire into the existing circle-circle collision system from bullets-collision-game-over.
+      UFO siren voice from synth-voices triggers on UFO spawn and releases on UFO despawn or destruction.
+    workflow: implement
+    status: todo
+    deps:
+      - synth-voices
+    context_files:
+      - DESIGN.md
+      - PLAN.md
+    acceptance:
+      - 'UFO AI alternates large (random fire, score < 10k) and small (aimed fire, score >= 10k) variants.'
+      - Spawn rate scales with score per the original disassembly; the rate function is documented in code comments with the disassembly citation.
+      - UFO motion (direction changes mid-screen) matches the original feel.
+      - UFO siren plays from spawn to despawn/destruction.
+      - 'Manual verification: cargo run shows UFOs appearing, hunting, and being destroyed correctly across both variants by playing past 10k score.'
+      - Record short notes capturing what was learned in this phase, including any UFO AI tuning that diverges from the original and the spawn-rate curve chosen.
+    verify_commands:
+      - cargo build
+      - cargo clippy --all-targets -- -D warnings
+      - cargo test --quiet
+    commit_message: Add UFO AI with large and small variants and score-driven spawn rate
+
+  - id: scoring-and-lives
+    title: Scoring values, extra-life threshold, and lives display
+    details: |
+      Per PLAN.md step 14 and DESIGN.md Game Constants, implement scoring and the lives system extension.
+      Scoring values match the original arcade: per-tier asteroid kill scores (large/medium/small) and per-variant UFO kill scores (large/small). Cite the disassembly source for exact values.
+      Extra-life threshold: +1 life every 10,000 points per DESIGN.md.
+      Lives display: max 6 lives shown onscreen even if more are earned (per DESIGN.md Game Constants). Lives drawn as miniature beam-rendered ship outlines reusing the ship outline from spinning-ship.
+      Score display: beam-rendered numerical readout in the playfield or bezel margin (depending on aspect-ratio-decision).
+      Add unit tests for: scoring totals on each kill type, extra-life threshold (one bonus at 10k, second at 20k, etc), and max-6 lives display cap (8 earned shows 6).
+    workflow: implement
+    status: todo
+    deps:
+      - ufo-ai
+    context_files:
+      - DESIGN.md
+      - PLAN.md
+    acceptance:
+      - Per-tier asteroid kill scores and per-variant UFO kill scores match the original arcade values, cited from the disassembly in code comments.
+      - +1 life is awarded at every 10,000-point threshold per DESIGN.md.
+      - Lives display shows up to 6 lives onscreen and clamps higher counts to 6.
+      - Score display is beam-rendered and visible during gameplay.
+      - Unit tests cover scoring totals, extra-life thresholds (one at 10k, another at 20k, etc), and the max-6 lives display cap.
+      - 'Manual verification: cargo run shows score and lives updating correctly through a few rounds.'
+      - Record short notes capturing what was learned in this phase, including the original scoring values and any divergences if the disassembly was ambiguous.
+    verify_commands:
+      - cargo build
+      - cargo clippy --all-targets -- -D warnings
+      - cargo test --quiet
+    commit_message: Add scoring values, extra-life threshold, and lives display
+
+  - id: hyperspace
+    title: Hyperspace teleport with cooldown and 10-percent self-destruct
+    details: |
+      Per PLAN.md step 14 and DESIGN.md Game Constants + Open Question 6, implement the hyperspace mechanic.
+      H (and Shift as alt, decision recorded in game-loop-physics) teleports the ship to a random screen location.
+      Cooldown: ~1 second between uses (prevents spam).
+      Self-destruct chance: ~10% on hyperspace exit per Open Question 6 (faithful, kept). Use a seedable RNG for deterministic testing.
+      Self-destruct triggers the same death flow as ship-asteroid collision (lives decrement, respawn or game-over).
+      Add unit tests for: cooldown timer (second invocation within cooldown is rejected), self-destruct probability (under a fixed seed the rate matches ~10% over many rolls), and teleport target placement (random within playfield bounds).
+    workflow: implement
+    status: todo
+    deps:
+      - scoring-and-lives
+    context_files:
+      - DESIGN.md
+      - PLAN.md
+    acceptance:
+      - 'Hyperspace on H (and Shift if the game-loop-physics decision kept it) teleports the ship to a random in-playfield location.'
+      - Cooldown of ~1 second is enforced; second invocation within the cooldown is rejected (no teleport, no self-destruct roll).
+      - ~10% self-destruct chance on hyperspace exit triggers the standard death flow.
+      - RNG used for the dice roll and target placement is seedable to keep tests deterministic.
+      - Unit tests cover cooldown enforcement, self-destruct probability under a fixed seed, and teleport placement bounds.
+      - 'Manual verification: cargo run lets the user trigger hyperspace several times - teleports happen, cooldown is felt, self-destruct fires occasionally.'
+      - Record short notes capturing what was learned in this phase, including how the Shift alt-key decision from game-loop-physics worked out in practice.
+    verify_commands:
+      - cargo build
+      - cargo clippy --all-targets -- -D warnings
+      - cargo test --quiet
+    commit_message: Add hyperspace teleport with cooldown and self-destruct chance
+
+  - id: highscore-and-attract
+    title: High-score persistence and attract mode
+    details: |
+      Implement the two meta-features that round out step 14: high-score persistence (PLAN.md reviewer concern) and attract mode (DESIGN.md Game Constants).
+      High-score persistence: save the high score to ~/.local/share/asteroids/highscore as a single ASCII-decimal integer per DESIGN.md and the reviewer concern. Create the directory if missing. Read at startup; treat a missing or corrupt (non-integer, negative, oversized) file as zero. Write on every new high score.
+      Nothing else persists per DESIGN.md Input Mapping; do not introduce other persisted state.
+      Attract mode: rolling demo of asteroids drifting + score table after 30s idle on the title screen, per DESIGN.md Game Constants. The score table includes the persisted high score from the file above.
+      Attract mode exits as soon as any input event arrives.
+      Add unit tests for: high-score read of valid file, missing file (returns zero, no error), corrupt file (returns zero, does not crash), and write-then-read round-trip.
+    workflow: implement
+    status: todo
+    deps:
+      - hyperspace
+    context_files:
+      - DESIGN.md
+      - PLAN.md
+    acceptance:
+      - High score persists to ~/.local/share/asteroids/highscore as a single ASCII-decimal integer; directory is created if missing; corrupt or missing file is treated as zero without error.
+      - High score is read at startup, displayed on the title screen and during attract mode, and written on every new high score.
+      - No other state persists to disk (only ~/.local/share/asteroids/highscore).
+      - Attract mode runs after 30s idle on the title screen with drifting asteroids and a score table that includes the persisted high score; exits on any input.
+      - Unit tests cover high-score read of valid, missing, and corrupt files plus write-then-read round-trip.
+      - 'Manual verification: cargo run shows the title screen, idle 30s reaches attract mode, any key returns to the title; high score survives a process restart.'
+      - Record short notes capturing what was learned in this phase, including any persistence-format edge cases (locale, integer overflow) and attract-mode timing notes.
+    verify_commands:
+      - cargo build
+      - cargo clippy --all-targets -- -D warnings
+      - cargo test --quiet
+    commit_message: Add high-score persistence and attract mode
+
+  - id: polish-pass
+    title: Polish pass - tune phosphor, bloom, beam dwell, and audio mix
+    details: |
+      Per PLAN.md step 15, the 1% that takes 30% of the time. This is the consolidated tuning + cleanup pass for v1, and the source plan explicitly calls for it - it is not a generic placeholder tech-debt task on a fixed schedule, it is the closing step listed in PLAN.md.
+      Tune: phosphor decay tau, bloom intensity and threshold, beam dwell defaults per object type, sigma defaults, and the audio mix levels of each voice.
+      Re-validate every DESIGN.md Game Constants value against Norbert Kehrer's disassembly and adjust where needed (the asteroids task started disassembly-driven tuning; this pass closes the loop).
+      Re-test the input mapping ergonomics (re-confirm the hyperspace Shift alt-key decision from game-loop-physics).
+      Replace any placeholder game-over text with beam-drawn vector glyphs if not already done.
+      Sweep for warnings, dead code, and any Open Question stragglers that were not closed inline (color, persistence-of-vision tau, CRT curvature, hyperspace randomness, collision model, disassembly references should all already be closed - confirm).
+      This task has a planning-time expectation of broad cross-cutting touch (renderer constants, audio constants, gameplay constants), but the scope is bounded by PLAN.md step 15 and does not need a separate follow-up tech-debt task.
+    workflow: implement
+    status: todo
+    deps:
+      - highscore-and-attract
+    context_files:
+      - DESIGN.md
+      - PLAN.md
+    acceptance:
+      - Phosphor tau, bloom intensity/threshold, beam dwell defaults, and sigma values are tuned and recorded as the new defaults.
+      - Audio mix levels for thrust, fire, explosion, UFO siren, and heartbeat are balanced so no voice clips or buries another.
+      - Game Constants re-validated against the disassembly references with any adjustments noted in code comments.
+      - Code is warning-free under cargo clippy --all-targets -- -D warnings; no dead code or stale TODOs from earlier tasks remain (or remaining ones are explicitly marked v2).
+      - Existing unit tests still pass under cargo test --quiet.
+      - Any Open Questions that were not closed inline are explicitly closed here in notes (color choice, persistence-of-vision tau, CRT curvature, hyperspace randomness, collision model, disassembly references).
+      - 'Manual verification: cargo run --release plays well end-to-end with the tuned defaults.'
+      - Record short notes capturing what was learned in this phase, including the final tuned values and any Open Question closures so a fresh re-plan can start from the right defaults.
+    verify_commands:
+      - cargo build --release
+      - cargo clippy --all-targets -- -D warnings
+      - cargo test --quiet
+    commit_message: Polish pass - tune phosphor, bloom, dwell, and audio mix
+
+  - id: checkpoint-success-criteria
+    title: Checkpoint - DESIGN.md success criteria verified end-to-end
+    details: |
+      Final acceptance gate against DESIGN.md Success Criteria.
+      Sit down with the binary and run through every success criterion in DESIGN.md as a checklist. The "real test" criterion - the user can sit down and play it for 10 minutes straight without the museum-piece illusion breaking - is the gate that closes v1.
+      If any criterion fails, document the failure and loop back to the relevant earlier task instead of declaring done.
+    workflow: checkpoint
+    status: todo
+    deps:
+      - polish-pass
+    context_files:
+      - DESIGN.md
+      - PLAN.md
+    acceptance:
+      - 'Spinning wireframe ship on black background with phosphor glow that visibly trails behind motion: verified by manual cargo run --release.'
+      - 'Thrust sound humming through speakers on Up press, generated by real synthesis: verified by manual play.'
+      - 'Asteroids breaking into smaller asteroids correctly (3 size tiers per the original): verified by manual play.'
+      - 'UFO appears, hunts the player with original-feeling AI, makes the iconic siren sound: verified by manual play.'
+      - 'Heartbeat audio tempo speeds up as round progresses, stays running between deaths: verified by manual play.'
+      - 'Frame rate sits at 144Hz on the user''s monitor with no judder during gameplay: verified by manual observation (the build/test gate cannot measure realtime framerate).'
+      - The user can sit down and play it for 10 minutes straight without the museum-piece illusion breaking - the real test - is verified or the failure is documented with a clear loop-back target.
+      - Record short notes capturing what was learned in this phase, including any criteria that needed loop-back, final tuning values, and any v2 follow-ups worth noting before the project is closed or re-planned.
+    verify_commands:
+      - cargo build --release
+      - cargo clippy --all-targets -- -D warnings
+      - cargo test --quiet
+    commit_message: Checkpoint final success criteria verification

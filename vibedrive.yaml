@@ -1,0 +1,222 @@
+workspace: .
+plan_file: vibedrive-plan.yaml
+max_iterations: 0
+max_stalled_iterations: 2
+default_workflow: implement
+
+claude:
+  command: claude
+  transport: tui
+  startup_timeout: 30s
+  args:
+    - --effort
+    - max
+    - --permission-mode
+    - bypassPermissions
+
+codex:
+  command: codex
+  transport: tui
+  startup_timeout: 30s
+  args:
+    - --dangerously-bypass-approvals-and-sandbox
+    - -c
+    - model_reasoning_effort="xhigh"
+
+workflows:
+  implement:
+    steps:
+      - name: execute-task
+        type: agent
+        actor: coder
+        prompt: |
+          Execute task {{ .Task.ID }} from {{ .PlanFile }}.
+          Title: {{ .Task.Title }}
+          
+          Hard constraints to preserve:
+          {{- range .Plan.Project.ConstraintFiles }}
+          - {{ . }}
+          {{- end }}
+          {{- if .Task.Details }}
+
+          Details:
+          {{ .Task.Details }}
+          {{- end }}
+          {{- if .Task.ContextFiles }}
+
+          Relevant files:
+          {{- range .Task.ContextFiles }}
+          - {{ . }}
+          {{- end }}
+          {{- end }}
+          {{- if .Task.Acceptance }}
+
+          Acceptance criteria:
+          {{- range .Task.Acceptance }}
+          - {{ . }}
+          {{- end }}
+          {{- end }}
+
+          Make the necessary code changes in {{ .Workspace }}.
+          Consult additional repository files only when they are needed to complete this task correctly.
+          Do not edit {{ .PlanFile }} directly.
+
+          Before you stop, write {{ .TaskResultPath }} as JSON with this schema:
+          {"status":"done|in_progress|blocked","notes":"brief phase notes"}
+
+          Set status to done only when the implementation work for this task is complete and ready for the configured automated verification commands.
+          Set status to in_progress when meaningful progress was made but more work is still required.
+          Set status to blocked when an external dependency, human decision, or missing prerequisite prevents completion.
+          Use notes to capture what was learned in this phase, especially discoveries, follow-up risks, or plan adjustments that matter if the project is re-planned and rerun in a fresh environment.
+          Finalize saves those notes in {{ .TaskNotesPath }} instead of embedding them in {{ .PlanFile }}.
+          Keep notes short and specific.
+        required_outputs:
+          - "{{ .TaskResultPath }}"
+
+      - name: peer-review
+        type: agent
+        actor: reviewer
+        prompt: |
+          Review the current uncommitted changes for task {{ .Task.ID }} from {{ .PlanFile }}.
+          Focus on correctness issues, regressions, missing tests, and mismatches with the task requirements.
+          Do not make code changes in this step.
+
+          Write {{ .ReviewPath }} as JSON with this schema:
+          {"decision":"approved|changes_requested","summary":"brief summary","findings":["actionable finding","..."]}
+
+          Use decision=approved with an empty findings list when there are no actionable issues.
+          Use decision=changes_requested only when the coder should make follow-up fixes before finalize.
+          Keep findings short, concrete, and specific enough for the coder to act on directly.
+        required_outputs:
+          - "{{ .ReviewPath }}"
+
+      - name: address-peer-review
+        type: agent
+        actor: coder
+        prompt: |
+          Read the peer review artifact at {{ .ReviewPath }} for task {{ .Task.ID }} from {{ .PlanFile }}.
+          If the reviewer requested changes, address each actionable finding before finalizing the task.
+          If the reviewer approved the change, leave the code and {{ .TaskResultPath }} unchanged unless you discover a real issue while verifying the review.
+
+          Keep {{ .TaskResultPath }} accurate:
+          - leave it as done only if the task is complete and ready for verification
+          - change it to in_progress if review issues remain or more work is needed
+          - change it to blocked if an external dependency or human decision prevents completion
+          - keep the notes focused on what this phase taught you that should inform replanning in a fresh environment
+          - finalize saves notes in {{ .TaskNotesPath }} instead of embedding them in {{ .PlanFile }}
+
+          Do not edit {{ .PlanFile }} directly.
+        required_outputs:
+          - "{{ .TaskResultPath }}"
+
+      - name: finalize-task
+        type: exec
+        command:
+          - "{{ .ExecutablePath }}"
+          - task
+          - finalize
+          - --workspace
+          - "{{ .Workspace }}"
+          - --plan
+          - "{{ .PlanFile }}"
+          - --task
+          - "{{ .Task.ID }}"
+          - --result
+          - "{{ .TaskResultPath }}"
+          - --message
+          - "{{- if .Task.CommitMessage -}}{{ .Task.CommitMessage }}{{- else -}}{{ .Task.Title }}{{- end -}}"
+
+  checkpoint:
+    steps:
+      - name: run-checkpoint
+        type: agent
+        actor: coder
+        prompt: |
+          Execute the checkpoint task {{ .Task.ID }} from {{ .PlanFile }}.
+          Title: {{ .Task.Title }}
+
+          Hard constraints to preserve:
+          {{- range .Plan.Project.ConstraintFiles }}
+          - {{ . }}
+          {{- end }}
+          {{- if .Task.Details }}
+
+          Details:
+          {{ .Task.Details }}
+          {{- end }}
+          {{- if .Task.Acceptance }}
+
+          Acceptance criteria:
+          {{- range .Task.Acceptance }}
+          - {{ . }}
+          {{- end }}
+          {{- end }}
+
+          Run the full required verification for this checkpoint, fix any regressions you find, and leave the repository green before moving on.
+          Consult additional repository files only when they are needed to complete this checkpoint correctly.
+          Do not edit {{ .PlanFile }} directly.
+
+          Before you stop, write {{ .TaskResultPath }} as JSON with this schema:
+          {"status":"done|in_progress|blocked","notes":"brief phase notes"}
+
+          Set status to done only when the checkpoint work is complete and ready for the configured automated verification commands.
+          Set status to in_progress when meaningful progress was made but more work is still required.
+          Set status to blocked when an external dependency, human decision, or missing prerequisite prevents completion.
+          Use notes to capture what was learned in this phase, especially discoveries, follow-up risks, or plan adjustments that matter if the project is re-planned and rerun in a fresh environment.
+          Finalize saves those notes in {{ .TaskNotesPath }} instead of embedding them in {{ .PlanFile }}.
+          Keep notes short and specific.
+        required_outputs:
+          - "{{ .TaskResultPath }}"
+
+      - name: peer-review
+        type: agent
+        actor: reviewer
+        prompt: |
+          Review the current uncommitted changes for checkpoint task {{ .Task.ID }} from {{ .PlanFile }}.
+          Focus on correctness issues, regressions, missing tests, and mismatches with the checkpoint requirements.
+          Do not make code changes in this step.
+
+          Write {{ .ReviewPath }} as JSON with this schema:
+          {"decision":"approved|changes_requested","summary":"brief summary","findings":["actionable finding","..."]}
+
+          Use decision=approved with an empty findings list when there are no actionable issues.
+          Use decision=changes_requested only when the coder should make follow-up fixes before finalize.
+          Keep findings short, concrete, and specific enough for the coder to act on directly.
+        required_outputs:
+          - "{{ .ReviewPath }}"
+
+      - name: address-peer-review
+        type: agent
+        actor: coder
+        prompt: |
+          Read the peer review artifact at {{ .ReviewPath }} for checkpoint task {{ .Task.ID }} from {{ .PlanFile }}.
+          If the reviewer requested changes, address each actionable finding before finalizing the checkpoint.
+          If the reviewer approved the change, leave the code and {{ .TaskResultPath }} unchanged unless you discover a real issue while verifying the review.
+
+          Keep {{ .TaskResultPath }} accurate:
+          - leave it as done only if the checkpoint is complete and ready for verification
+          - change it to in_progress if review issues remain or more work is needed
+          - change it to blocked if an external dependency or human decision prevents completion
+          - keep the notes focused on what this phase taught you that should inform replanning in a fresh environment
+          - finalize saves notes in {{ .TaskNotesPath }} instead of embedding them in {{ .PlanFile }}
+
+          Do not edit {{ .PlanFile }} directly.
+        required_outputs:
+          - "{{ .TaskResultPath }}"
+
+      - name: finalize-task
+        type: exec
+        command:
+          - "{{ .ExecutablePath }}"
+          - task
+          - finalize
+          - --workspace
+          - "{{ .Workspace }}"
+          - --plan
+          - "{{ .PlanFile }}"
+          - --task
+          - "{{ .Task.ID }}"
+          - --result
+          - "{{ .TaskResultPath }}"
+          - --message
+          - "{{- if .Task.CommitMessage -}}{{ .Task.CommitMessage }}{{- else -}}{{ .Task.Title }}{{- end -}}"
