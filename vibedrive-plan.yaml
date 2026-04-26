@@ -303,7 +303,7 @@ tasks:
         Rotate the ship around its center on a simple frame-time clock (the full fixed-timestep simulation lands at game-loop-physics). Add a scenario ship-spinning that drives the rotation deterministically under --fixed-dt --seed for verification.
         DESIGN.md Open Question 2 - for the autonomous run, lock the beam color to pure white-on-black (most faithful to original arcade Asteroids monochrome XY display). Record the decision in code comments tied to Open Question 2.
         DESIGN.md Premise 4 soft deadline: ~3-4 weekends to reach this milestone is a planning-time heuristic about expected breadth, not a measured fact. If bloom-and-phosphor work has overrun the budget, course-correct rather than scope-creep further; the deadline is an anti-rabbit-hole guard, not a shipping deadline. If you arrive here over-budget, capture the overrun in notes and consider what to descope rather than expanding.
-      status: todo
+      status: done
       workflow: implement
       deps:
         - aspect-ratio-decision

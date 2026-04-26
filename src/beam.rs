@@ -209,6 +209,20 @@ impl BeamEmitter {
         self.emit_segment(start, end, intensity, tuning::SHIP_OUTLINE_SEGMENT_DWELL_US)
     }
 
+    pub fn emit_ship_outline_segment_with_endpoint_bonus(
+        &mut self,
+        start: Vec2,
+        end: Vec2,
+        intensity: f32,
+    ) -> &mut Self {
+        self.emit_segment_with_endpoint_bonus(
+            start,
+            end,
+            intensity,
+            tuning::SHIP_OUTLINE_SEGMENT_DWELL_US,
+        )
+    }
+
     pub fn emit_asteroid_hull_segment(
         &mut self,
         start: Vec2,

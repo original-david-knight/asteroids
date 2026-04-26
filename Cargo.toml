@@ -22,3 +22,18 @@ winit = "=0.30.13"
 [[bin]]
 name = "verify"
 path = "src/bin/verify.rs"
+
+[profile.dev.package.asteroids]
+opt-level = 1
+
+[profile.dev.package.png]
+opt-level = 2
+
+[profile.dev.package.fdeflate]
+opt-level = 2
+
+[profile.dev.package.flate2]
+opt-level = 2
+
+[profile.dev.package.miniz_oxide]
+opt-level = 2

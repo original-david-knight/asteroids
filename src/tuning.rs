@@ -3,6 +3,14 @@ pub const ASTEROID_HULL_SEGMENT_DWELL_US: f32 = 25.0;
 pub const BULLET_DOT_DWELL_US: f32 = 40.0;
 pub const ENDPOINT_DWELL_BONUS_US: f32 = 10.0;
 
+/// DESIGN.md Open Question 2 autonomous-run lock:
+/// original Asteroids was a monochrome XY display, so the default beam is
+/// pure white-on-black instead of a taste-tuned green/amber phosphor tint.
+pub const DEFAULT_BEAM_RGB: [f32; 3] = [1.0, 1.0, 1.0];
+
+pub const SHIP_ROTATION_RATE_RAD_PER_SEC: f32 = 3.0;
+pub const SHIP_SPINNING_SCALE: f32 = 0.55;
+
 pub const BEAM_QUAD_HALF_WIDTH_PIXELS: f32 = 6.0;
 pub const BEAM_SIGMA_PIXELS: f32 = 1.0;
 pub const BEAM_SIGMA_DWELL_GROWTH: f32 = 0.50;

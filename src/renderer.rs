@@ -19,6 +19,7 @@ pub enum Scenario {
     #[default]
     Demo,
     Idle,
+    ShipSpinning,
     HorizontalSweep,
     StaticBrightLine,
     StaticBrightLineLowDwell,
@@ -31,6 +32,7 @@ impl Scenario {
         match name {
             "demo" => Some(Self::Demo),
             "idle" => Some(Self::Idle),
+            "ship-spinning" => Some(Self::ShipSpinning),
             "horizontal-sweep" => Some(Self::HorizontalSweep),
             "static-bright-line" => Some(Self::StaticBrightLine),
             "static-bright-line-low-dwell" => Some(Self::StaticBrightLineLowDwell),
@@ -44,6 +46,7 @@ impl Scenario {
         match self {
             Self::Demo => "demo",
             Self::Idle => "idle",
+            Self::ShipSpinning => "ship-spinning",
             Self::HorizontalSweep => "horizontal-sweep",
             Self::StaticBrightLine => "static-bright-line",
             Self::StaticBrightLineLowDwell => "static-bright-line-low-dwell",
@@ -949,6 +952,7 @@ fn emit_scenario_beams(emitter: &mut BeamEmitter, scenario: Scenario, time_s: f3
     match scenario {
         Scenario::Demo => emit_demo_beams(emitter, time_s),
         Scenario::Idle => emit_idle_beams(emitter),
+        Scenario::ShipSpinning => emit_ship_spinning_beams(emitter, time_s),
         Scenario::HorizontalSweep => emit_horizontal_sweep_beams(emitter, time_s),
         Scenario::StaticBrightLine => {
             emit_static_bright_line(emitter, tuning::SHIP_OUTLINE_SEGMENT_DWELL_US)
@@ -966,6 +970,11 @@ fn emit_scenario_beams(emitter: &mut BeamEmitter, scenario: Scenario, time_s: f3
 fn emit_idle_beams(emitter: &mut BeamEmitter) {
     emit_ship_outline(emitter, Vec2::ZERO, 0.0, 0.55, 0.85);
     emitter.emit_bullet_dot(Vec2::new(0.56, -0.34), 0.014, 0.7);
+}
+
+fn emit_ship_spinning_beams(emitter: &mut BeamEmitter, time_s: f32) {
+    let angle = time_s * tuning::SHIP_ROTATION_RATE_RAD_PER_SEC;
+    emit_ship_outline(emitter, Vec2::ZERO, angle, tuning::SHIP_SPINNING_SCALE, 1.0);
 }
 
 fn emit_horizontal_sweep_beams(emitter: &mut BeamEmitter, time_s: f32) {
@@ -999,6 +1008,14 @@ fn emit_gamma_ramp_beams(emitter: &mut BeamEmitter) {
     }
 }
 
+const SHIP_OUTLINE_VERTICES: [Vec2; 4] = [
+    Vec2::new(0.44, 0.0),
+    Vec2::new(-0.30, 0.22),
+    Vec2::new(-0.12, 0.0),
+    Vec2::new(-0.30, -0.22),
+];
+const SHIP_OUTLINE_SEGMENTS: [(usize, usize); 4] = [(0, 1), (1, 2), (2, 3), (3, 0)];
+
 fn emit_ship_outline(
     emitter: &mut BeamEmitter,
     center: Vec2,
@@ -1007,60 +1024,27 @@ fn emit_ship_outline(
     intensity: f32,
 ) {
     let (angle_sin, angle_cos) = angle.sin_cos();
-    let nose_direction = Vec2::new(angle_cos, angle_sin);
-    let side_direction = nose_direction.left_perp();
+    let vertices = SHIP_OUTLINE_VERTICES.map(|vertex| {
+        center
+            + Vec2::new(
+                vertex.x * angle_cos - vertex.y * angle_sin,
+                vertex.x * angle_sin + vertex.y * angle_cos,
+            ) * scale
+    });
 
-    let nose = center + nose_direction * (0.44 * scale);
-    let left = center - nose_direction * (0.30 * scale) + side_direction * (0.22 * scale);
-    let right = center - nose_direction * (0.30 * scale) - side_direction * (0.22 * scale);
-    let notch = center - nose_direction * (0.12 * scale);
-
-    emitter
-        .emit(
-            BeamCommand::builder(nose, left)
-                .intensity(intensity)
-                .dwell_us(tuning::SHIP_OUTLINE_SEGMENT_DWELL_US)
-                .endpoint_dwell_bonus()
-                .build(),
-        )
-        .emit_ship_outline_segment(left, notch, intensity)
-        .emit_segment_with_endpoint_bonus(
-            notch,
-            right,
+    for (start, end) in SHIP_OUTLINE_SEGMENTS {
+        emitter.emit_ship_outline_segment_with_endpoint_bonus(
+            vertices[start],
+            vertices[end],
             intensity,
-            tuning::SHIP_OUTLINE_SEGMENT_DWELL_US,
-        )
-        .emit_segment_with_endpoint_bonus(
-            right,
-            nose,
-            intensity,
-            tuning::SHIP_OUTLINE_SEGMENT_DWELL_US,
         );
+    }
 }
 
 fn emit_demo_beams(emitter: &mut BeamEmitter, time_s: f32) {
     let center = Vec2::ZERO + Vec2::new((time_s * 0.47).sin() * 0.24, (time_s * 0.31).cos() * 0.16);
     let angle = time_s * 1.65;
-    let (angle_sin, angle_cos) = angle.sin_cos();
-    let nose_direction = Vec2::new(angle_cos, angle_sin);
-    let side_direction = nose_direction.left_perp();
-
-    let nose = center + nose_direction * 0.44;
-    let left = center - nose_direction * 0.30 + side_direction * 0.22;
-    let right = center - nose_direction * 0.30 - side_direction * 0.22;
-    let notch = center - nose_direction * 0.12;
-
-    emitter
-        .emit(
-            BeamCommand::builder(nose, left)
-                .intensity(1.0)
-                .dwell_us(tuning::SHIP_OUTLINE_SEGMENT_DWELL_US)
-                .endpoint_dwell_bonus()
-                .build(),
-        )
-        .emit_ship_outline_segment(left, notch, 1.0)
-        .emit_segment_with_endpoint_bonus(notch, right, 1.0, tuning::SHIP_OUTLINE_SEGMENT_DWELL_US)
-        .emit_segment_with_endpoint_bonus(right, nose, 1.0, tuning::SHIP_OUTLINE_SEGMENT_DWELL_US);
+    emit_ship_outline(emitter, center, angle, 1.0, 1.0);
 
     let sweep_x = (time_s * 0.73).sin() * 0.78;
     emitter
@@ -1166,10 +1150,12 @@ fn beam_quad_half_width_ndc(size: PhysicalSize<u32>) -> f32 {
 struct BeamUniforms {
     target_size_sigma_dwell: [f32; 4],
     growth_max_luma_pad: [f32; 4],
+    default_color_pad: [f32; 4],
 }
 
 impl BeamUniforms {
     fn new(size: PhysicalSize<u32>, max_luma: f32) -> Self {
+        let [red, green, blue] = tuning::DEFAULT_BEAM_RGB;
         Self {
             target_size_sigma_dwell: [
                 size.width.max(1) as f32,
@@ -1178,6 +1164,7 @@ impl BeamUniforms {
                 tuning::SHIP_OUTLINE_SEGMENT_DWELL_US,
             ],
             growth_max_luma_pad: [tuning::BEAM_SIGMA_DWELL_GROWTH, max_luma, 0.0, 0.0],
+            default_color_pad: [red, green, blue, 0.0],
         }
     }
 }
@@ -2400,6 +2387,7 @@ struct VertexOutput {
 struct BeamUniforms {
     target_size_sigma_dwell: vec4<f32>,
     growth_max_luma_pad: vec4<f32>,
+    default_color_pad: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -2446,8 +2434,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let sigma_sq = max(sigma * sigma, 0.0001);
     let brightness = input.intensity * dwell_factor * exp(-(distance * distance) / sigma_sq);
     let luma = clamp(brightness, 0.0, beam.growth_max_luma_pad.y);
+    let beam_color = max(beam.default_color_pad.rgb, vec3<f32>(0.0));
 
-    return vec4<f32>(vec3<f32>(luma), luma);
+    return vec4<f32>(beam_color * luma, luma);
 }
 "#;
 

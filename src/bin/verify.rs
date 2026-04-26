@@ -1,5 +1,7 @@
 use std::{
-    env, fs,
+    env,
+    f32::consts::PI,
+    fs,
     path::{Path, PathBuf},
     process,
 };
@@ -14,6 +16,7 @@ const SUBCOMMANDS: &[&str] = &[
     "banding",
     "peak-count",
     "ship-outline",
+    "trail-luminance",
     "soul-visible",
     "asteroid-count",
     "screen-wrap",
@@ -56,6 +59,8 @@ fn run() -> Result<(), String> {
         "gamma-ramp" => cmd_gamma_ramp(&mut args),
         "banding" => cmd_banding(&mut args),
         "peak-count" => cmd_peak_count(&mut args),
+        "ship-outline" => cmd_ship_outline(&mut args),
+        "trail-luminance" => cmd_trail_luminance(&mut args),
         "playfield-rect" => cmd_playfield_rect(&mut args),
         "audio-rms" => cmd_audio_rms(&mut args),
         "audio-dominant-freq" => cmd_audio_dominant_freq(&mut args),
@@ -63,11 +68,12 @@ fn run() -> Result<(), String> {
         "xrun-count" => cmd_xrun_count(&mut args),
         "frame-time-p99" => cmd_frame_time_p99(&mut args),
         "state-trace" => cmd_state_trace(&mut args),
-        "ship-outline" | "soul-visible" | "asteroid-count" | "screen-wrap" | "lives-display"
-        | "heartbeat-tempo" => Err(format!(
-            "{command} is reserved for a later gameplay/audio milestone\n\n{}",
-            subcommand_help(&command)
-        )),
+        "soul-visible" | "asteroid-count" | "screen-wrap" | "lives-display" | "heartbeat-tempo" => {
+            Err(format!(
+                "{command} is reserved for a later gameplay/audio milestone\n\n{}",
+                subcommand_help(&command)
+            ))
+        }
         _ => Err(format!(
             "unknown subcommand '{command}'\n\n{}",
             general_help()
@@ -202,6 +208,101 @@ fn cmd_peak_count(args: &mut CliArgs) -> Result<(), String> {
         ));
     }
     println!("peak-count ok: count={count}");
+    Ok(())
+}
+
+fn cmd_ship_outline(args: &mut CliArgs) -> Result<(), String> {
+    let frames = args.path("--frames")?;
+    let vertex_count: usize = args.value("--vertex-count")?;
+    let rotation_rate: f32 = args.value("--rotation-rate-rad-per-sec")?;
+    let tolerance: f32 = args.value("--tolerance")?;
+    args.finish()?;
+
+    if vertex_count != SHIP_VERTEX_COUNT {
+        return Err(format!(
+            "ship-outline failed: verifier recognizes {SHIP_VERTEX_COUNT} ship vertices, expected {vertex_count}"
+        ));
+    }
+
+    let frames = sorted_frame_paths(&frames)?;
+    if frames.len() < 2 {
+        return Err("ship-outline failed: at least two frames are required".to_string());
+    }
+
+    let detections = detect_ship_angles(&frames, rotation_rate)?;
+    let fit = fit_angle_rate(&detections, VERIFY_FIXED_DT_SECONDS);
+    let rate_error = (fit.rate_rad_per_sec - rotation_rate).abs();
+    if rate_error > tolerance {
+        return Err(format!(
+            "ship-outline failed: rate={:.6}rad/s expected={rotation_rate:.6} tolerance={tolerance:.6}, max_residual={:.6}rad",
+            fit.rate_rad_per_sec, fit.max_residual_rad
+        ));
+    }
+
+    let weakest_vertex = detections
+        .iter()
+        .flat_map(|detection| detection.vertex_luminance)
+        .fold(f32::INFINITY, f32::min);
+    println!(
+        "ship-outline ok: frames={} vertices={vertex_count}, rate={:.6}rad/s, max_residual={:.6}rad, weakest_vertex_luma={weakest_vertex:.6}",
+        detections.len(),
+        fit.rate_rad_per_sec,
+        fit.max_residual_rad
+    );
+    Ok(())
+}
+
+fn cmd_trail_luminance(args: &mut CliArgs) -> Result<(), String> {
+    let frames = args.path("--frames")?;
+    let behind_vector = args.flag("--behind-vector");
+    let min_luminance: f32 = args.value("--min-luminance")?;
+    args.finish()?;
+    if !behind_vector {
+        return Err("trail-luminance requires --behind-vector".to_string());
+    }
+
+    let frames = sorted_frame_paths(&frames)?;
+    if frames.len() < 8 {
+        return Err("trail-luminance failed: at least eight frames are required".to_string());
+    }
+
+    let detections =
+        detect_ship_angles(&frames, asteroids::tuning::SHIP_ROTATION_RATE_RAD_PER_SEC)?;
+    let image = verify::load_png(
+        frames
+            .last()
+            .ok_or_else(|| "trail-luminance failed: no frames loaded".to_string())?,
+    )?;
+    let angle = detections
+        .last()
+        .ok_or_else(|| "trail-luminance failed: no ship detections".to_string())?
+        .angle_rad;
+    let playfield = centered_aspect_rect(image.width, image.height, PLAYFIELD_ASPECT_RATIO)?;
+    let lag_angle =
+        asteroids::tuning::SHIP_ROTATION_RATE_RAD_PER_SEC * VERIFY_FIXED_DT_SECONDS * 6.0;
+    let mut best_luminance = 0.0_f32;
+
+    for (start, end) in SHIP_SEGMENTS {
+        let local_start = SHIP_VERTICES[start] * asteroids::tuning::SHIP_SPINNING_SCALE;
+        let local_end = SHIP_VERTICES[end] * asteroids::tuning::SHIP_SPINNING_SCALE;
+        for sample in [0.25_f32, 0.50, 0.75] {
+            let local = local_start + (local_end - local_start) * sample;
+            let current = gameplay_to_pixel(playfield, rotate_vec2(local, angle));
+            let behind = gameplay_to_pixel(playfield, rotate_vec2(local, angle - lag_angle));
+            let trail_point = (
+                current.0 + (behind.0 - current.0) * 1.15,
+                current.1 + (behind.1 - current.1) * 1.15,
+            );
+            best_luminance = best_luminance.max(max_luminance_near(&image, trail_point, 4));
+        }
+    }
+
+    if best_luminance < min_luminance {
+        return Err(format!(
+            "trail-luminance failed: behind-vector luminance={best_luminance:.6}, expected >= {min_luminance:.6}"
+        ));
+    }
+    println!("trail-luminance ok: behind-vector luminance={best_luminance:.6}");
     Ok(())
 }
 
@@ -481,6 +582,229 @@ fn brightest_pixel(image: &verify::PngImage) -> (u32, u32, f32) {
     best
 }
 
+const VERIFY_FIXED_DT_SECONDS: f32 = 0.00694;
+const PLAYFIELD_ASPECT_RATIO: f32 = 4.0 / 3.0;
+const SHIP_VERTEX_COUNT: usize = 4;
+const SHIP_VERTICES: [asteroids::beam::Vec2; SHIP_VERTEX_COUNT] = [
+    asteroids::beam::Vec2::new(0.44, 0.0),
+    asteroids::beam::Vec2::new(-0.30, 0.22),
+    asteroids::beam::Vec2::new(-0.12, 0.0),
+    asteroids::beam::Vec2::new(-0.30, -0.22),
+];
+const SHIP_SEGMENTS: [(usize, usize); SHIP_VERTEX_COUNT] = [(0, 1), (1, 2), (2, 3), (3, 0)];
+const SHIP_ANGLE_SEARCH_RADIUS_RAD: f32 = 0.25;
+const SHIP_ANGLE_COARSE_STEP_RAD: f32 = 0.006;
+const SHIP_ANGLE_FINE_RADIUS_RAD: f32 = 0.012;
+const SHIP_ANGLE_FINE_STEP_RAD: f32 = 0.001;
+
+#[derive(Clone, Debug)]
+struct ShipDetection {
+    angle_rad: f32,
+    vertex_luminance: [f32; SHIP_VERTEX_COUNT],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AngleRateFit {
+    rate_rad_per_sec: f32,
+    max_residual_rad: f32,
+}
+
+fn detect_ship_angles(
+    frames: &[PathBuf],
+    rotation_rate_rad_per_sec: f32,
+) -> Result<Vec<ShipDetection>, String> {
+    let mut detections = Vec::with_capacity(frames.len());
+    let expected_delta = rotation_rate_rad_per_sec * VERIFY_FIXED_DT_SECONDS;
+    let mut initial_angle = None;
+
+    for (frame_index, path) in frames.iter().enumerate() {
+        let image = verify::load_png(path)?;
+        let playfield = centered_aspect_rect(image.width, image.height, PLAYFIELD_ASPECT_RATIO)?;
+
+        let angle = if let Some(initial_angle) = initial_angle {
+            let predicted_angle = initial_angle + expected_delta * frame_index as f32;
+            measure_ship_angle(
+                &image,
+                playfield,
+                predicted_angle,
+                SHIP_ANGLE_SEARCH_RADIUS_RAD,
+            )
+        } else {
+            let angle = measure_ship_angle(&image, playfield, PI, PI);
+            initial_angle = Some(angle);
+            angle
+        };
+        let vertex_luminance = ship_vertex_luminance(&image, playfield, angle);
+        let weakest_vertex = vertex_luminance.into_iter().fold(f32::INFINITY, f32::min);
+        let vertex_threshold = 0.025;
+        if weakest_vertex < vertex_threshold {
+            return Err(format!(
+                "ship-outline failed: frame {frame_index} detected {SHIP_VERTEX_COUNT} vertices but weakest luma={weakest_vertex:.6} below threshold={vertex_threshold:.6}"
+            ));
+        }
+
+        detections.push(ShipDetection {
+            angle_rad: angle,
+            vertex_luminance,
+        });
+    }
+
+    Ok(detections)
+}
+
+fn measure_ship_angle(
+    image: &verify::PngImage,
+    playfield: PixelRect,
+    center: f32,
+    radius: f32,
+) -> f32 {
+    let coarse = best_ship_angle(image, playfield, center, radius, SHIP_ANGLE_COARSE_STEP_RAD);
+    best_ship_angle(
+        image,
+        playfield,
+        coarse,
+        SHIP_ANGLE_FINE_RADIUS_RAD,
+        SHIP_ANGLE_FINE_STEP_RAD,
+    )
+}
+
+fn best_ship_angle(
+    image: &verify::PngImage,
+    playfield: PixelRect,
+    center: f32,
+    radius: f32,
+    step: f32,
+) -> f32 {
+    let steps = ((radius * 2.0) / step).ceil().max(1.0) as i32;
+    let start = center - radius;
+    let mut best_angle = center;
+    let mut best_score = f32::NEG_INFINITY;
+    for i in 0..=steps {
+        let angle = start + i as f32 * step;
+        let score = ship_outline_score(image, playfield, angle);
+        if score > best_score {
+            best_score = score;
+            best_angle = angle;
+        }
+    }
+    best_angle
+}
+
+fn ship_outline_score(image: &verify::PngImage, playfield: PixelRect, angle: f32) -> f32 {
+    let vertices = ship_pixels(playfield, angle);
+    let mut score = 0.0;
+    let mut samples = 0;
+    for (start, end) in SHIP_SEGMENTS {
+        let a = vertices[start];
+        let b = vertices[end];
+        for i in [3, 5, 7, 9, 11, 13] {
+            let t = i as f32 / 16.0;
+            let point = (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+            score += max_signal_near(image, point, 1);
+            samples += 1;
+        }
+    }
+    score / samples.max(1) as f32
+}
+
+fn ship_vertex_luminance(
+    image: &verify::PngImage,
+    playfield: PixelRect,
+    angle: f32,
+) -> [f32; SHIP_VERTEX_COUNT] {
+    ship_pixels(playfield, angle).map(|point| max_signal_near(image, point, 4))
+}
+
+fn ship_pixels(playfield: PixelRect, angle: f32) -> [(f32, f32); SHIP_VERTEX_COUNT] {
+    SHIP_VERTICES.map(|vertex| {
+        gameplay_to_pixel(
+            playfield,
+            rotate_vec2(vertex * asteroids::tuning::SHIP_SPINNING_SCALE, angle),
+        )
+    })
+}
+
+fn gameplay_to_pixel(playfield: PixelRect, point: asteroids::beam::Vec2) -> (f32, f32) {
+    (
+        playfield.left as f32 + (point.x * 0.5 + 0.5) * playfield.width() as f32,
+        playfield.top as f32 + (0.5 - point.y * 0.5) * playfield.height() as f32,
+    )
+}
+
+fn rotate_vec2(point: asteroids::beam::Vec2, angle: f32) -> asteroids::beam::Vec2 {
+    let (sin, cos) = angle.sin_cos();
+    asteroids::beam::Vec2::new(point.x * cos - point.y * sin, point.x * sin + point.y * cos)
+}
+
+fn max_luminance_near(image: &verify::PngImage, point: (f32, f32), radius: i32) -> f32 {
+    let x = point.0.round() as i32;
+    let y = point.1.round() as i32;
+    let mut best = 0.0;
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            if dx * dx + dy * dy > radius * radius {
+                continue;
+            }
+            let px = (x + dx).clamp(0, image.width.saturating_sub(1) as i32) as u32;
+            let py = (y + dy).clamp(0, image.height.saturating_sub(1) as i32) as u32;
+            best = f32::max(best, image.luminance(px, py));
+        }
+    }
+    best
+}
+
+fn max_signal_near(image: &verify::PngImage, point: (f32, f32), radius: i32) -> f32 {
+    let x = point.0.round() as i32;
+    let y = point.1.round() as i32;
+    let mut best = 0.0;
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            if dx * dx + dy * dy > radius * radius {
+                continue;
+            }
+            let px = (x + dx).clamp(0, image.width.saturating_sub(1) as i32) as u32;
+            let py = (y + dy).clamp(0, image.height.saturating_sub(1) as i32) as u32;
+            let [red, green, blue, _] = image.pixel_rgba(px, py);
+            best = f32::max(best, red.max(green).max(blue) as f32 / 255.0);
+        }
+    }
+    best
+}
+
+fn fit_angle_rate(detections: &[ShipDetection], fixed_dt: f32) -> AngleRateFit {
+    let n = detections.len() as f32;
+    let mean_time = fixed_dt * (n - 1.0) * 0.5;
+    let mean_angle = detections
+        .iter()
+        .map(|detection| detection.angle_rad)
+        .sum::<f32>()
+        / n;
+    let mut ss_xy = 0.0;
+    let mut ss_xx = 0.0;
+    for (index, detection) in detections.iter().enumerate() {
+        let dt = index as f32 * fixed_dt - mean_time;
+        ss_xy += dt * (detection.angle_rad - mean_angle);
+        ss_xx += dt * dt;
+    }
+    let rate = if ss_xx > f32::EPSILON {
+        ss_xy / ss_xx
+    } else {
+        0.0
+    };
+    let intercept = mean_angle - rate * mean_time;
+    let max_residual = detections
+        .iter()
+        .enumerate()
+        .map(|(index, detection)| {
+            (detection.angle_rad - (intercept + rate * index as f32 * fixed_dt)).abs()
+        })
+        .fold(0.0, f32::max);
+    AngleRateFit {
+        rate_rad_per_sec: rate,
+        max_residual_rad: max_residual,
+    }
+}
+
 fn estimated_fwhm_width(image: &verify::PngImage) -> f32 {
     let best = brightest_pixel(image);
     let row_values = (0..image.width)
@@ -708,6 +1032,7 @@ fn subcommand_help(command: &str) -> String {
         "banding" => "Usage: verify banding --frame <png> --max-step-jump <luma>".to_string(),
         "peak-count" => "Usage: verify peak-count --frame <png> [--threshold <luma>] [--min <n>] [--max <n>]".to_string(),
         "ship-outline" => "Usage: verify ship-outline --frames <dir> --vertex-count <n> --rotation-rate-rad-per-sec <rate> --tolerance <value>".to_string(),
+        "trail-luminance" => "Usage: verify trail-luminance --frames <dir> --behind-vector --min-luminance <value>".to_string(),
         "soul-visible" => "Usage: verify soul-visible [task-specific args added by the soul-visible milestone]".to_string(),
         "asteroid-count" => "Usage: verify asteroid-count --frame <png> --count <n>".to_string(),
         "screen-wrap" => "Usage: verify screen-wrap --log <state-jsonl> --expect <event,...>".to_string(),
