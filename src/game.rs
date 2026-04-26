@@ -49,10 +49,16 @@ pub const ASTEROIDS_PER_WAVE_INCREMENT: u32 = 2;
 pub const ASTEROIDS_PER_WAVE_MAX: u32 = 11;
 pub const ASTEROID_HULL_VERTEX_COUNT: usize = 10;
 pub const INITIAL_LIVES: u32 = 3;
-pub const BULLET_LIFETIME_SECONDS: f32 = 1.0;
 pub const BULLET_SPEED_NDC_PER_SEC: f32 = 1.65;
 pub const BULLET_RADIUS_NDC: f32 = 0.012;
 pub const BULLET_RENDER_RADIUS_NDC: f32 = 0.0045;
+/// Original player fire state has four ship-shot timer slots at $021F-$0222,
+/// loaded with `#$12` when a shot is created.
+pub const PLAYER_SHOT_SLOT_COUNT: usize = 4;
+pub const PLAYER_SHOT_TIMER_RELOAD_TICKS: f32 = 0x12 as f32;
+pub const PLAYER_SHOT_TIMER_TICK_SECONDS: f32 = 4.0 / tuning::ASTEROID_ORIGINAL_FPS;
+pub const BULLET_LIFETIME_SECONDS: f32 =
+    PLAYER_SHOT_TIMER_RELOAD_TICKS * PLAYER_SHOT_TIMER_TICK_SECONDS;
 pub const SHIP_COLLISION_RADIUS_NDC: f32 = 0.44 * tuning::SHIP_GAMEPLAY_SCALE;
 pub const SHIP_RESPAWN_DELAY_SECONDS: f32 = 1.25;
 pub const SHIP_RESPAWN_INVULNERABILITY_SECONDS: f32 = 1.25;
@@ -67,6 +73,8 @@ pub const UFO_SPAWN_SCORE_STEP_POINTS: u32 = 2_500;
 pub const UFO_BULLET_SPEED_NDC_PER_SEC: f32 = 1.25;
 
 const UFO_ORIGINAL_TIMER_TICK_SECONDS: f32 = 4.0 / tuning::ASTEROID_ORIGINAL_FPS;
+const PLAYER_SHOT_COMPONENT_SPEED_MAX_NDC_PER_SEC: f32 =
+    0x6F as f32 * tuning::ASTEROID_RAW_VELOCITY_TO_NDC_PER_SEC;
 const UFO_SPAWN_RELOAD_INITIAL_TICKS: u32 = 0x92;
 const UFO_SPAWN_RELOAD_DECREMENT_TICKS: u32 = 0x06;
 const UFO_SPAWN_RELOAD_MIN_TICKS: u32 = 0x20;
@@ -245,19 +253,36 @@ impl Asteroid {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Bullet {
     pub id: u32,
+    pub player_slot: Option<usize>,
     pub position: Vec2,
     pub velocity: Vec2,
     pub age_seconds: f32,
+    pub shot_timer_ticks_remaining: f32,
     pub wrapped_last_tick: bool,
 }
 
 impl Bullet {
     fn new(id: u32, position: Vec2, velocity: Vec2) -> Self {
+        Self::with_player_slot(id, None, position, velocity)
+    }
+
+    fn new_player_shot(id: u32, slot: usize, position: Vec2, velocity: Vec2) -> Self {
+        Self::with_player_slot(id, Some(slot), position, velocity)
+    }
+
+    fn with_player_slot(
+        id: u32,
+        player_slot: Option<usize>,
+        position: Vec2,
+        velocity: Vec2,
+    ) -> Self {
         Self {
             id,
+            player_slot,
             position,
             velocity,
             age_seconds: 0.0,
+            shot_timer_ticks_remaining: PLAYER_SHOT_TIMER_RELOAD_TICKS,
             wrapped_last_tick: false,
         }
     }
@@ -266,11 +291,13 @@ impl Bullet {
         let (position, wrapped) = wrap_position_with_report(self.position + self.velocity * dt);
         self.position = position;
         self.age_seconds += dt;
+        self.shot_timer_ticks_remaining =
+            (self.shot_timer_ticks_remaining - dt / PLAYER_SHOT_TIMER_TICK_SECONDS).max(0.0);
         self.wrapped_last_tick = wrapped;
     }
 
     pub fn is_expired(self) -> bool {
-        self.age_seconds >= BULLET_LIFETIME_SECONDS
+        self.shot_timer_ticks_remaining <= f32::EPSILON
     }
 }
 
@@ -616,7 +643,7 @@ pub struct GameState {
     hyperspace_cooldown_timer_seconds: f32,
     hyperspace_was_down: bool,
     ufo_spawn_timer_seconds: f32,
-    fire_was_down: bool,
+    photon_limiter: u8,
     events: Vec<GameEvent>,
     rng: SeededRng,
     script: ScriptedScenario,
@@ -753,7 +780,7 @@ impl GameState {
             hyperspace_cooldown_timer_seconds: 0.0,
             hyperspace_was_down: false,
             ufo_spawn_timer_seconds: ufo_spawn_interval_seconds_for_score(SCORE_PLACEHOLDER),
-            fire_was_down: false,
+            photon_limiter: 0,
             events: Vec::new(),
             rng: rng_for_seed(seed),
             script: ScriptedScenario::None,
@@ -781,6 +808,7 @@ impl GameState {
             asteroid.integrate(dt);
         }
         self.update_ufo(dt);
+        self.despawn_expired_bullets();
         self.update_fire(input);
         for bullet in &mut self.bullets {
             bullet.integrate(dt);
@@ -936,7 +964,7 @@ impl GameState {
     }
 
     fn latch_edge_inputs(&mut self, input: &ControlState) {
-        self.fire_was_down = input.fire;
+        self.sample_photon_limiter(input.fire);
         self.hyperspace_was_down = input.hyperspace;
     }
 
@@ -1058,11 +1086,17 @@ impl GameState {
     }
 
     fn update_fire(&mut self, input: &ControlState) {
-        let fire_pressed = input.fire && !self.fire_was_down;
-        self.fire_was_down = input.fire;
-        if self.alive && !self.game_over && fire_pressed {
+        let fire_limited = self.sample_photon_limiter(input.fire);
+        if self.alive && !self.game_over && fire_limited {
             self.fire_bullet(input.shot_x_scale);
         }
+    }
+
+    fn sample_photon_limiter(&mut self, fire_down: bool) -> bool {
+        let (next_limiter, fire_limited) =
+            sample_photon_limiter_byte(self.photon_limiter, fire_down);
+        self.photon_limiter = next_limiter;
+        fire_limited
     }
 
     fn update_hyperspace_cooldown(&mut self, dt: f32) {
@@ -1093,14 +1127,31 @@ impl GameState {
     }
 
     fn fire_bullet(&mut self, shot_x_scale: f32) {
+        let Some(slot) = self.open_player_shot_slot() else {
+            return;
+        };
         let forward = shot_forward(self.ship.angle, shot_x_scale);
         let id = self.allocate_bullet_id();
         let position = wrap_position(
             self.ship.position + forward * (SHIP_COLLISION_RADIUS_NDC + BULLET_RADIUS_NDC),
         );
-        let velocity = forward * BULLET_SPEED_NDC_PER_SEC;
-        self.bullets.push(Bullet::new(id, position, velocity));
+        let velocity =
+            clamp_player_shot_velocity(self.ship.velocity + forward * BULLET_SPEED_NDC_PER_SEC);
+        self.bullets
+            .push(Bullet::new_player_shot(id, slot, position, velocity));
         self.push_event(GameEventKind::BulletFired);
+    }
+
+    fn open_player_shot_slot(&self) -> Option<usize> {
+        (0..PLAYER_SHOT_SLOT_COUNT)
+            .rev()
+            .find(|slot| !self.player_shot_slot_is_active(*slot))
+    }
+
+    fn player_shot_slot_is_active(&self, slot: usize) -> bool {
+        self.bullets
+            .iter()
+            .any(|bullet| bullet.player_slot == Some(slot) && !bullet.is_expired())
     }
 
     fn update_ufo(&mut self, dt: f32) {
@@ -2111,6 +2162,27 @@ fn bool_axis(value: bool) -> f32 {
     if value { 1.0 } else { 0.0 }
 }
 
+fn sample_photon_limiter_byte(current: u8, fire_down: bool) -> (u8, bool) {
+    // Mirrors `ROR photomLimiter`: fire is accepted only on a pressed sample
+    // whose previous limiter byte was not already above the original threshold.
+    let next = (current >> 1) | if fire_down { 0x80 } else { 0x00 };
+    let fire_limited = fire_down && next & 0x80 != 0 && next & 0x40 == 0;
+    (next, fire_limited)
+}
+
+fn clamp_player_shot_velocity(velocity: Vec2) -> Vec2 {
+    Vec2::new(
+        velocity.x.clamp(
+            -PLAYER_SHOT_COMPONENT_SPEED_MAX_NDC_PER_SEC,
+            PLAYER_SHOT_COMPONENT_SPEED_MAX_NDC_PER_SEC,
+        ),
+        velocity.y.clamp(
+            -PLAYER_SHOT_COMPONENT_SPEED_MAX_NDC_PER_SEC,
+            PLAYER_SHOT_COMPONENT_SPEED_MAX_NDC_PER_SEC,
+        ),
+    )
+}
+
 fn clamp_velocity(velocity: Vec2, max_speed: f32) -> Vec2 {
     let speed = velocity.length();
     if speed > max_speed {
@@ -2600,7 +2672,8 @@ mod tests {
             Vec2::ZERO,
             Vec2::new(BULLET_SPEED_NDC_PER_SEC, 0.0),
         ));
-        state.bullets[0].age_seconds = BULLET_LIFETIME_SECONDS - FIXED_TIMESTEP_SECONDS * 0.5;
+        state.bullets[0].shot_timer_ticks_remaining =
+            FIXED_TIMESTEP_SECONDS / PLAYER_SHOT_TIMER_TICK_SECONDS * 0.5;
 
         state.step(&ControlState::default(), FIXED_TIMESTEP_SECONDS);
 
@@ -2614,7 +2687,14 @@ mod tests {
     }
 
     #[test]
-    fn player_bullet_velocity_follows_ship_angle_without_ship_drift() {
+    fn player_shot_lifetime_matches_original_four_frame_timer_cadence() {
+        assert!((PLAYER_SHOT_TIMER_RELOAD_TICKS - 18.0).abs() < EPSILON);
+        assert!((PLAYER_SHOT_TIMER_TICK_SECONDS - 4.0 / 60.0).abs() < EPSILON);
+        assert!((BULLET_LIFETIME_SECONDS - 1.2).abs() < EPSILON);
+    }
+
+    #[test]
+    fn player_bullet_velocity_inherits_ship_drift() {
         let mut state = empty_test_state();
         state.ship = ShipState {
             position: Vec2::ZERO,
@@ -2626,9 +2706,12 @@ mod tests {
 
         assert_eq!(state.bullets.len(), 1);
         let bullet = state.bullets[0];
-        assert!(bullet.velocity.x.abs() < EPSILON);
-        assert!((bullet.velocity.y - BULLET_SPEED_NDC_PER_SEC).abs() < EPSILON);
-        assert!((bullet.velocity.length() - BULLET_SPEED_NDC_PER_SEC).abs() < EPSILON);
+        assert_eq!(bullet.player_slot, Some(PLAYER_SHOT_SLOT_COUNT - 1));
+        assert!((bullet.velocity.x - state.ship.velocity.x).abs() < EPSILON);
+        assert!(
+            (bullet.velocity.y - (state.ship.velocity.y + BULLET_SPEED_NDC_PER_SEC)).abs()
+                < EPSILON
+        );
         assert!(bullet.position.x.abs() < EPSILON);
         assert!(
             (bullet.position.y - (SHIP_COLLISION_RADIUS_NDC + BULLET_RADIUS_NDC)).abs() < EPSILON
@@ -2650,6 +2733,94 @@ mod tests {
         let bullet = state.bullets[0];
         assert!((bullet.velocity.length() - BULLET_SPEED_NDC_PER_SEC).abs() < EPSILON);
         assert!((bullet.velocity.x / bullet.velocity.y - shot_x_scale).abs() < EPSILON);
+    }
+
+    #[test]
+    fn player_bullet_velocity_clamps_after_inheriting_ship_drift() {
+        let mut state = empty_test_state();
+        state.ship = ShipState {
+            position: Vec2::ZERO,
+            velocity: Vec2::new(SHIP_MAX_VELOCITY_UNITS_PER_SEC, 0.0),
+            angle: 0.0,
+        };
+
+        state.fire_bullet(1.0);
+
+        let bullet = state.bullets[0];
+        assert!((bullet.velocity.x - PLAYER_SHOT_COMPONENT_SPEED_MAX_NDC_PER_SEC).abs() < EPSILON);
+        assert!(bullet.velocity.y.abs() < EPSILON);
+    }
+
+    #[test]
+    fn photon_limiter_blocks_held_fire_after_first_sample() {
+        let mut state = empty_test_state();
+        let input = ControlState {
+            fire: true,
+            ..ControlState::default()
+        };
+
+        for _ in 0..8 {
+            state.update_fire(&input);
+        }
+
+        assert_eq!(state.bullets.len(), 1);
+        assert!(state.photon_limiter > 0x7f);
+    }
+
+    #[test]
+    fn player_fire_uses_four_original_shot_slots() {
+        let mut state = empty_test_state();
+
+        for _ in 0..PLAYER_SHOT_SLOT_COUNT {
+            state.update_fire(&ControlState {
+                fire: true,
+                ..ControlState::default()
+            });
+            state.update_fire(&ControlState::default());
+        }
+
+        assert_eq!(state.bullets.len(), PLAYER_SHOT_SLOT_COUNT);
+        for slot in 0..PLAYER_SHOT_SLOT_COUNT {
+            assert!(
+                state
+                    .bullets
+                    .iter()
+                    .any(|bullet| bullet.player_slot == Some(slot))
+            );
+        }
+
+        state.update_fire(&ControlState {
+            fire: true,
+            ..ControlState::default()
+        });
+
+        assert_eq!(state.bullets.len(), PLAYER_SHOT_SLOT_COUNT);
+    }
+
+    #[test]
+    fn expired_player_shot_timer_reopens_slot() {
+        let mut state = empty_test_state();
+        for _ in 0..PLAYER_SHOT_SLOT_COUNT {
+            state.photon_limiter = 0;
+            state.fire_bullet(1.0);
+        }
+        let recycled_slot = state.bullets[0].player_slot.unwrap();
+        state.bullets[0].shot_timer_ticks_remaining = 0.0;
+
+        state.despawn_expired_bullets();
+        state.photon_limiter = 0;
+        state.update_fire(&ControlState {
+            fire: true,
+            ..ControlState::default()
+        });
+
+        assert_eq!(state.bullets.len(), PLAYER_SHOT_SLOT_COUNT);
+        assert!(
+            state
+                .bullets
+                .iter()
+                .any(|bullet| bullet.player_slot == Some(recycled_slot) && bullet.id > 4)
+        );
     }
 
     #[test]
