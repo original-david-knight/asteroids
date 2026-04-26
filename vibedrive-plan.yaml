@@ -484,7 +484,7 @@ tasks:
         Update the GameSnapshot POD pushed to the audio side each tick (asteroid count placeholder until next task).
         Input-latency target: total input-to-feedback budget ~16ms (sim step ~4.2ms + frame ~6.9ms at 144Hz + audio block ~5.3ms) per DESIGN.md "low input latency" constraint - do not add per-frame input batching that defers events.
         Add unit tests for: spiral-of-death substep cap (cap=4 enforced), screen wrap (positions wrap at playfield edges), rotation rate (radians per second), thrust integration (acceleration accumulates and caps at max velocity), no-friction (idle ship retains velocity).
-      status: todo
+      status: done
       workflow: implement
       deps:
         - checkpoint-soul-audible

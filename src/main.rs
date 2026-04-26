@@ -2,7 +2,8 @@ use std::{error::Error, sync::Arc};
 
 use asteroids::{
     audio::{AudioMsg, AudioMsgSender, AudioRuntime, AudioScaffold, VOICE_THRUST},
-    renderer::{self, Renderer},
+    game::{ControlState, GameLoop},
+    renderer::{self, FrameParams, Renderer, Scenario},
     runtime::{self, RuntimeConfig},
     tuning,
 };
@@ -49,6 +50,7 @@ struct AsteroidsApp {
     audio_sender: Option<AudioMsgSender>,
     audio_runtime: Option<AudioRuntime>,
     input: InputState,
+    game: GameLoop,
     startup_error: Option<String>,
 }
 
@@ -61,6 +63,7 @@ impl AsteroidsApp {
             audio_sender: None,
             audio_runtime: None,
             input: InputState::default(),
+            game: GameLoop::new(),
             startup_error: None,
         }
     }
@@ -87,14 +90,26 @@ impl AsteroidsApp {
 
 #[derive(Default)]
 struct InputState {
+    rotate_left_a: bool,
+    rotate_left_arrow: bool,
+    rotate_right_d: bool,
+    rotate_right_arrow: bool,
     thrust_w: bool,
     thrust_up: bool,
+    fire_space: bool,
+    hyperspace_h: bool,
 }
 
 #[derive(Clone, Copy)]
-enum ThrustKey {
+enum InputBinding {
+    RotateLeftA,
+    RotateLeftArrow,
+    RotateRightD,
+    RotateRightArrow,
     W,
     Up,
+    FireSpace,
+    HyperspaceH,
 }
 
 impl InputState {
@@ -102,28 +117,59 @@ impl InputState {
         self.thrust_w || self.thrust_up
     }
 
-    fn update_thrust(&mut self, key: ThrustKey, pressed: bool) -> Option<bool> {
+    fn controls(&self) -> ControlState {
+        ControlState {
+            rotate_left: self.rotate_left_a || self.rotate_left_arrow,
+            rotate_right: self.rotate_right_d || self.rotate_right_arrow,
+            thrust: self.thrust_active(),
+            fire: self.fire_space,
+            hyperspace: self.hyperspace_h,
+        }
+    }
+
+    fn update_binding(&mut self, binding: InputBinding, pressed: bool) -> Option<bool> {
         let was_active = self.thrust_active();
-        match key {
-            ThrustKey::W => self.thrust_w = pressed,
-            ThrustKey::Up => self.thrust_up = pressed,
+        match binding {
+            InputBinding::RotateLeftA => self.rotate_left_a = pressed,
+            InputBinding::RotateLeftArrow => self.rotate_left_arrow = pressed,
+            InputBinding::RotateRightD => self.rotate_right_d = pressed,
+            InputBinding::RotateRightArrow => self.rotate_right_arrow = pressed,
+            InputBinding::W => self.thrust_w = pressed,
+            InputBinding::Up => self.thrust_up = pressed,
+            InputBinding::FireSpace => self.fire_space = pressed,
+            InputBinding::HyperspaceH => self.hyperspace_h = pressed,
         }
         let is_active = self.thrust_active();
         (was_active != is_active).then_some(is_active)
     }
 
-    fn clear_thrust(&mut self) -> bool {
+    fn clear_controls(&mut self) -> bool {
         let was_active = self.thrust_active();
+        self.rotate_left_a = false;
+        self.rotate_left_arrow = false;
+        self.rotate_right_d = false;
+        self.rotate_right_arrow = false;
         self.thrust_w = false;
         self.thrust_up = false;
+        self.fire_space = false;
+        self.hyperspace_h = false;
         was_active
     }
 }
 
-fn thrust_key_for_event(event: &KeyEvent) -> Option<ThrustKey> {
+fn input_binding_for_event(event: &KeyEvent) -> Option<InputBinding> {
     match &event.logical_key {
-        Key::Named(NamedKey::ArrowUp) => Some(ThrustKey::Up),
-        Key::Character(text) if text.eq_ignore_ascii_case("w") => Some(ThrustKey::W),
+        Key::Named(NamedKey::ArrowLeft) => Some(InputBinding::RotateLeftArrow),
+        Key::Named(NamedKey::ArrowRight) => Some(InputBinding::RotateRightArrow),
+        Key::Named(NamedKey::ArrowUp) => Some(InputBinding::Up),
+        Key::Named(NamedKey::Space) => Some(InputBinding::FireSpace),
+        Key::Character(text) if text.eq_ignore_ascii_case("a") => Some(InputBinding::RotateLeftA),
+        Key::Character(text) if text.eq_ignore_ascii_case("d") => Some(InputBinding::RotateRightD),
+        Key::Character(text) if text.eq_ignore_ascii_case("w") => Some(InputBinding::W),
+        // DESIGN.md Input Mapping listed Shift as a hyperspace alternate. The
+        // autonomous run drops that binding and keeps H only so platform/window
+        // manager Shift shortcuts cannot collide with gameplay input.
+        Key::Character(text) if text.eq_ignore_ascii_case("h") => Some(InputBinding::HyperspaceH),
         _ => None,
     }
 }
@@ -213,10 +259,10 @@ impl ApplicationHandler for AsteroidsApp {
 
         if let WindowEvent::KeyboardInput { event, .. } = &event
             && !event.repeat
-            && let Some(key) = thrust_key_for_event(event)
+            && let Some(binding) = input_binding_for_event(event)
         {
             let pressed = event.state == ElementState::Pressed;
-            if let Some(active) = self.input.update_thrust(key, pressed) {
+            if let Some(active) = self.input.update_binding(binding, pressed) {
                 self.set_thrust_audio_gate(active);
             }
         }
@@ -224,7 +270,7 @@ impl ApplicationHandler for AsteroidsApp {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Focused(false) => {
-                if self.input.clear_thrust() {
+                if self.input.clear_controls() {
                     self.set_thrust_audio_gate(false);
                 }
             }
@@ -237,6 +283,19 @@ impl ApplicationHandler for AsteroidsApp {
                     },
                 ..
             } => event_loop.exit(),
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Character(text),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } if text.eq_ignore_ascii_case("p") => {
+                self.game.toggle_paused();
+                println!("pause: {}", if self.game.paused() { "on" } else { "off" });
+            }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -361,11 +420,24 @@ impl ApplicationHandler for AsteroidsApp {
                 }
             }
             WindowEvent::RedrawRequested => {
-                if let (Some(renderer), Some(window)) =
-                    (self.renderer.as_mut(), self.window.as_ref())
-                {
+                let Some(renderer) = self.renderer.as_mut() else {
+                    return;
+                };
+                let frame_dt = renderer.frame_dt_seconds();
+                let controls = self.input.controls();
+                let audio_sender = &mut self.audio_sender;
+                self.game.advance(frame_dt, &controls, |snapshot| {
+                    if let Some(sender) = audio_sender.as_mut() {
+                        let _ = sender.try_push(AudioMsg::GameState(snapshot));
+                    }
+                });
+                let params =
+                    FrameParams::new(Scenario::Idle, self.game.render_time_seconds(), frame_dt)
+                        .with_ship(self.game.interpolated_ship());
+
+                if let Some(window) = self.window.as_ref() {
                     window.pre_present_notify();
-                    if let Err(error) = renderer.render() {
+                    if let Err(error) = renderer.render_with_params(params) {
                         self.fail(event_loop, error);
                         return;
                     }

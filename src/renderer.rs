@@ -11,6 +11,7 @@ use winit::{dpi::PhysicalSize, window::Window};
 
 use crate::{
     beam::{self, BeamCommand, BeamEmitter, BeamVertex, Vec2},
+    game::RenderShip,
     tuning,
 };
 
@@ -27,6 +28,7 @@ pub enum Scenario {
     GammaRamp,
     Thrust1s,
     ShipSpinningWithThrust,
+    HeavyInput,
 }
 
 impl Scenario {
@@ -42,6 +44,7 @@ impl Scenario {
             "gamma-ramp" => Some(Self::GammaRamp),
             "thrust-1s" => Some(Self::Thrust1s),
             "ship-spinning-with-thrust" => Some(Self::ShipSpinningWithThrust),
+            "heavy-input" => Some(Self::HeavyInput),
             _ => None,
         }
     }
@@ -58,7 +61,12 @@ impl Scenario {
             Self::GammaRamp => "gamma-ramp",
             Self::Thrust1s => "thrust-1s",
             Self::ShipSpinningWithThrust => "ship-spinning-with-thrust",
+            Self::HeavyInput => "heavy-input",
         }
+    }
+
+    pub fn uses_game_simulation(self) -> bool {
+        matches!(self, Self::HeavyInput)
     }
 }
 
@@ -67,6 +75,7 @@ pub struct FrameParams {
     pub scenario: Scenario,
     pub time_seconds: f32,
     pub frame_dt_seconds: f32,
+    pub ship: Option<RenderShip>,
 }
 
 impl FrameParams {
@@ -75,7 +84,13 @@ impl FrameParams {
             scenario,
             time_seconds,
             frame_dt_seconds,
+            ship: None,
         }
+    }
+
+    pub fn with_ship(mut self, ship: RenderShip) -> Self {
+        self.ship = Some(ship);
+        self
     }
 }
 
@@ -307,6 +322,7 @@ impl Renderer {
             &mut self.gameplay_beam_emitter,
             params.scenario,
             params.time_seconds,
+            params.ship,
             self.size,
         );
 
@@ -415,7 +431,7 @@ impl Renderer {
         self.config.present_mode
     }
 
-    fn frame_dt_seconds(&mut self) -> f32 {
+    pub fn frame_dt_seconds(&mut self) -> f32 {
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
@@ -507,6 +523,7 @@ impl HeadlessRenderer {
             &mut self.gameplay_beam_emitter,
             params.scenario,
             params.time_seconds,
+            params.ship,
             self.size,
         );
 
@@ -828,6 +845,7 @@ fn emit_frame_beams(
     gameplay_emitter: &mut BeamEmitter,
     scenario: Scenario,
     time_s: f32,
+    ship: Option<RenderShip>,
     size: PhysicalSize<u32>,
 ) {
     let playfield = PlayfieldRect::centered_4_3(size);
@@ -836,7 +854,11 @@ fn emit_frame_beams(
     gameplay_emitter.clear();
 
     emit_bezel_readouts(frame_emitter, playfield, size);
-    emit_scenario_beams(gameplay_emitter, scenario, time_s);
+    if let Some(ship) = ship {
+        emit_ship_outline(gameplay_emitter, ship.position, ship.angle, ship.scale, 1.0);
+    } else {
+        emit_scenario_beams(gameplay_emitter, scenario, time_s);
+    }
 
     for command in gameplay_emitter.commands() {
         frame_emitter.emit(playfield.map_command(*command));
@@ -972,7 +994,7 @@ fn emit_scenario_beams(emitter: &mut BeamEmitter, scenario: Scenario, time_s: f3
             emit_static_bright_line(emitter, tuning::PHOSPHOR_TRAIL_HIGH_DWELL_US)
         }
         Scenario::GammaRamp => emit_gamma_ramp_beams(emitter),
-        Scenario::Thrust1s => emit_idle_beams(emitter),
+        Scenario::Thrust1s | Scenario::HeavyInput => emit_idle_beams(emitter),
     }
 }
 

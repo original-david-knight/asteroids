@@ -15,6 +15,7 @@ use winit::dpi::PhysicalSize;
 
 use crate::{
     audio,
+    game::{self, ControlState, GameLoop},
     renderer::{FrameParams, HeadlessRenderer, Scenario},
     rng::{SeededRng, rng_for_seed},
     tuning, verify,
@@ -164,11 +165,12 @@ pub async fn run_automated(config: &RuntimeConfig) -> Result<(), String> {
         config.bloom_threshold,
     );
 
-    let audio_writer = start_automated_audio_capture(config)?;
+    let mut audio_writer = start_automated_audio_capture(config)?;
 
     let mut frame_time_log = optional_writer(config.frame_time_log.as_deref())?;
     let mut state_log = optional_writer(config.state_log.as_deref())?;
     let mut tick_state = TickState::new(config.seed);
+    let mut game_loop = GameLoop::new();
 
     if let Some(writer) = state_log.as_mut() {
         write_state_event(writer, &mut tick_state, config, "scenario-start")?;
@@ -184,8 +186,12 @@ pub async fn run_automated(config: &RuntimeConfig) -> Result<(), String> {
             config,
             fixed_dt,
             &mut tick_state,
-            frame_time_log.as_mut(),
-            state_log.as_mut(),
+            &mut game_loop,
+            TickIo {
+                audio_sender: audio_writer.as_mut().map(|writer| &mut writer.sender),
+                frame_time_log: frame_time_log.as_mut(),
+                state_log: state_log.as_mut(),
+            },
         )?;
     }
 
@@ -199,8 +205,12 @@ pub async fn run_automated(config: &RuntimeConfig) -> Result<(), String> {
                 config,
                 fixed_dt,
                 &mut tick_state,
-                frame_time_log.as_mut(),
-                state_log.as_mut(),
+                &mut game_loop,
+                TickIo {
+                    audio_sender: audio_writer.as_mut().map(|writer| &mut writer.sender),
+                    frame_time_log: frame_time_log.as_mut(),
+                    state_log: state_log.as_mut(),
+                },
             )?;
             let rgba = renderer.capture_rgba8()?;
             let path = frames_out.join(format!("frame_{frame_index:0frame_digits$}.png"));
@@ -215,8 +225,12 @@ pub async fn run_automated(config: &RuntimeConfig) -> Result<(), String> {
                 config,
                 fixed_dt,
                 &mut tick_state,
-                frame_time_log.as_mut(),
-                state_log.as_mut(),
+                &mut game_loop,
+                TickIo {
+                    audio_sender: audio_writer.as_mut().map(|writer| &mut writer.sender),
+                    frame_time_log: frame_time_log.as_mut(),
+                    state_log: state_log.as_mut(),
+                },
             )?;
         }
         let rgba = renderer.capture_rgba8()?;
@@ -233,8 +247,12 @@ pub async fn run_automated(config: &RuntimeConfig) -> Result<(), String> {
             config,
             fixed_dt,
             &mut tick_state,
-            frame_time_log.as_mut(),
-            state_log.as_mut(),
+            &mut game_loop,
+            TickIo {
+                audio_sender: audio_writer.as_mut().map(|writer| &mut writer.sender),
+                frame_time_log: frame_time_log.as_mut(),
+                state_log: state_log.as_mut(),
+            },
         )?;
     }
 
@@ -356,7 +374,7 @@ fn enqueue_audio_msg(
 }
 
 pub fn runtime_usage() -> String {
-    "Usage: asteroids [--headless] [--screenshot <path>] [--capture-frames <N> --frames-out <dir>] [--audio-capture <secs> --wav-out <path>] [--seed <u64>] [--fixed-dt <secs>] [--simulate-secs <secs>] [--scenario <name>] [--xrun-log <path>] [--frame-time-log <path>] [--state-log <path>] [--bloom-intensity <value>] [--bloom-threshold <value>]\n\nScenarios: demo, idle, ship-spinning, horizontal-sweep, static-bright-line, static-bright-line-low-dwell, static-bright-line-high-dwell, gamma-ramp, thrust-1s, ship-spinning-with-thrust".to_string()
+    "Usage: asteroids [--headless] [--screenshot <path>] [--capture-frames <N> --frames-out <dir>] [--audio-capture <secs> --wav-out <path>] [--seed <u64>] [--fixed-dt <secs>] [--simulate-secs <secs>] [--scenario <name>] [--xrun-log <path>] [--frame-time-log <path>] [--state-log <path>] [--bloom-intensity <value>] [--bloom-threshold <value>]\n\nScenarios: demo, idle, ship-spinning, horizontal-sweep, static-bright-line, static-bright-line-low-dwell, static-bright-line-high-dwell, gamma-ramp, thrust-1s, ship-spinning-with-thrust, heavy-input".to_string()
 }
 
 fn render_tick(
@@ -364,26 +382,58 @@ fn render_tick(
     config: &RuntimeConfig,
     fixed_dt: f32,
     tick_state: &mut TickState,
-    frame_time_log: Option<&mut BufWriter<File>>,
-    state_log: Option<&mut BufWriter<File>>,
+    game_loop: &mut GameLoop,
+    io: TickIo<'_>,
 ) -> Result<(), String> {
     let start = Instant::now();
-    renderer.render(FrameParams::new(
-        config.scenario,
-        tick_state.sim_time,
-        fixed_dt,
-    ))?;
+    let mut params = FrameParams::new(config.scenario, tick_state.sim_time, fixed_dt);
+    let mut audio_sender = io.audio_sender;
+    let mut substeps = 0;
+    let mut dropped_accumulator_seconds = 0.0;
+    if config.scenario.uses_game_simulation() {
+        let input = scripted_controls(config.scenario, tick_state.sim_time);
+        let report = game_loop.advance(fixed_dt, &input, |snapshot| {
+            if let Some(sender) = audio_sender.as_mut() {
+                let _ = sender.try_push(audio::AudioMsg::GameState(snapshot));
+            }
+        });
+        substeps = report.substeps;
+        dropped_accumulator_seconds = report.dropped_accumulator_seconds;
+        params = params.with_ship(game_loop.interpolated_ship());
+    }
+
+    renderer.render(params)?;
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-    if let Some(writer) = frame_time_log {
+    if let Some(writer) = io.frame_time_log {
         writeln!(writer, "{duration_ms:.6}")
             .map_err(|error| format!("failed to write frame-time log: {error}"))?;
     }
 
     tick_state.advance(fixed_dt);
-    if let Some(writer) = state_log {
-        write_state_event(writer, tick_state, config, "tick")?;
+    if let Some(writer) = io.state_log {
+        write_state_tick_event(
+            writer,
+            tick_state,
+            config,
+            game_loop,
+            substeps,
+            dropped_accumulator_seconds,
+        )?;
     }
     Ok(())
+}
+
+struct TickIo<'a> {
+    audio_sender: Option<&'a mut audio::AudioMsgSender>,
+    frame_time_log: Option<&'a mut BufWriter<File>>,
+    state_log: Option<&'a mut BufWriter<File>>,
+}
+
+fn scripted_controls(scenario: Scenario, time_seconds: f32) -> ControlState {
+    match scenario {
+        Scenario::HeavyInput => game::heavy_input_controls(time_seconds),
+        _ => ControlState::default(),
+    }
 }
 
 fn write_state_event(
@@ -400,6 +450,33 @@ fn write_state_event(
         config.seed.unwrap_or(0),
         tick = tick_state.tick,
         sim_time = tick_state.sim_time,
+    )
+    .map_err(|error| format!("failed to write state log: {error}"))
+}
+
+fn write_state_tick_event(
+    writer: &mut BufWriter<File>,
+    tick_state: &mut TickState,
+    config: &RuntimeConfig,
+    game_loop: &GameLoop,
+    substeps: u32,
+    dropped_accumulator_seconds: f32,
+) -> Result<(), String> {
+    let rng_outcome = tick_state.rng.next_u64();
+    let state = game_loop.current();
+    writeln!(
+        writer,
+        "{{\"tick\":{tick},\"time\":{sim_time:.6},\"event\":\"tick\",\"scenario\":\"{}\",\"seed\":{},\"rng\":{rng_outcome},\"physics_tick\":{},\"substeps\":{substeps},\"dropped_accumulator_seconds\":{dropped_accumulator_seconds:.6},\"ship_x\":{ship_x:.6},\"ship_y\":{ship_y:.6},\"ship_angle\":{ship_angle:.6},\"ship_vx\":{ship_vx:.6},\"ship_vy\":{ship_vy:.6}}}",
+        config.scenario.name(),
+        config.seed.unwrap_or(0),
+        game_loop.tick(),
+        tick = tick_state.tick,
+        sim_time = tick_state.sim_time,
+        ship_x = state.ship.position.x,
+        ship_y = state.ship.position.y,
+        ship_angle = state.ship.angle,
+        ship_vx = state.ship.velocity.x,
+        ship_vy = state.ship.velocity.y,
     )
     .map_err(|error| format!("failed to write state log: {error}"))
 }
@@ -583,5 +660,27 @@ mod tests {
         assert_eq!(config.scenario, Scenario::ShipSpinningWithThrust);
         assert_eq!(config.capture_frames, Some(144));
         assert_eq!(config.audio_capture_secs, Some(10.0));
+    }
+
+    #[test]
+    fn parses_heavy_input_physics_scenario() {
+        let config = RuntimeConfig::from_args(
+            [
+                "--headless",
+                "--scenario",
+                "heavy-input",
+                "--simulate-secs",
+                "10",
+                "--frame-time-log",
+                "/tmp/loop-frametimes.log",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap();
+
+        assert_eq!(config.scenario, Scenario::HeavyInput);
+        assert!(config.scenario.uses_game_simulation());
+        assert_eq!(config.simulate_secs, Some(10.0));
     }
 }
