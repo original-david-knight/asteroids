@@ -337,6 +337,29 @@ fn emit_demo_beams(emitter: &mut BeamEmitter, time_s: f32) {
     emitter
         .emit_bullet_dot(Vec2::new(sweep_x, -0.54), 0.018, 1.0)
         .emit_asteroid_hull_segment(Vec2::new(-0.86, 0.62), Vec2::new(-0.58, 0.70), 0.45);
+
+    emit_phosphor_trail_verification_beams(emitter, time_s);
+}
+
+fn emit_phosphor_trail_verification_beams(emitter: &mut BeamEmitter, time_s: f32) {
+    let drift = (time_s * 0.55).sin() * 0.12;
+    let x0 = -0.52 + drift;
+    let length = 0.42;
+    let slope = (time_s * 1.2).sin() * 0.035;
+    let rows = [
+        (-0.78, tuning::PHOSPHOR_TRAIL_LOW_DWELL_US),
+        (-0.86, tuning::PHOSPHOR_TRAIL_MID_DWELL_US),
+        (-0.94, tuning::PHOSPHOR_TRAIL_HIGH_DWELL_US),
+    ];
+
+    for (y, dwell_us) in rows {
+        emitter.emit_segment(
+            Vec2::new(x0, y),
+            Vec2::new(x0 + length, y + slope),
+            1.0,
+            dwell_us,
+        );
+    }
 }
 
 pub fn target_surface_size(

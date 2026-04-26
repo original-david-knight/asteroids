@@ -1,0 +1,1 @@
+cargo run --release starts the Rgba16Float phosphor renderer at tau=70ms, and a moving 18/30/80us dwell verification trio was added. Subjective confirmation is blocked because the Wayland session is locked and screenshots show the lock screen, so Open Question 3 is not fully closed.

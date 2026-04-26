@@ -166,7 +166,7 @@ tasks:
         Sit with the renderer running and confirm the trail effect actually feels like a vector display (not just a frame-blend smear).
         Tune tau live with the F-key slider and pick a default in the 50-100ms range that looks like persistence-of-vision rather than motion blur.
         If the effect is wrong (sigma too small, decay misshapen, MAX_LUMA causing clipping), loop back to phosphor-accumulator before continuing. PLAN.md is explicit that this is a "the magic is real" gate, not a "it works" gate.
-      status: todo
+      status: blocked
       workflow: checkpoint
       deps:
         - phosphor-accumulator
