@@ -52,6 +52,7 @@ pub const INITIAL_LIVES: u32 = 3;
 pub const BULLET_LIFETIME_SECONDS: f32 = 1.0;
 pub const BULLET_SPEED_NDC_PER_SEC: f32 = 1.65;
 pub const BULLET_RADIUS_NDC: f32 = 0.012;
+pub const BULLET_RENDER_RADIUS_NDC: f32 = 0.0045;
 pub const SHIP_COLLISION_RADIUS_NDC: f32 = 0.44 * tuning::SHIP_GAMEPLAY_SCALE;
 pub const SHIP_RESPAWN_DELAY_SECONDS: f32 = 1.25;
 pub const SHIP_RESPAWN_INVULNERABILITY_SECONDS: f32 = 1.25;
@@ -874,7 +875,7 @@ impl GameState {
             .map(|bullet| RenderBullet {
                 id: bullet.id,
                 position: bullet.position,
-                radius: BULLET_RADIUS_NDC,
+                radius: BULLET_RENDER_RADIUS_NDC,
             })
             .collect()
     }
@@ -894,7 +895,7 @@ impl GameState {
             .map(|bullet| RenderBullet {
                 id: bullet.id,
                 position: bullet.position,
-                radius: BULLET_RADIUS_NDC,
+                radius: BULLET_RENDER_RADIUS_NDC,
             })
             .collect()
     }
@@ -1795,7 +1796,7 @@ impl GameLoop {
                 RenderBullet {
                     id: current.id,
                     position,
-                    radius: BULLET_RADIUS_NDC,
+                    radius: BULLET_RENDER_RADIUS_NDC,
                 }
             })
             .collect()
@@ -1853,7 +1854,7 @@ impl GameLoop {
                 RenderBullet {
                     id: current.id,
                     position,
-                    radius: BULLET_RADIUS_NDC,
+                    radius: BULLET_RENDER_RADIUS_NDC,
                 }
             })
             .collect()
@@ -2252,6 +2253,28 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == GameEventKind::BulletExpired)
         );
+    }
+
+    #[test]
+    fn bullet_render_radius_is_smaller_than_collision_radius() {
+        let mut state = empty_test_state();
+        state.bullets.push(Bullet::new(
+            1,
+            Vec2::ZERO,
+            Vec2::new(BULLET_SPEED_NDC_PER_SEC, 0.0),
+        ));
+        state.ufo_bullets.push(Bullet::new(
+            2,
+            Vec2::new(0.25, 0.0),
+            Vec2::new(-UFO_BULLET_SPEED_NDC_PER_SEC, 0.0),
+        ));
+
+        let player_bullets = state.render_bullets();
+        let ufo_bullets = state.render_ufo_bullets();
+
+        assert!((player_bullets[0].radius - BULLET_RENDER_RADIUS_NDC).abs() < EPSILON);
+        assert!((ufo_bullets[0].radius - BULLET_RENDER_RADIUS_NDC).abs() < EPSILON);
+        assert!(BULLET_RENDER_RADIUS_NDC < BULLET_RADIUS_NDC);
     }
 
     #[test]

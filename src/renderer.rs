@@ -1403,12 +1403,11 @@ fn emit_dot(
     intensity: f32,
     local_x_scale: f32,
 ) {
-    let half_extent = half_extent.abs().max(f32::EPSILON) * local_x_scale;
-    emitter.emit_segment(
-        center - Vec2::X * half_extent,
-        center + Vec2::X * half_extent,
+    let half_extent = half_extent.abs().max(f32::EPSILON);
+    emitter.emit_bullet_ellipse_dot(
+        center,
+        Vec2::new(half_extent * local_x_scale, half_extent),
         intensity,
-        tuning::BULLET_DOT_DWELL_US,
     );
 }
 
@@ -3404,6 +3403,43 @@ mod tests {
         assert_eq!(score_digits(0), [0, 0, 0, 0, 0, 0]);
         assert_eq!(score_digits(20_990), [0, 2, 0, 9, 9, 0]);
         assert_eq!(score_digits(1_234_567), [2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn bullet_dot_emits_aspect_corrected_round_outline() {
+        let center = Vec2::new(0.1, -0.2);
+        let radius = 0.012;
+        let local_x_scale = 0.5;
+        let mut emitter = BeamEmitter::new();
+
+        emit_bullet_dot(
+            &mut emitter,
+            RenderBullet {
+                id: 1,
+                position: center,
+                radius,
+            },
+            local_x_scale,
+        );
+
+        let commands = emitter.commands();
+        assert_eq!(commands.len(), beam::BULLET_DOT_SEGMENTS);
+
+        let mut min = Vec2::new(f32::INFINITY, f32::INFINITY);
+        let mut max = Vec2::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for command in commands {
+            for point in [command.start, command.end] {
+                min.x = min.x.min(point.x);
+                min.y = min.y.min(point.y);
+                max.x = max.x.max(point.x);
+                max.y = max.y.max(point.y);
+            }
+        }
+
+        assert_close(min.x, center.x - radius * local_x_scale);
+        assert_close(max.x, center.x + radius * local_x_scale);
+        assert_close(min.y, center.y - radius);
+        assert_close(max.y, center.y + radius);
     }
 
     #[test]

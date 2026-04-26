@@ -1,4 +1,7 @@
-use std::ops::{Add, Mul, Neg, Sub};
+use std::{
+    f32::consts::TAU,
+    ops::{Add, Mul, Neg, Sub},
+};
 
 use bytemuck::{Pod, Zeroable};
 
@@ -155,6 +158,8 @@ pub struct BeamEmitter {
     commands: Vec<BeamCommand>,
 }
 
+pub const BULLET_DOT_SEGMENTS: usize = 12;
+
 impl BeamEmitter {
     pub fn new() -> Self {
         Self::with_capacity(0)
@@ -238,13 +243,29 @@ impl BeamEmitter {
     }
 
     pub fn emit_bullet_dot(&mut self, center: Vec2, half_extent: f32, intensity: f32) -> &mut Self {
-        let half_extent = half_extent.abs().max(f32::EPSILON);
-        self.emit_segment(
-            center - Vec2::X * half_extent,
-            center + Vec2::X * half_extent,
-            intensity,
-            tuning::BULLET_DOT_DWELL_US,
-        )
+        self.emit_bullet_ellipse_dot(center, Vec2::new(half_extent, half_extent), intensity)
+    }
+
+    pub fn emit_bullet_ellipse_dot(
+        &mut self,
+        center: Vec2,
+        half_extents: Vec2,
+        intensity: f32,
+    ) -> &mut Self {
+        let half_extents = Vec2::new(
+            finite_abs_extent(half_extents.x),
+            finite_abs_extent(half_extents.y),
+        );
+        let first = ellipse_point(center, half_extents, 0);
+        let mut previous = first;
+
+        for index in 1..BULLET_DOT_SEGMENTS {
+            let next = ellipse_point(center, half_extents, index);
+            self.emit_segment(previous, next, intensity, tuning::BULLET_DOT_DWELL_US);
+            previous = next;
+        }
+
+        self.emit_segment(previous, first, intensity, tuning::BULLET_DOT_DWELL_US)
     }
 
     pub fn commands(&self) -> &[BeamCommand] {
@@ -254,6 +275,19 @@ impl BeamEmitter {
     pub fn into_commands(self) -> Vec<BeamCommand> {
         self.commands
     }
+}
+
+fn finite_abs_extent(value: f32) -> f32 {
+    if value.is_finite() {
+        value.abs().max(f32::EPSILON)
+    } else {
+        f32::EPSILON
+    }
+}
+
+fn ellipse_point(center: Vec2, half_extents: Vec2, index: usize) -> Vec2 {
+    let angle = TAU * index as f32 / BULLET_DOT_SEGMENTS as f32;
+    center + Vec2::new(angle.cos() * half_extents.x, angle.sin() * half_extents.y)
 }
 
 #[repr(C)]
@@ -392,5 +426,28 @@ mod tests {
         assert_vec2_close(position(vertices[1]), Vec2::new(1.0, -1.0));
         assert_vec2_close(position(vertices[2]), Vec2::new(0.0, 2.0));
         assert_vec2_close(position(vertices[5]), Vec2::new(2.0, 0.0));
+    }
+
+    #[test]
+    fn bullet_dot_emits_closed_multi_axis_outline() {
+        let center = Vec2::new(0.25, -0.5);
+        let mut emitter = BeamEmitter::new();
+
+        emitter.emit_bullet_dot(center, 0.1, 0.8);
+
+        let commands = emitter.commands();
+        assert_eq!(commands.len(), BULLET_DOT_SEGMENTS);
+        assert_vec2_close(commands[0].start, center + Vec2::new(0.1, 0.0));
+        assert_vec2_close(commands[BULLET_DOT_SEGMENTS - 1].end, commands[0].start);
+        assert!(
+            commands
+                .iter()
+                .any(|command| (command.end.x - command.start.x).abs() > 0.0001)
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| (command.end.y - command.start.y).abs() > 0.0001)
+        );
     }
 }
