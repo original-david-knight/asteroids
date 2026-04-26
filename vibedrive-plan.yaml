@@ -81,7 +81,7 @@ tasks:
         Per PLAN.md step 2, prove the wgpu render pipeline end-to-end with a throwaway triangle.
         Create a render pipeline with a vertex/fragment shader pair, a vertex buffer, and a single draw call into the swap-chain.
         Keep the triangle behind a debug feature flag or simply remove it once the next step starts replacing it with real beam-emission rendering.
-      status: todo
+      status: done
       workflow: implement
       deps:
         - project-skeleton
