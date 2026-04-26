@@ -1454,7 +1454,7 @@ fn edge_spawn_velocity(side: u32, index: u32, rng: &mut SeededRng) -> Vec2 {
         2 => Vec2::new(secondary_raw, primary_raw),
         _ => Vec2::new(secondary_raw, -primary_raw),
     };
-    raw * tuning::ASTEROID_RAW_VELOCITY_TO_NDC_PER_SEC
+    raw * tuning::ASTEROID_RAW_VELOCITY_TO_DRIFT_NDC_PER_SEC
 }
 
 fn signed_random_raw_velocity(rng: &mut SeededRng) -> f32 {
@@ -2152,6 +2152,21 @@ mod tests {
     fn asteroid_spawn_count_progression_matches_original_wave_counter() {
         let counts: Vec<u32> = (1..=7).map(asteroid_spawn_count_for_round).collect();
         assert_eq!(counts, vec![4, 6, 8, 10, 11, 11, 11]);
+    }
+
+    #[test]
+    fn asteroid_spawn_velocity_uses_playable_drift_scale() {
+        let mut rng = rng_for_seed(Some(11));
+        let velocity = edge_spawn_velocity(0, 0, &mut rng);
+        let unscaled_max =
+            tuning::ASTEROID_RAW_VELOCITY_MAX * tuning::ASTEROID_RAW_VELOCITY_TO_NDC_PER_SEC;
+
+        assert!(
+            (velocity.x - tuning::ASTEROID_DRIFT_SPEED_MAX_NDC_PER_SEC).abs() < EPSILON,
+            "velocity.x={}",
+            velocity.x
+        );
+        assert!(velocity.x < unscaled_max * 0.5);
     }
 
     #[test]
