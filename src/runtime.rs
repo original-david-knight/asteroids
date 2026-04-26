@@ -15,7 +15,7 @@ use winit::dpi::PhysicalSize;
 
 use crate::{
     audio,
-    game::{self, ControlState, GameLoop},
+    game::{self, AsteroidSize, ControlState, GameEvent, GameEventKind, GameLoop},
     renderer::{FrameParams, HeadlessRenderer, Scenario},
     rng::{SeededRng, rng_for_seed},
     tuning, verify,
@@ -245,6 +245,10 @@ pub async fn run_automated(config: &RuntimeConfig) -> Result<(), String> {
         verify::save_png(path, renderer.size().width, renderer.size().height, &rgba)?;
     }
 
+    if let Some(audio_writer) = audio_writer.as_mut() {
+        audio_writer.drive_scripted_audio(config, state_log.as_mut())?;
+    }
+
     if simulate_frames == 0
         && config.capture_frames.is_none()
         && config.screenshot.is_none()
@@ -311,6 +315,105 @@ struct AutomatedAudioCapture {
 }
 
 impl AutomatedAudioCapture {
+    fn drive_scripted_audio(
+        &mut self,
+        config: &RuntimeConfig,
+        state_log: Option<&mut BufWriter<File>>,
+    ) -> Result<(), String> {
+        if !config.scenario.uses_scripted_audio() {
+            return Ok(());
+        }
+        let duration = Duration::from_secs_f64(config.audio_capture_secs.unwrap_or(0.0));
+        let start = Instant::now();
+        match config.scenario {
+            Scenario::Fire3 => self.drive_fire_3(start, duration),
+            Scenario::ExplosionStorm => self.drive_explosion_storm(start, duration),
+            Scenario::HeartbeatCurve => {
+                self.drive_heartbeat_curve(config, start, duration, state_log)
+            }
+            Scenario::UfoLarge | Scenario::UfoSmall => {
+                sleep_until(start + duration);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn drive_fire_3(&mut self, start: Instant, duration: Duration) -> Result<(), String> {
+        for offset in [
+            Duration::from_millis(60),
+            Duration::from_millis(360),
+            Duration::from_millis(660),
+        ] {
+            if offset <= duration {
+                sleep_until(start + offset);
+                enqueue_audio_msg(
+                    &mut self.sender,
+                    audio::AudioMsg::Trigger(audio::VOICE_FIRE),
+                    "fire trigger",
+                )?;
+            }
+        }
+        sleep_until(start + duration);
+        Ok(())
+    }
+
+    fn drive_explosion_storm(&mut self, start: Instant, duration: Duration) -> Result<(), String> {
+        let burst_interval = Duration::from_millis(45);
+        let mut burst = 0_u32;
+        loop {
+            let target = start + burst_interval.saturating_mul(burst);
+            if target >= start + duration {
+                break;
+            }
+            sleep_until(target);
+            for index in 0..9 {
+                let variant = ((burst + index) % 3) as u16;
+                enqueue_audio_msg(
+                    &mut self.sender,
+                    audio::AudioMsg::TriggerVariant(audio::VOICE_EXPLOSION, variant),
+                    "explosion trigger",
+                )?;
+            }
+            burst += 1;
+        }
+        sleep_until(start + duration);
+        Ok(())
+    }
+
+    fn drive_heartbeat_curve(
+        &mut self,
+        config: &RuntimeConfig,
+        start: Instant,
+        duration: Duration,
+        mut state_log: Option<&mut BufWriter<File>>,
+    ) -> Result<(), String> {
+        let tick_interval = Duration::from_secs_f64(1.0 / 60.0);
+        let mut tick = 0_u64;
+        let mut next_tick = start;
+        while next_tick < start + duration {
+            sleep_until(next_tick);
+            let elapsed = next_tick.duration_since(start).as_secs_f32();
+            let asteroid_count = heartbeat_curve_asteroid_count(elapsed);
+            enqueue_audio_msg(
+                &mut self.sender,
+                audio::AudioMsg::GameState(audio::GameSnapshot::with_game_over(
+                    asteroid_count,
+                    true,
+                    0,
+                    false,
+                )),
+                "heartbeat game state",
+            )?;
+            if let Some(writer) = state_log.as_deref_mut() {
+                write_audio_state_tick_event(writer, config, tick, elapsed, asteroid_count)?;
+            }
+            tick += 1;
+            next_tick += tick_interval;
+        }
+        Ok(())
+    }
+
     fn release_due_thrust_gate(&mut self) -> Result<(), String> {
         let Some(deadline) = self.thrust_release_deadline.take() else {
             return Ok(());
@@ -355,6 +458,27 @@ fn start_automated_audio_capture(
         _ => None,
     };
 
+    match config.scenario {
+        Scenario::UfoLarge | Scenario::UfoSmall => {
+            let variant = if config.scenario == Scenario::UfoSmall {
+                1.0
+            } else {
+                0.0
+            };
+            enqueue_audio_msg(
+                &mut sender,
+                audio::AudioMsg::SetParam(audio::VOICE_UFO, audio::PARAM_UFO_VARIANT, variant),
+                "ufo variant",
+            )?;
+            enqueue_audio_msg(
+                &mut sender,
+                audio::AudioMsg::Trigger(audio::VOICE_UFO),
+                "ufo trigger",
+            )?;
+        }
+        _ => {}
+    }
+
     Ok(Some(AutomatedAudioCapture {
         path: path.clone(),
         handle: audio::spawn_captured_wav_writer(
@@ -381,8 +505,63 @@ fn enqueue_audio_msg(
         .map_err(|error| format!("failed to enqueue {context} audio message: {error:?}"))
 }
 
+fn send_game_event_audio(sender: &mut audio::AudioMsgSender, event: GameEvent) {
+    match event.kind {
+        GameEventKind::BulletFired => {
+            let _ = sender.try_push(audio::AudioMsg::Trigger(audio::VOICE_FIRE));
+        }
+        GameEventKind::BulletHitAsteroid => {
+            let variant = event
+                .asteroid_size
+                .map(asteroid_size_audio_variant)
+                .unwrap_or(0);
+            let _ = sender.try_push(audio::AudioMsg::TriggerVariant(
+                audio::VOICE_EXPLOSION,
+                variant,
+            ));
+        }
+        _ => {}
+    }
+}
+
+fn asteroid_size_audio_variant(size: AsteroidSize) -> u16 {
+    match size {
+        AsteroidSize::Large => 0,
+        AsteroidSize::Medium => 1,
+        AsteroidSize::Small => 2,
+    }
+}
+
+fn heartbeat_curve_asteroid_count(elapsed: f32) -> u32 {
+    let step = (elapsed / 2.5).floor() as u32;
+    11_u32.saturating_sub(step).max(1)
+}
+
+fn write_audio_state_tick_event(
+    writer: &mut BufWriter<File>,
+    config: &RuntimeConfig,
+    tick: u64,
+    elapsed: f32,
+    asteroid_count: u32,
+) -> Result<(), String> {
+    writeln!(
+        writer,
+        "{{\"tick\":{tick},\"time\":{elapsed:.6},\"event\":\"tick\",\"scenario\":\"{}\",\"seed\":{},\"asteroid_count\":{asteroid_count}}}",
+        config.scenario.name(),
+        config.seed.unwrap_or(0),
+    )
+    .map_err(|error| format!("failed to write state log: {error}"))
+}
+
+fn sleep_until(deadline: Instant) {
+    let now = Instant::now();
+    if deadline > now {
+        thread::sleep(deadline - now);
+    }
+}
+
 pub fn runtime_usage() -> String {
-    "Usage: asteroids [--headless] [--screenshot <path>] [--capture-frames <N> --frames-out <dir>] [--audio-capture <secs> --wav-out <path>] [--seed <u64>] [--fixed-dt <secs>] [--simulate-secs <secs>] [--scenario <name>] [--xrun-log <path>] [--frame-time-log <path>] [--state-log <path>] [--bloom-intensity <value>] [--bloom-threshold <value>]\n\nScenarios: demo, idle, ship-spinning, horizontal-sweep, static-bright-line, static-bright-line-low-dwell, static-bright-line-high-dwell, gamma-ramp, thrust-1s, ship-spinning-with-thrust, heavy-input, asteroids-round-1, bullet-hit-asteroid, ship-collides-with-asteroid, lose-all-lives".to_string()
+    "Usage: asteroids [--headless] [--screenshot <path>] [--capture-frames <N> --frames-out <dir>] [--audio-capture <secs> --wav-out <path>] [--seed <u64>] [--fixed-dt <secs>] [--simulate-secs <secs>] [--scenario <name>] [--xrun-log <path>] [--frame-time-log <path>] [--state-log <path>] [--bloom-intensity <value>] [--bloom-threshold <value>]\n\nScenarios: demo, idle, ship-spinning, horizontal-sweep, static-bright-line, static-bright-line-low-dwell, static-bright-line-high-dwell, gamma-ramp, thrust-1s, ship-spinning-with-thrust, heavy-input, asteroids-round-1, bullet-hit-asteroid, ship-collides-with-asteroid, lose-all-lives, explosion-storm, heartbeat-curve, fire-3, ufo-large, ufo-small".to_string()
 }
 
 fn game_loop_for_scenario(scenario: Scenario, seed: Option<u64>) -> GameLoop {
@@ -431,6 +610,13 @@ fn render_tick(
         }
     }
 
+    let events = game_loop.drain_events();
+    if let Some(sender) = audio_sender.as_mut() {
+        for event in events.iter().copied() {
+            send_game_event_audio(sender, event);
+        }
+    }
+
     renderer.render(params)?;
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
     if let Some(writer) = io.frame_time_log {
@@ -448,11 +634,11 @@ fn render_tick(
             substeps,
             dropped_accumulator_seconds,
         )?;
-        for event in game_loop.drain_events() {
+        for event in events {
             write_state_event(writer, tick_state, config, event.name())?;
         }
     } else {
-        let _ = game_loop.drain_events();
+        drop(events);
     }
     Ok(())
 }
@@ -851,6 +1037,34 @@ mod tests {
             .unwrap();
 
             assert!(config.scenario.uses_game_simulation());
+        }
+    }
+
+    #[test]
+    fn parses_scripted_audio_scenarios() {
+        for name in [
+            "explosion-storm",
+            "heartbeat-curve",
+            "fire-3",
+            "ufo-large",
+            "ufo-small",
+        ] {
+            let config = RuntimeConfig::from_args(
+                [
+                    "--headless",
+                    "--scenario",
+                    name,
+                    "--audio-capture",
+                    "1",
+                    "--wav-out",
+                    "/tmp/a.wav",
+                ]
+                .into_iter()
+                .map(str::to_string),
+            )
+            .unwrap();
+
+            assert!(config.scenario.uses_scripted_audio());
         }
     }
 }

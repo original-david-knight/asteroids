@@ -33,6 +33,11 @@ pub enum Scenario {
     BulletHitAsteroid,
     ShipCollidesWithAsteroid,
     LoseAllLives,
+    ExplosionStorm,
+    HeartbeatCurve,
+    Fire3,
+    UfoLarge,
+    UfoSmall,
 }
 
 impl Scenario {
@@ -53,6 +58,11 @@ impl Scenario {
             "bullet-hit-asteroid" => Some(Self::BulletHitAsteroid),
             "ship-collides-with-asteroid" => Some(Self::ShipCollidesWithAsteroid),
             "lose-all-lives" => Some(Self::LoseAllLives),
+            "explosion-storm" => Some(Self::ExplosionStorm),
+            "heartbeat-curve" => Some(Self::HeartbeatCurve),
+            "fire-3" => Some(Self::Fire3),
+            "ufo-large" => Some(Self::UfoLarge),
+            "ufo-small" => Some(Self::UfoSmall),
             _ => None,
         }
     }
@@ -74,6 +84,11 @@ impl Scenario {
             Self::BulletHitAsteroid => "bullet-hit-asteroid",
             Self::ShipCollidesWithAsteroid => "ship-collides-with-asteroid",
             Self::LoseAllLives => "lose-all-lives",
+            Self::ExplosionStorm => "explosion-storm",
+            Self::HeartbeatCurve => "heartbeat-curve",
+            Self::Fire3 => "fire-3",
+            Self::UfoLarge => "ufo-large",
+            Self::UfoSmall => "ufo-small",
         }
     }
 
@@ -85,6 +100,17 @@ impl Scenario {
                 | Self::BulletHitAsteroid
                 | Self::ShipCollidesWithAsteroid
                 | Self::LoseAllLives
+        )
+    }
+
+    pub fn uses_scripted_audio(self) -> bool {
+        matches!(
+            self,
+            Self::ExplosionStorm
+                | Self::HeartbeatCurve
+                | Self::Fire3
+                | Self::UfoLarge
+                | Self::UfoSmall
         )
     }
 }
@@ -1049,7 +1075,12 @@ fn emit_scenario_beams(emitter: &mut BeamEmitter, scenario: Scenario, time_s: f3
         | Scenario::AsteroidsRound1
         | Scenario::BulletHitAsteroid
         | Scenario::ShipCollidesWithAsteroid
-        | Scenario::LoseAllLives => emit_idle_beams(emitter),
+        | Scenario::LoseAllLives
+        | Scenario::ExplosionStorm
+        | Scenario::HeartbeatCurve
+        | Scenario::Fire3
+        | Scenario::UfoLarge
+        | Scenario::UfoSmall => emit_idle_beams(emitter),
     }
 }
 

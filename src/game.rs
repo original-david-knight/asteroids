@@ -253,11 +253,22 @@ impl GameEventKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GameEvent {
     pub kind: GameEventKind,
+    pub asteroid_size: Option<AsteroidSize>,
 }
 
 impl GameEvent {
     fn new(kind: GameEventKind) -> Self {
-        Self { kind }
+        Self {
+            kind,
+            asteroid_size: None,
+        }
+    }
+
+    fn asteroid(kind: GameEventKind, asteroid_size: AsteroidSize) -> Self {
+        Self {
+            kind,
+            asteroid_size: Some(asteroid_size),
+        }
     }
 
     pub fn name(self) -> &'static str {
@@ -383,7 +394,7 @@ impl GameState {
     }
 
     pub fn snapshot(&self) -> GameSnapshot {
-        GameSnapshot::new(self.asteroid_count, self.alive, self.score)
+        GameSnapshot::with_game_over(self.asteroid_count, self.alive, self.score, self.game_over)
     }
 
     pub fn start_round(&mut self, round: u32) {
@@ -403,6 +414,7 @@ impl GameState {
             return false;
         };
         let parent = self.asteroids.remove(index);
+        self.push_asteroid_event(GameEventKind::BulletHitAsteroid, parent.size);
         if let Some(child_size) = parent.size.next_smaller() {
             for child_index in 0..2 {
                 let velocity = split_child_velocity(parent.velocity, child_index);
@@ -410,9 +422,9 @@ impl GameState {
                 let child = self.allocate_asteroid(child_size, parent.position, velocity, hull);
                 self.asteroids.push(child);
             }
-            self.push_event(GameEventKind::AsteroidSplit);
+            self.push_asteroid_event(GameEventKind::AsteroidSplit, parent.size);
         } else {
-            self.push_event(GameEventKind::AsteroidDestroyed);
+            self.push_asteroid_event(GameEventKind::AsteroidDestroyed, parent.size);
         }
         self.sync_asteroid_count();
         true
@@ -529,7 +541,6 @@ impl GameState {
 
             if let Some(asteroid_id) = hit_asteroid_id {
                 self.bullets.remove(bullet_index);
-                self.push_event(GameEventKind::BulletHitAsteroid);
                 self.hit_asteroid_by_id(asteroid_id);
             } else {
                 bullet_index += 1;
@@ -576,6 +587,10 @@ impl GameState {
 
     fn push_event(&mut self, kind: GameEventKind) {
         self.events.push(GameEvent::new(kind));
+    }
+
+    fn push_asteroid_event(&mut self, kind: GameEventKind, asteroid_size: AsteroidSize) {
+        self.events.push(GameEvent::asteroid(kind, asteroid_size));
     }
 
     fn spawn_large_asteroid(&mut self, index: u32) -> Asteroid {

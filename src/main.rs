@@ -1,8 +1,11 @@
 use std::{error::Error, sync::Arc};
 
 use asteroids::{
-    audio::{AudioMsg, AudioMsgSender, AudioRuntime, AudioScaffold, VOICE_THRUST},
-    game::{ControlState, GameLoop},
+    audio::{
+        AudioMsg, AudioMsgSender, AudioRuntime, AudioScaffold, VOICE_EXPLOSION, VOICE_FIRE,
+        VOICE_THRUST,
+    },
+    game::{AsteroidSize, ControlState, GameEvent, GameEventKind, GameLoop},
     renderer::{self, FrameParams, Renderer, Scenario},
     runtime::{self, RuntimeConfig},
     tuning,
@@ -431,6 +434,10 @@ impl ApplicationHandler for AsteroidsApp {
                         let _ = sender.try_push(AudioMsg::GameState(snapshot));
                     }
                 });
+                let events = self.game.drain_events();
+                for event in events {
+                    send_game_event_audio(audio_sender, event);
+                }
                 let mut params =
                     FrameParams::new(Scenario::Idle, self.game.render_time_seconds(), frame_dt)
                         .with_asteroids(self.game.interpolated_asteroids())
@@ -451,6 +458,34 @@ impl ApplicationHandler for AsteroidsApp {
             }
             _ => {}
         }
+    }
+}
+
+fn send_game_event_audio(audio_sender: &mut Option<AudioMsgSender>, event: GameEvent) {
+    let Some(sender) = audio_sender.as_mut() else {
+        return;
+    };
+
+    match event.kind {
+        GameEventKind::BulletFired => {
+            let _ = sender.try_push(AudioMsg::Trigger(VOICE_FIRE));
+        }
+        GameEventKind::BulletHitAsteroid => {
+            let variant = event
+                .asteroid_size
+                .map(asteroid_size_audio_variant)
+                .unwrap_or(0);
+            let _ = sender.try_push(AudioMsg::TriggerVariant(VOICE_EXPLOSION, variant));
+        }
+        _ => {}
+    }
+}
+
+fn asteroid_size_audio_variant(size: AsteroidSize) -> u16 {
+    match size {
+        AsteroidSize::Large => 0,
+        AsteroidSize::Medium => 1,
+        AsteroidSize::Small => 2,
     }
 }
 

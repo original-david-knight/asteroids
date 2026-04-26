@@ -1,0 +1,1 @@
+Implemented pure-synth fire, size-coded explosion, large/small UFO siren, and heartbeat voices in the preallocated fundsp graph. Heartbeat uses disassembly reload endpoints $30->$08 with 4-frame thump-on, projected from asteroid_count; stress captures passed with zero xruns.

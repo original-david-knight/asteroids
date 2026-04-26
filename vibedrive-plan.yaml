@@ -589,7 +589,7 @@ tasks:
         UFO siren: dual-oscillator wail with characteristic descending-then-ascending pattern (large vs small UFO variants - parameter difference, same voice).
         Heartbeat: low thump that speeds up as remaining-asteroid count decreases. DESIGN.md Open Question 4 - confirm the exact tempo curve from Norbert Kehrer's Asteroids disassembly / computerarcheology.com listing during this task and document the curve in code comments. Heartbeat must keep running between deaths per DESIGN.md success criteria; only resets at game-over restart.
         All voices pre-allocated at startup, all parameter mutation through AtomicF32. Verify zero xruns with all voices active under stress (many simultaneous explosions).
-      status: todo
+      status: done
       workflow: implement
       deps:
         - bullets-collision-game-over

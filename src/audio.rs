@@ -1,9 +1,12 @@
 #![allow(dead_code)]
 
 use std::{
+    array,
+    f32::consts::{PI, TAU},
     fmt,
     fs::{self, File},
     io::{self, BufWriter, Write},
+    mem::size_of,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -19,7 +22,8 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 use fundsp::prelude::{
-    AudioUnit, Net, Shared, U2, adsr_live, lowpass, multizero, pan, pass, product, saw, var,
+    AudioUnit, BufferMut, BufferRef, Net, Routing, Shared, SignalFrame, U2, adsr_live, lowpass,
+    multizero, pan, pass, product, saw, var,
 };
 use ringbuf::{
     Cons, HeapProd, HeapRb,
@@ -46,6 +50,22 @@ pub const THRUST_ATTACK_SECONDS: f32 = 0.020;
 pub const THRUST_DECAY_SECONDS: f32 = 0.090;
 pub const THRUST_SUSTAIN_LEVEL: f32 = 0.86;
 pub const THRUST_RELEASE_SECONDS: f32 = 0.120;
+pub const FIRE_FREQUENCY_HZ: f32 = 920.0;
+pub const FIRE_GAIN: f32 = 0.30;
+pub const EXPLOSION_GAIN: f32 = 0.48;
+pub const UFO_GAIN: f32 = 0.18;
+pub const HEARTBEAT_GAIN: f32 = 0.34;
+pub const HEARTBEAT_ORIGINAL_FRAME_RATE_HZ: f32 = 60.0;
+pub const HEARTBEAT_ORIGINAL_ON_FRAMES: u32 = 4;
+pub const HEARTBEAT_ORIGINAL_SLOW_OFF_RELOAD_FRAMES: u32 = 0x30;
+pub const HEARTBEAT_ORIGINAL_FAST_OFF_RELOAD_FRAMES: u32 = 0x08;
+const VOICE_VARIANT_TRIGGER_COUNT: usize = 4;
+const FIRE_POLYPHONY: usize = 8;
+const EXPLOSION_POLYPHONY: usize = 96;
+const FIRE_DURATION_SECONDS: f32 = 0.085;
+const FIRE_ATTACK_SECONDS: f32 = 0.003;
+const HEARTBEAT_ON_SECONDS: f32 =
+    HEARTBEAT_ORIGINAL_ON_FRAMES as f32 / HEARTBEAT_ORIGINAL_FRAME_RATE_HZ;
 
 type AudioRing = Arc<HeapRb<AudioMsg>>;
 type AudioCaptureRing = Arc<HeapRb<AudioCaptureBatch>>;
@@ -64,19 +84,29 @@ pub struct GameSnapshot {
     pub asteroid_count: u32,
     pub alive: u32,
     pub score: u32,
+    pub game_over: u32,
 }
 
 impl GameSnapshot {
     pub fn new(asteroid_count: u32, alive: bool, score: u32) -> Self {
+        Self::with_game_over(asteroid_count, alive, score, false)
+    }
+
+    pub fn with_game_over(asteroid_count: u32, alive: bool, score: u32, game_over: bool) -> Self {
         Self {
             asteroid_count,
             alive: u32::from(alive),
             score,
+            game_over: u32::from(game_over),
         }
     }
 
     pub fn is_alive(self) -> bool {
         self.alive != 0
+    }
+
+    pub fn is_game_over(self) -> bool {
+        self.game_over != 0
     }
 }
 
@@ -84,6 +114,7 @@ impl GameSnapshot {
 pub enum AudioMsg {
     SetParam(VoiceId, ParamId, f32),
     Trigger(VoiceId),
+    TriggerVariant(VoiceId, u16),
     Release(VoiceId),
     GameState(GameSnapshot),
 }
@@ -349,6 +380,10 @@ pub struct PreallocatedVoice {
     fundsp_controls: Vec<Shared>,
     gate: AtomicF32,
     gate_control: Shared,
+    trigger_counter: AtomicF32,
+    trigger_control: Shared,
+    variant_trigger_counters: [AtomicF32; VOICE_VARIANT_TRIGGER_COUNT],
+    variant_trigger_controls: [Shared; VOICE_VARIANT_TRIGGER_COUNT],
 }
 
 impl PreallocatedVoice {
@@ -359,6 +394,10 @@ impl PreallocatedVoice {
             fundsp_controls: param_defaults.iter().copied().map(Shared::new).collect(),
             gate: AtomicF32::new(0.0),
             gate_control: Shared::new(0.0),
+            trigger_counter: AtomicF32::new(0.0),
+            trigger_control: Shared::new(0.0),
+            variant_trigger_counters: array::from_fn(|_| AtomicF32::new(0.0)),
+            variant_trigger_controls: array::from_fn(|_| Shared::new(0.0)),
         }
     }
 
@@ -369,6 +408,11 @@ impl PreallocatedVoice {
     pub fn is_triggered(&self) -> bool {
         self.gate.load() > 0.5
     }
+
+    fn trigger_variant(&self, variant: u16) {
+        let index = usize::from(variant).min(VOICE_VARIANT_TRIGGER_COUNT - 1);
+        increment_atomic_f32(&self.variant_trigger_counters[index]);
+    }
 }
 
 impl Voice for PreallocatedVoice {
@@ -377,6 +421,7 @@ impl Voice for PreallocatedVoice {
     }
 
     fn trigger(&self) {
+        increment_atomic_f32(&self.trigger_counter);
         self.gate.store(1.0);
     }
 
@@ -397,7 +442,19 @@ impl Voice for PreallocatedVoice {
             control.set(cell.load());
         }
         self.gate_control.set(self.gate.load());
+        self.trigger_control.set(self.trigger_counter.load());
+        for (cell, control) in self
+            .variant_trigger_counters
+            .iter()
+            .zip(self.variant_trigger_controls.iter())
+        {
+            control.set(cell.load());
+        }
     }
+}
+
+fn increment_atomic_f32(cell: &AtomicF32) {
+    cell.store(cell.load() + 1.0);
 }
 
 pub struct VoiceBank {
@@ -410,16 +467,20 @@ const THRUST_PARAM_DEFAULTS: [f32; 4] = [
     THRUST_GAIN,
     THRUST_LOW_PASS_Q,
 ];
+const FIRE_PARAM_DEFAULTS: [f32; 2] = [FIRE_FREQUENCY_HZ, FIRE_GAIN];
+const EXPLOSION_PARAM_DEFAULTS: [f32; 1] = [EXPLOSION_GAIN];
+const UFO_PARAM_DEFAULTS: [f32; 2] = [0.0, UFO_GAIN];
+const HEARTBEAT_PARAM_DEFAULTS: [f32; 4] = [0.0, 0.0, 0.0, HEARTBEAT_GAIN];
 
 impl VoiceBank {
     pub fn single_player_default() -> Self {
         Self {
             voices: vec![
                 PreallocatedVoice::new(VOICE_THRUST, &THRUST_PARAM_DEFAULTS),
-                PreallocatedVoice::new(VOICE_FIRE, &[0.0, 0.0, 0.0]),
-                PreallocatedVoice::new(VOICE_EXPLOSION, &[0.0, 0.0, 0.0, 0.0]),
-                PreallocatedVoice::new(VOICE_UFO, &[0.0, 0.0, 0.0]),
-                PreallocatedVoice::new(VOICE_HEARTBEAT, &[0.0, 0.0]),
+                PreallocatedVoice::new(VOICE_FIRE, &FIRE_PARAM_DEFAULTS),
+                PreallocatedVoice::new(VOICE_EXPLOSION, &EXPLOSION_PARAM_DEFAULTS),
+                PreallocatedVoice::new(VOICE_UFO, &UFO_PARAM_DEFAULTS),
+                PreallocatedVoice::new(VOICE_HEARTBEAT, &HEARTBEAT_PARAM_DEFAULTS),
             ],
         }
     }
@@ -443,7 +504,7 @@ impl VoiceBank {
     pub fn control_count(&self) -> usize {
         self.voices
             .iter()
-            .map(|voice| voice.fundsp_controls.len() + 1)
+            .map(|voice| voice.fundsp_controls.len() + 2 + VOICE_VARIANT_TRIGGER_COUNT)
             .sum()
     }
 }
@@ -457,6 +518,41 @@ pub const PARAM_THRUST_FREQUENCY: ParamId = ParamId(0);
 pub const PARAM_THRUST_LOW_PASS_CUTOFF: ParamId = ParamId(1);
 pub const PARAM_THRUST_GAIN: ParamId = ParamId(2);
 pub const PARAM_THRUST_LOW_PASS_Q: ParamId = ParamId(3);
+pub const PARAM_FIRE_FREQUENCY: ParamId = ParamId(0);
+pub const PARAM_FIRE_GAIN: ParamId = ParamId(1);
+pub const PARAM_EXPLOSION_GAIN: ParamId = ParamId(0);
+pub const PARAM_UFO_VARIANT: ParamId = ParamId(0);
+pub const PARAM_UFO_GAIN: ParamId = ParamId(1);
+pub const PARAM_HEARTBEAT_ASTEROID_COUNT: ParamId = ParamId(0);
+pub const PARAM_HEARTBEAT_MAX_ASTEROIDS: ParamId = ParamId(1);
+pub const PARAM_HEARTBEAT_RUNNING: ParamId = ParamId(2);
+pub const PARAM_HEARTBEAT_GAIN: ParamId = ParamId(3);
+
+/// DESIGN.md Open Question 4: the disassembly's thump speed is not a
+/// rock-count table. Computer Archeology/SourceGen show ThmpOffReload starts at
+/// $30, ChkThmpFaster decrements it every 64 frames until $08, and the audible
+/// thump-on timer is always 4 frames. The audio contract only gives this voice
+/// GameSnapshot.asteroid_count, so this build maps round progress by asteroid
+/// count onto those exact off-reload endpoints.
+pub fn heartbeat_reload_frames_for_count(max_count: u32, current_count: u32) -> Option<u32> {
+    if max_count == 0 || current_count == 0 {
+        return None;
+    }
+    if max_count <= 1 {
+        return Some(HEARTBEAT_ORIGINAL_FAST_OFF_RELOAD_FRAMES);
+    }
+
+    let current_count = current_count.min(max_count);
+    let progress = (max_count - current_count) as f32 / (max_count.saturating_sub(1)) as f32;
+    let slow = HEARTBEAT_ORIGINAL_SLOW_OFF_RELOAD_FRAMES as f32;
+    let fast = HEARTBEAT_ORIGINAL_FAST_OFF_RELOAD_FRAMES as f32;
+    Some((slow + (fast - slow) * progress).round() as u32)
+}
+
+pub fn heartbeat_period_seconds_for_count(max_count: u32, current_count: u32) -> Option<f32> {
+    let reload = heartbeat_reload_frames_for_count(max_count, current_count)?;
+    Some((reload + HEARTBEAT_ORIGINAL_ON_FRAMES) as f32 / HEARTBEAT_ORIGINAL_FRAME_RATE_HZ)
+}
 
 pub struct AudioScaffold {
     sender: AudioMsgSender,
@@ -844,6 +940,7 @@ impl AudioRuntime {
 struct AudioEngine {
     voices: VoiceBank,
     graph: Net,
+    heartbeat_max_asteroids: u32,
 }
 
 impl AudioEngine {
@@ -853,7 +950,11 @@ impl AudioEngine {
         graph.allocate();
         let mut warmup = [0.0_f32; 2];
         graph.tick(&[], &mut warmup);
-        Self { voices, graph }
+        Self {
+            voices,
+            graph,
+            heartbeat_max_asteroids: 0,
+        }
     }
 
     fn drain_messages(&mut self, receiver: &mut AudioMsgReceiver) {
@@ -869,17 +970,52 @@ impl AudioEngine {
                         voice.trigger();
                     }
                 }
+                AudioMsg::TriggerVariant(voice_id, variant) => {
+                    if let Some(voice) = self.voices.get(voice_id) {
+                        voice.trigger_variant(variant);
+                    }
+                }
                 AudioMsg::Release(voice_id) => {
                     if let Some(voice) = self.voices.get(voice_id) {
                         voice.release();
                     }
                 }
-                AudioMsg::GameState(_) => {}
+                AudioMsg::GameState(snapshot) => self.apply_game_snapshot(snapshot),
             }
         }
 
         for voice in self.voices.iter() {
             voice.sync_controls_for_audio_block();
+        }
+    }
+
+    fn apply_game_snapshot(&mut self, snapshot: GameSnapshot) {
+        let Some(heartbeat) = self.voices.get(VOICE_HEARTBEAT) else {
+            return;
+        };
+
+        if snapshot.is_game_over() {
+            self.heartbeat_max_asteroids = 0;
+            heartbeat.release();
+            heartbeat.set_param(PARAM_HEARTBEAT_ASTEROID_COUNT, 0.0);
+            heartbeat.set_param(PARAM_HEARTBEAT_MAX_ASTEROIDS, 0.0);
+            heartbeat.set_param(PARAM_HEARTBEAT_RUNNING, 0.0);
+            return;
+        }
+
+        let asteroid_count = snapshot.asteroid_count;
+        if asteroid_count > 0 {
+            self.heartbeat_max_asteroids = self.heartbeat_max_asteroids.max(asteroid_count);
+            heartbeat.trigger();
+            heartbeat.set_param(PARAM_HEARTBEAT_ASTEROID_COUNT, asteroid_count as f32);
+            heartbeat.set_param(
+                PARAM_HEARTBEAT_MAX_ASTEROIDS,
+                self.heartbeat_max_asteroids as f32,
+            );
+            heartbeat.set_param(PARAM_HEARTBEAT_RUNNING, 1.0);
+        } else {
+            heartbeat.set_param(PARAM_HEARTBEAT_ASTEROID_COUNT, 0.0);
+            heartbeat.set_param(PARAM_HEARTBEAT_RUNNING, 0.0);
         }
     }
 
@@ -891,11 +1027,37 @@ impl AudioEngine {
 }
 
 fn build_voice_graph(voices: &VoiceBank) -> Net {
+    let mut graph = Net::new(0, usize::from(CAPTURE_CHANNELS));
+    let mut sources = Vec::new();
+
     if let Some(thrust) = voices.get(VOICE_THRUST) {
-        build_thrust_voice_graph(thrust)
-    } else {
-        build_silent_voice_graph()
+        sources.push(graph.push(Box::new(build_thrust_voice_graph(thrust))));
     }
+    if let Some(fire) = voices.get(VOICE_FIRE) {
+        sources.push(graph.push(Box::new(FireVoiceUnit::new(fire))));
+    }
+    if let Some(explosion) = voices.get(VOICE_EXPLOSION) {
+        sources.push(graph.push(Box::new(ExplosionVoiceUnit::new(explosion))));
+    }
+    if let Some(ufo) = voices.get(VOICE_UFO) {
+        sources.push(graph.push(Box::new(UfoVoiceUnit::new(ufo))));
+    }
+    if let Some(heartbeat) = voices.get(VOICE_HEARTBEAT) {
+        sources.push(graph.push(Box::new(HeartbeatVoiceUnit::new(heartbeat))));
+    }
+
+    if sources.is_empty() {
+        return build_silent_voice_graph();
+    }
+
+    let mixer = graph.push(Box::new(StereoMixerUnit::new(sources.len())));
+    for (source_index, source) in sources.iter().copied().enumerate() {
+        graph.connect(source, 0, mixer, source_index * 2);
+        graph.connect(source, 1, mixer, source_index * 2 + 1);
+    }
+    graph.pipe_output(mixer);
+    graph.check();
+    graph
 }
 
 fn build_thrust_voice_graph(thrust: &PreallocatedVoice) -> Net {
@@ -931,6 +1093,623 @@ fn build_silent_voice_graph() -> Net {
     graph.pipe_output(silent);
     graph.check();
     graph
+}
+
+#[derive(Clone)]
+struct StereoMixerUnit {
+    voice_count: usize,
+}
+
+impl StereoMixerUnit {
+    fn new(voice_count: usize) -> Self {
+        Self { voice_count }
+    }
+}
+
+impl AudioUnit for StereoMixerUnit {
+    fn tick(&mut self, input: &[f32], output: &mut [f32]) {
+        let mut left = 0.0;
+        let mut right = 0.0;
+        for voice in 0..self.voice_count {
+            left += input[voice * 2];
+            right += input[voice * 2 + 1];
+        }
+        output[0] = soft_clip(left);
+        output[1] = soft_clip(right);
+    }
+
+    fn process(&mut self, size: usize, input: &BufferRef, output: &mut BufferMut) {
+        for i in 0..size {
+            let mut left = 0.0;
+            let mut right = 0.0;
+            for voice in 0..self.voice_count {
+                left += input.at_f32(voice * 2, i);
+                right += input.at_f32(voice * 2 + 1, i);
+            }
+            output.set_f32(0, i, soft_clip(left));
+            output.set_f32(1, i, soft_clip(right));
+        }
+    }
+
+    fn inputs(&self) -> usize {
+        self.voice_count * 2
+    }
+
+    fn outputs(&self) -> usize {
+        2
+    }
+
+    fn route(&mut self, input: &SignalFrame, _frequency: f64) -> SignalFrame {
+        Routing::Arbitrary(0.0).route(input, self.outputs())
+    }
+
+    fn get_id(&self) -> u64 {
+        0x4153_4d58
+    }
+
+    fn footprint(&self) -> usize {
+        size_of::<Self>()
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct FireLayer {
+    active: bool,
+    age: f32,
+    phase: f32,
+}
+
+#[derive(Clone)]
+struct FireVoiceUnit {
+    trigger: Shared,
+    frequency: Shared,
+    gain: Shared,
+    sample_rate: f32,
+    last_trigger: f32,
+    layers: [FireLayer; FIRE_POLYPHONY],
+    next_layer: usize,
+}
+
+impl FireVoiceUnit {
+    fn new(voice: &PreallocatedVoice) -> Self {
+        Self {
+            trigger: voice.trigger_control.clone(),
+            frequency: voice.fundsp_controls[usize::from(PARAM_FIRE_FREQUENCY.0)].clone(),
+            gain: voice.fundsp_controls[usize::from(PARAM_FIRE_GAIN.0)].clone(),
+            sample_rate: TARGET_OUTPUT_SAMPLE_RATE as f32,
+            last_trigger: 0.0,
+            layers: [FireLayer::default(); FIRE_POLYPHONY],
+            next_layer: 0,
+        }
+    }
+
+    fn start_layer(&mut self) {
+        let index = self.next_layer;
+        self.next_layer = (self.next_layer + 1) % FIRE_POLYPHONY;
+        self.layers[index] = FireLayer {
+            active: true,
+            age: 0.0,
+            phase: 0.0,
+        };
+    }
+
+    fn next_sample(&mut self) -> f32 {
+        let triggers = trigger_delta(self.trigger.value(), &mut self.last_trigger, FIRE_POLYPHONY);
+        for _ in 0..triggers {
+            self.start_layer();
+        }
+
+        let dt = 1.0 / self.sample_rate.max(1.0);
+        let base_frequency = self.frequency.value().clamp(200.0, 4_000.0);
+        let gain = self.gain.value().clamp(0.0, 1.0);
+        let mut sample = 0.0;
+
+        for layer in &mut self.layers {
+            if !layer.active {
+                continue;
+            }
+            if layer.age >= FIRE_DURATION_SECONDS {
+                layer.active = false;
+                continue;
+            }
+            let progress = (layer.age / FIRE_DURATION_SECONDS).clamp(0.0, 1.0);
+            let frequency = base_frequency * (1.0 - 0.22 * progress);
+            layer.phase = advance_unit_phase(layer.phase, frequency, self.sample_rate);
+            let square = if layer.phase < 0.5 { 1.0 } else { -1.0 };
+            let triangle = 4.0 * (layer.phase - 0.5).abs() - 1.0;
+            let envelope =
+                percussive_envelope(layer.age, FIRE_DURATION_SECONDS, FIRE_ATTACK_SECONDS);
+            sample += (0.72 * square + 0.28 * triangle) * envelope * gain;
+            layer.age += dt;
+        }
+
+        sample
+    }
+}
+
+impl AudioUnit for FireVoiceUnit {
+    fn set_sample_rate(&mut self, sample_rate: f64) {
+        self.sample_rate = sample_rate as f32;
+    }
+
+    fn tick(&mut self, _input: &[f32], output: &mut [f32]) {
+        let sample = self.next_sample();
+        output[0] = sample;
+        output[1] = sample;
+    }
+
+    fn process(&mut self, size: usize, _input: &BufferRef, output: &mut BufferMut) {
+        for i in 0..size {
+            let sample = self.next_sample();
+            output.set_f32(0, i, sample);
+            output.set_f32(1, i, sample);
+        }
+    }
+
+    fn inputs(&self) -> usize {
+        0
+    }
+
+    fn outputs(&self) -> usize {
+        2
+    }
+
+    fn route(&mut self, input: &SignalFrame, _frequency: f64) -> SignalFrame {
+        Routing::Generator(0.0).route(input, self.outputs())
+    }
+
+    fn get_id(&self) -> u64 {
+        0x4153_4652
+    }
+
+    fn footprint(&self) -> usize {
+        size_of::<Self>()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ExplosionLayer {
+    active: bool,
+    size_variant: usize,
+    age: f32,
+    duration: f32,
+    low: f32,
+    band: f32,
+    noise_state: u32,
+}
+
+impl Default for ExplosionLayer {
+    fn default() -> Self {
+        Self {
+            active: false,
+            size_variant: 0,
+            age: 0.0,
+            duration: 0.0,
+            low: 0.0,
+            band: 0.0,
+            noise_state: 1,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ExplosionVoiceUnit {
+    variant_triggers: [Shared; VOICE_VARIANT_TRIGGER_COUNT],
+    last_variant_triggers: [f32; VOICE_VARIANT_TRIGGER_COUNT],
+    gain: Shared,
+    sample_rate: f32,
+    layers: [ExplosionLayer; EXPLOSION_POLYPHONY],
+    next_layer: usize,
+    rng: u32,
+}
+
+impl ExplosionVoiceUnit {
+    fn new(voice: &PreallocatedVoice) -> Self {
+        Self {
+            variant_triggers: voice.variant_trigger_controls.clone(),
+            last_variant_triggers: [0.0; VOICE_VARIANT_TRIGGER_COUNT],
+            gain: voice.fundsp_controls[usize::from(PARAM_EXPLOSION_GAIN.0)].clone(),
+            sample_rate: TARGET_OUTPUT_SAMPLE_RATE as f32,
+            layers: [ExplosionLayer::default(); EXPLOSION_POLYPHONY],
+            next_layer: 0,
+            rng: 0x4d59_4657,
+        }
+    }
+
+    fn start_layer(&mut self, size_variant: usize) {
+        self.rng = self.rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let index = self.next_layer;
+        self.next_layer = (self.next_layer + 1) % EXPLOSION_POLYPHONY;
+        self.layers[index] = ExplosionLayer {
+            active: true,
+            size_variant: size_variant.min(2),
+            age: 0.0,
+            duration: explosion_duration_seconds(size_variant),
+            low: 0.0,
+            band: 0.0,
+            noise_state: self.rng ^ ((size_variant as u32 + 1) * 0x9e37_79b9),
+        };
+    }
+
+    fn next_sample(&mut self) -> f32 {
+        for variant in 0..3 {
+            let triggers = trigger_delta(
+                self.variant_triggers[variant].value(),
+                &mut self.last_variant_triggers[variant],
+                EXPLOSION_POLYPHONY,
+            );
+            for _ in 0..triggers {
+                self.start_layer(variant);
+            }
+        }
+
+        let dt = 1.0 / self.sample_rate.max(1.0);
+        let mut sample = 0.0;
+        let gain = self.gain.value().clamp(0.0, 1.0);
+
+        for layer in &mut self.layers {
+            if !layer.active {
+                continue;
+            }
+            if layer.age >= layer.duration {
+                layer.active = false;
+                continue;
+            }
+
+            let progress = (layer.age / layer.duration.max(0.001)).clamp(0.0, 1.0);
+            let tone_index = ((progress * 4.0) as usize).min(3);
+            let center = explosion_tone_hz(layer.size_variant, tone_index);
+            let noise = next_white_noise(&mut layer.noise_state);
+            let band = state_variable_bandpass(
+                noise,
+                center,
+                0.22,
+                self.sample_rate,
+                &mut layer.low,
+                &mut layer.band,
+            );
+            let attack = 0.006;
+            let envelope = percussive_envelope(layer.age, layer.duration, attack);
+            sample += band * envelope * explosion_variant_gain(layer.size_variant) * gain;
+            layer.age += dt;
+        }
+
+        sample
+    }
+}
+
+impl AudioUnit for ExplosionVoiceUnit {
+    fn set_sample_rate(&mut self, sample_rate: f64) {
+        self.sample_rate = sample_rate as f32;
+    }
+
+    fn tick(&mut self, _input: &[f32], output: &mut [f32]) {
+        let sample = self.next_sample();
+        output[0] = sample;
+        output[1] = sample;
+    }
+
+    fn process(&mut self, size: usize, _input: &BufferRef, output: &mut BufferMut) {
+        for i in 0..size {
+            let sample = self.next_sample();
+            output.set_f32(0, i, sample);
+            output.set_f32(1, i, sample);
+        }
+    }
+
+    fn inputs(&self) -> usize {
+        0
+    }
+
+    fn outputs(&self) -> usize {
+        2
+    }
+
+    fn route(&mut self, input: &SignalFrame, _frequency: f64) -> SignalFrame {
+        Routing::Generator(0.0).route(input, self.outputs())
+    }
+
+    fn get_id(&self) -> u64 {
+        0x4153_4558
+    }
+
+    fn footprint(&self) -> usize {
+        size_of::<Self>()
+    }
+}
+
+#[derive(Clone)]
+struct UfoVoiceUnit {
+    gate: Shared,
+    variant: Shared,
+    gain: Shared,
+    sample_rate: f32,
+    envelope: f32,
+    phase_a: f32,
+    phase_b: f32,
+    pattern_phase: f32,
+}
+
+impl UfoVoiceUnit {
+    fn new(voice: &PreallocatedVoice) -> Self {
+        Self {
+            gate: voice.gate_control.clone(),
+            variant: voice.fundsp_controls[usize::from(PARAM_UFO_VARIANT.0)].clone(),
+            gain: voice.fundsp_controls[usize::from(PARAM_UFO_GAIN.0)].clone(),
+            sample_rate: TARGET_OUTPUT_SAMPLE_RATE as f32,
+            envelope: 0.0,
+            phase_a: 0.0,
+            phase_b: 0.0,
+            pattern_phase: 0.0,
+        }
+    }
+
+    fn next_sample(&mut self) -> f32 {
+        let dt = 1.0 / self.sample_rate.max(1.0);
+        let target = if self.gate.value() > 0.5 { 1.0 } else { 0.0 };
+        let time_constant = if target > self.envelope { 0.030 } else { 0.080 };
+        let coefficient = 1.0 - (-dt / time_constant).exp();
+        self.envelope += (target - self.envelope) * coefficient;
+        if self.envelope < 0.0001 && target == 0.0 {
+            self.envelope = 0.0;
+            return 0.0;
+        }
+
+        let small = self.variant.value() >= 0.5;
+        let period = if small { 1.20 } else { 1.70 };
+        self.pattern_phase = (self.pattern_phase + dt / period).rem_euclid(1.0);
+        let descent_first = if self.pattern_phase < 0.5 {
+            1.0 - self.pattern_phase * 2.0
+        } else {
+            (self.pattern_phase - 0.5) * 2.0
+        };
+        let (low, high) = if small {
+            (620.0, 1120.0)
+        } else {
+            (290.0, 680.0)
+        };
+        let frequency = low + (high - low) * descent_first;
+        self.phase_a = advance_unit_phase(self.phase_a, frequency, self.sample_rate);
+        self.phase_b = advance_unit_phase(self.phase_b, frequency * 1.31, self.sample_rate);
+        let osc_a = if self.phase_a < 0.5 { 1.0 } else { -1.0 };
+        let osc_b = if self.phase_b < 0.5 { 1.0 } else { -1.0 };
+        (0.62 * osc_a + 0.38 * osc_b) * self.envelope * self.gain.value().clamp(0.0, 1.0)
+    }
+}
+
+impl AudioUnit for UfoVoiceUnit {
+    fn set_sample_rate(&mut self, sample_rate: f64) {
+        self.sample_rate = sample_rate as f32;
+    }
+
+    fn tick(&mut self, _input: &[f32], output: &mut [f32]) {
+        let sample = self.next_sample();
+        output[0] = sample;
+        output[1] = sample;
+    }
+
+    fn process(&mut self, size: usize, _input: &BufferRef, output: &mut BufferMut) {
+        for i in 0..size {
+            let sample = self.next_sample();
+            output.set_f32(0, i, sample);
+            output.set_f32(1, i, sample);
+        }
+    }
+
+    fn inputs(&self) -> usize {
+        0
+    }
+
+    fn outputs(&self) -> usize {
+        2
+    }
+
+    fn route(&mut self, input: &SignalFrame, _frequency: f64) -> SignalFrame {
+        Routing::Generator(0.0).route(input, self.outputs())
+    }
+
+    fn get_id(&self) -> u64 {
+        0x4153_5546
+    }
+
+    fn footprint(&self) -> usize {
+        size_of::<Self>()
+    }
+}
+
+#[derive(Clone)]
+struct HeartbeatVoiceUnit {
+    asteroid_count: Shared,
+    max_asteroids: Shared,
+    running: Shared,
+    gain: Shared,
+    sample_rate: f32,
+    was_running: bool,
+    seconds_to_next: f32,
+    beat_age: f32,
+    beat_active: bool,
+    alternate: bool,
+    phase: f32,
+}
+
+impl HeartbeatVoiceUnit {
+    fn new(voice: &PreallocatedVoice) -> Self {
+        Self {
+            asteroid_count: voice.fundsp_controls[usize::from(PARAM_HEARTBEAT_ASTEROID_COUNT.0)]
+                .clone(),
+            max_asteroids: voice.fundsp_controls[usize::from(PARAM_HEARTBEAT_MAX_ASTEROIDS.0)]
+                .clone(),
+            running: voice.fundsp_controls[usize::from(PARAM_HEARTBEAT_RUNNING.0)].clone(),
+            gain: voice.fundsp_controls[usize::from(PARAM_HEARTBEAT_GAIN.0)].clone(),
+            sample_rate: TARGET_OUTPUT_SAMPLE_RATE as f32,
+            was_running: false,
+            seconds_to_next: 0.0,
+            beat_age: HEARTBEAT_ON_SECONDS,
+            beat_active: false,
+            alternate: false,
+            phase: 0.0,
+        }
+    }
+
+    fn next_sample(&mut self) -> f32 {
+        let active = self.running.value() > 0.5 && self.asteroid_count.value() >= 0.5;
+        let dt = 1.0 / self.sample_rate.max(1.0);
+        if !active {
+            self.was_running = false;
+            self.beat_active = false;
+            return 0.0;
+        }
+
+        if !self.was_running {
+            self.seconds_to_next = 0.0;
+            self.beat_active = false;
+            self.was_running = true;
+        }
+
+        if self.seconds_to_next <= 0.0 {
+            self.beat_active = true;
+            self.beat_age = 0.0;
+            self.alternate = !self.alternate;
+            self.phase = 0.0;
+            let count = self.asteroid_count.value().round().max(1.0) as u32;
+            let max_count = self.max_asteroids.value().round().max(count as f32) as u32;
+            let period = heartbeat_period_seconds_for_count(max_count, count).unwrap_or(0.5);
+            self.seconds_to_next += period;
+        }
+        self.seconds_to_next -= dt;
+
+        if !self.beat_active {
+            return 0.0;
+        }
+        if self.beat_age >= HEARTBEAT_ON_SECONDS {
+            self.beat_active = false;
+            return 0.0;
+        }
+
+        let frequency = if self.alternate { 86.0 } else { 64.0 };
+        self.phase = advance_unit_phase(self.phase, frequency, self.sample_rate);
+        let envelope = (1.0 - self.beat_age / HEARTBEAT_ON_SECONDS)
+            .clamp(0.0, 1.0)
+            .powf(2.4);
+        let sample = (self.phase * TAU).sin() * envelope * self.gain.value().clamp(0.0, 1.0);
+        self.beat_age += dt;
+        sample
+    }
+}
+
+impl AudioUnit for HeartbeatVoiceUnit {
+    fn set_sample_rate(&mut self, sample_rate: f64) {
+        self.sample_rate = sample_rate as f32;
+    }
+
+    fn tick(&mut self, _input: &[f32], output: &mut [f32]) {
+        let sample = self.next_sample();
+        output[0] = sample;
+        output[1] = sample;
+    }
+
+    fn process(&mut self, size: usize, _input: &BufferRef, output: &mut BufferMut) {
+        for i in 0..size {
+            let sample = self.next_sample();
+            output.set_f32(0, i, sample);
+            output.set_f32(1, i, sample);
+        }
+    }
+
+    fn inputs(&self) -> usize {
+        0
+    }
+
+    fn outputs(&self) -> usize {
+        2
+    }
+
+    fn route(&mut self, input: &SignalFrame, _frequency: f64) -> SignalFrame {
+        Routing::Generator(0.0).route(input, self.outputs())
+    }
+
+    fn get_id(&self) -> u64 {
+        0x4153_4842
+    }
+
+    fn footprint(&self) -> usize {
+        size_of::<Self>()
+    }
+}
+
+fn trigger_delta(current: f32, last: &mut f32, max_delta: usize) -> usize {
+    let delta = (current - *last).round();
+    *last = current;
+    if delta.is_finite() && delta > 0.0 {
+        (delta as usize).min(max_delta)
+    } else {
+        0
+    }
+}
+
+fn advance_unit_phase(phase: f32, frequency: f32, sample_rate: f32) -> f32 {
+    (phase + frequency.max(0.0) / sample_rate.max(1.0)).rem_euclid(1.0)
+}
+
+fn percussive_envelope(age: f32, duration: f32, attack: f32) -> f32 {
+    if age < attack {
+        (age / attack.max(0.0001)).clamp(0.0, 1.0)
+    } else {
+        let progress = ((age - attack) / (duration - attack).max(0.0001)).clamp(0.0, 1.0);
+        (1.0 - progress).powf(2.0)
+    }
+}
+
+fn next_white_noise(state: &mut u32) -> f32 {
+    *state ^= *state << 13;
+    *state ^= *state >> 17;
+    *state ^= *state << 5;
+    (*state as f32 / u32::MAX as f32) * 2.0 - 1.0
+}
+
+fn state_variable_bandpass(
+    input: f32,
+    center_hz: f32,
+    damping: f32,
+    sample_rate: f32,
+    low: &mut f32,
+    band: &mut f32,
+) -> f32 {
+    let normalized = (PI * center_hz.clamp(20.0, sample_rate * 0.45) / sample_rate.max(1.0)).sin();
+    let f = (2.0 * normalized).min(0.98);
+    let high = input - *low - damping * *band;
+    *band += f * high;
+    *low += f * *band;
+    *band
+}
+
+fn explosion_duration_seconds(size_variant: usize) -> f32 {
+    match size_variant {
+        0 => 0.72,
+        1 => 0.52,
+        _ => 0.36,
+    }
+}
+
+fn explosion_variant_gain(size_variant: usize) -> f32 {
+    match size_variant {
+        0 => 1.00,
+        1 => 0.88,
+        _ => 0.74,
+    }
+}
+
+fn explosion_tone_hz(size_variant: usize, tone_index: usize) -> f32 {
+    const TONES: [[f32; 4]; 3] = [
+        [240.0, 340.0, 470.0, 660.0],
+        [390.0, 560.0, 790.0, 1120.0],
+        [660.0, 930.0, 1320.0, 1860.0],
+    ];
+    TONES[size_variant.min(2)][tone_index.min(3)]
+}
+
+fn soft_clip(value: f32) -> f32 {
+    value / (1.0 + value.abs() * 0.35)
 }
 
 fn render_audio_callback(

@@ -6,7 +6,7 @@ use std::{
     process,
 };
 
-use asteroids::verify;
+use asteroids::{audio, verify};
 use serde_json::Value;
 
 const SUBCOMMANDS: &[&str] = &[
@@ -72,7 +72,8 @@ fn run() -> Result<(), String> {
         "soul-visible" => cmd_soul_visible(&mut args),
         "asteroid-count" => cmd_asteroid_count(&mut args),
         "screen-wrap" => cmd_screen_wrap(&mut args),
-        "lives-display" | "heartbeat-tempo" => Err(format!(
+        "heartbeat-tempo" => cmd_heartbeat_tempo(&mut args),
+        "lives-display" => Err(format!(
             "{command} is reserved for a later gameplay/audio milestone\n\n{}",
             subcommand_help(&command)
         )),
@@ -558,6 +559,74 @@ fn cmd_xrun_count(args: &mut CliArgs) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_heartbeat_tempo(args: &mut CliArgs) -> Result<(), String> {
+    let wav = verify::load_wav(&args.path("--wav")?)?;
+    let state_log = args.path("--state-log")?;
+    let tempo_curve = args.value_or("--tempo-curve", "disassembly".to_string())?;
+    let tolerance = args.value_or("--tolerance", 0.1_f32)?;
+    args.finish()?;
+    if tempo_curve != "disassembly" {
+        return Err(format!(
+            "heartbeat-tempo only supports --tempo-curve disassembly, got {tempo_curve}"
+        ));
+    }
+
+    let state_points = heartbeat_state_points(&state_log)?;
+    let max_count = state_points
+        .iter()
+        .map(|point| point.1)
+        .max()
+        .ok_or_else(|| "heartbeat-tempo failed: no asteroid_count states".to_string())?;
+    let beats = detect_heartbeat_beats(&wav)?;
+    if beats.len() < 4 {
+        return Err(format!(
+            "heartbeat-tempo failed: detected only {} beats",
+            beats.len()
+        ));
+    }
+
+    let mut checked = 0;
+    let mut worst_error = 0.0_f32;
+    for pair in beats.windows(2) {
+        let t0 = pair[0];
+        let t1 = pair[1];
+        let Some(count0) = asteroid_count_at_time(&state_points, t0) else {
+            continue;
+        };
+        let Some(count1) = asteroid_count_at_time(&state_points, t1) else {
+            continue;
+        };
+        if count0 == 0 || count0 != count1 {
+            continue;
+        }
+        let Some(expected) = audio::heartbeat_period_seconds_for_count(max_count, count0) else {
+            continue;
+        };
+        let observed = t1 - t0;
+        let error = (observed - expected).abs();
+        worst_error = worst_error.max(error);
+        if error > tolerance {
+            return Err(format!(
+                "heartbeat-tempo failed: count={count0} observed={observed:.3}s expected={expected:.3}s error={error:.3}s tolerance={tolerance:.3}s"
+            ));
+        }
+        checked += 1;
+    }
+
+    if checked < 3 {
+        return Err(format!(
+            "heartbeat-tempo failed: only {checked} beat intervals matched stable state-log counts"
+        ));
+    }
+    println!(
+        "heartbeat-tempo ok: beats={} checked={} max_count={} worst_error={worst_error:.3}s",
+        beats.len(),
+        checked,
+        max_count
+    );
+    Ok(())
+}
+
 fn cmd_frame_time_p99(args: &mut CliArgs) -> Result<(), String> {
     let p99 = verify::frame_time_p99(&args.path("--log")?)?;
     let max_ms = args.value("--max-ms")?;
@@ -569,6 +638,85 @@ fn cmd_frame_time_p99(args: &mut CliArgs) -> Result<(), String> {
     }
     println!("frame-time-p99 ok: p99={p99:.6}ms");
     Ok(())
+}
+
+fn heartbeat_state_points(path: &Path) -> Result<Vec<(f32, u32)>, String> {
+    let events = verify::load_state_trace(path)?;
+    let mut points = Vec::new();
+    for event in events {
+        if event.event.as_deref() != Some("tick") {
+            continue;
+        }
+        let Some(time) = event.value.get("time").and_then(Value::as_f64) else {
+            continue;
+        };
+        let Some(count) = event.value.get("asteroid_count").and_then(Value::as_u64) else {
+            continue;
+        };
+        points.push((time as f32, count as u32));
+    }
+    points.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Ok(points)
+}
+
+fn asteroid_count_at_time(points: &[(f32, u32)], time: f32) -> Option<u32> {
+    let mut current = None;
+    for (point_time, count) in points {
+        if *point_time > time {
+            break;
+        }
+        current = Some(*count);
+    }
+    current
+}
+
+fn detect_heartbeat_beats(wav: &verify::WavData) -> Result<Vec<f32>, String> {
+    let channels = usize::from(wav.channels.max(1));
+    let frames = wav.samples.len() / channels;
+    if frames == 0 {
+        return Err("heartbeat-tempo failed: WAV has no samples".to_string());
+    }
+    let mono = wav.mono_samples(frames);
+    let sample_rate = wav.sample_rate as usize;
+    let window = (sample_rate / 100).max(1);
+    let hop = (sample_rate / 200).max(1);
+    let mut envelope = Vec::new();
+    let mut frame = 0;
+    while frame + window <= mono.len() {
+        let rms = (mono[frame..frame + window]
+            .iter()
+            .map(|sample| sample * sample)
+            .sum::<f32>()
+            / window as f32)
+            .sqrt();
+        envelope.push((frame as f32 / wav.sample_rate as f32, rms));
+        frame += hop;
+    }
+    let max_env = envelope
+        .iter()
+        .map(|(_, value)| *value)
+        .fold(0.0_f32, f32::max);
+    if max_env <= 0.0 {
+        return Err("heartbeat-tempo failed: WAV envelope is silent".to_string());
+    }
+    let threshold = (max_env * 0.32).max(0.01);
+    let mut beats = Vec::new();
+    let mut last_beat_time = -1.0_f32;
+    for i in 1..envelope.len().saturating_sub(1) {
+        let (time, value) = envelope[i];
+        if value < threshold {
+            continue;
+        }
+        if value < envelope[i - 1].1 || value < envelope[i + 1].1 {
+            continue;
+        }
+        if time - last_beat_time < 0.12 {
+            continue;
+        }
+        beats.push(time);
+        last_beat_time = time;
+    }
+    Ok(beats)
 }
 
 fn cmd_state_trace(args: &mut CliArgs) -> Result<(), String> {
