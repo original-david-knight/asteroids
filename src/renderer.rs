@@ -13,7 +13,7 @@ use crate::{
     beam::{self, BeamCommand, BeamEmitter, BeamVertex, Vec2},
     game::{
         ASTEROID_HULL_VERTEX_COUNT, AsteroidSize, INITIAL_LIVES, RenderAsteroid, RenderBullet,
-        RenderShip, RenderUfo, displayed_lives,
+        RenderShip, RenderUfo, displayed_lives, ufo_outline_segments,
     },
     tuning,
 };
@@ -1344,52 +1344,7 @@ fn emit_asteroid_outline(emitter: &mut BeamEmitter, asteroid: RenderAsteroid, lo
 }
 
 fn emit_ufo_outline(emitter: &mut BeamEmitter, ufo: RenderUfo, local_x_scale: f32) {
-    let width = ufo.radius * 2.2;
-    let body_half_width = width * 0.42;
-    let body_half_height = ufo.radius * 0.34;
-    let dome_half_width = width * 0.20;
-    let dome_height = ufo.radius * 0.38;
-    let base_y = -body_half_height;
-    let mid_y = 0.0;
-    let top_y = body_half_height;
-    let dome_top_y = top_y + dome_height;
-
-    let segments = [
-        (
-            Vec2::new(-width * 0.5, mid_y),
-            Vec2::new(-body_half_width, top_y),
-        ),
-        (
-            Vec2::new(-body_half_width, top_y),
-            Vec2::new(body_half_width, top_y),
-        ),
-        (
-            Vec2::new(body_half_width, top_y),
-            Vec2::new(width * 0.5, mid_y),
-        ),
-        (
-            Vec2::new(width * 0.5, mid_y),
-            Vec2::new(body_half_width, base_y),
-        ),
-        (
-            Vec2::new(body_half_width, base_y),
-            Vec2::new(-body_half_width, base_y),
-        ),
-        (
-            Vec2::new(-body_half_width, base_y),
-            Vec2::new(-width * 0.5, mid_y),
-        ),
-        (
-            Vec2::new(-dome_half_width, top_y),
-            Vec2::new(0.0, dome_top_y),
-        ),
-        (
-            Vec2::new(0.0, dome_top_y),
-            Vec2::new(dome_half_width, top_y),
-        ),
-    ];
-
-    for (start, end) in segments {
+    for (start, end) in ufo_outline_segments(ufo.radius) {
         emitter.emit_ship_outline_segment_with_endpoint_bonus(
             ufo.position + aspect_correct_local(start, local_x_scale),
             ufo.position + aspect_correct_local(end, local_x_scale),

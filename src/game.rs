@@ -78,6 +78,7 @@ const UFO_LARGE_RADIUS_NDC: f32 = 0.092;
 const UFO_SMALL_RADIUS_NDC: f32 = 0.062;
 const UFO_RAW_HORIZONTAL_SPEED: f32 = 16.0;
 const UFO_RAW_VERTICAL_SPEEDS: [f32; 4] = [-16.0, 0.0, 0.0, 16.0];
+pub const UFO_OUTLINE_SEGMENT_COUNT: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ControlState {
@@ -307,6 +308,53 @@ impl UfoVariant {
             Self::Small => UFO_SMALL_RADIUS_NDC,
         }
     }
+}
+
+pub fn ufo_outline_segments(radius: f32) -> [(Vec2, Vec2); UFO_OUTLINE_SEGMENT_COUNT] {
+    let width = radius * 2.2;
+    let body_half_width = width * 0.42;
+    let body_half_height = radius * 0.34;
+    let dome_half_width = width * 0.20;
+    let dome_height = radius * 0.38;
+    let base_y = -body_half_height;
+    let mid_y = 0.0;
+    let top_y = body_half_height;
+    let dome_top_y = top_y + dome_height;
+
+    [
+        (
+            Vec2::new(-width * 0.5, mid_y),
+            Vec2::new(-body_half_width, top_y),
+        ),
+        (
+            Vec2::new(-body_half_width, top_y),
+            Vec2::new(body_half_width, top_y),
+        ),
+        (
+            Vec2::new(body_half_width, top_y),
+            Vec2::new(width * 0.5, mid_y),
+        ),
+        (
+            Vec2::new(width * 0.5, mid_y),
+            Vec2::new(body_half_width, base_y),
+        ),
+        (
+            Vec2::new(body_half_width, base_y),
+            Vec2::new(-body_half_width, base_y),
+        ),
+        (
+            Vec2::new(-body_half_width, base_y),
+            Vec2::new(-width * 0.5, mid_y),
+        ),
+        (
+            Vec2::new(-dome_half_width, top_y),
+            Vec2::new(0.0, dome_top_y),
+        ),
+        (
+            Vec2::new(0.0, dome_top_y),
+            Vec2::new(dome_half_width, top_y),
+        ),
+    ]
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -742,13 +790,14 @@ impl GameState {
         }
         self.despawn_expired_bullets();
         self.despawn_expired_ufo_bullets();
-        self.resolve_bullet_ufo_collisions();
+        let object_local_x_scale = sanitized_object_local_x_scale(input.shot_x_scale);
+        self.resolve_bullet_ufo_collisions(object_local_x_scale);
         self.resolve_bullet_asteroid_collisions();
         self.resolve_ufo_bullet_asteroid_collisions();
         self.resolve_ship_asteroid_collisions();
-        self.resolve_ship_ufo_collisions();
+        self.resolve_ship_ufo_collisions(object_local_x_scale);
         self.resolve_ufo_bullet_ship_collisions();
-        self.resolve_asteroid_ufo_collisions();
+        self.resolve_asteroid_ufo_collisions(object_local_x_scale);
         if self.invulnerability_timer_seconds > 0.0 {
             self.invulnerability_timer_seconds = (self.invulnerability_timer_seconds - dt).max(0.0);
         }
@@ -1156,16 +1205,16 @@ impl GameState {
         self.ufo_bullets.retain(|bullet| !bullet.is_expired());
     }
 
-    fn resolve_bullet_ufo_collisions(&mut self) {
+    fn resolve_bullet_ufo_collisions(&mut self, local_x_scale: f32) {
         let Some(ufo) = self.ufo else {
             return;
         };
         let hit_bullet_index = self.bullets.iter().position(|bullet| {
-            playfield_circles_overlap(
+            playfield_circle_ufo_outline_overlap(
                 bullet.position,
-                BULLET_RADIUS_NDC,
-                ufo.position,
-                ufo.radius_ndc(),
+                BULLET_RENDER_RADIUS_NDC,
+                ufo,
+                local_x_scale,
             )
         });
         if let Some(index) = hit_bullet_index {
@@ -1243,16 +1292,16 @@ impl GameState {
         }
     }
 
-    fn resolve_ship_ufo_collisions(&mut self) {
+    fn resolve_ship_ufo_collisions(&mut self, local_x_scale: f32) {
         if !self.alive || self.game_over || self.invulnerability_timer_seconds > 0.0 {
             return;
         }
         let hit_ship = self.ufo.is_some_and(|ufo| {
-            playfield_circles_overlap(
+            playfield_circle_ufo_outline_overlap(
                 self.ship.position,
                 SHIP_COLLISION_RADIUS_NDC,
-                ufo.position,
-                ufo.radius_ndc(),
+                ufo,
+                local_x_scale,
             )
         });
         if hit_ship {
@@ -1279,7 +1328,7 @@ impl GameState {
         }
     }
 
-    fn resolve_asteroid_ufo_collisions(&mut self) {
+    fn resolve_asteroid_ufo_collisions(&mut self, local_x_scale: f32) {
         let Some(ufo) = self.ufo else {
             return;
         };
@@ -1287,11 +1336,11 @@ impl GameState {
             .asteroids
             .iter()
             .find(|asteroid| {
-                playfield_circles_overlap(
-                    ufo.position,
-                    ufo.radius_ndc(),
+                playfield_circle_ufo_outline_overlap(
                     asteroid.position,
                     asteroid.radius_ndc(),
+                    ufo,
+                    local_x_scale,
                 )
             })
             .map(|asteroid| asteroid.id);
@@ -1478,9 +1527,10 @@ fn ufo_shot_interval_seconds() -> f32 {
     UFO_SHOT_RELOAD_TICKS as f32 * UFO_ORIGINAL_TIMER_TICK_SECONDS
 }
 
-/// Closed DESIGN collision-model question: gameplay collisions use circle-vs-circle
-/// tests with sprite-extent radii. This is modern, fast, deterministic at edge
-/// touch, and accurate enough for the wireframe sprites used in this build.
+/// Closed DESIGN collision-model question: most gameplay collisions use
+/// circle-vs-circle tests with sprite-extent radii. The UFO uses its rendered
+/// outline segments so near misses above and below the shallow saucer do not
+/// register as hits.
 pub fn circles_overlap(center_a: Vec2, radius_a: f32, center_b: Vec2, radius_b: f32) -> bool {
     let combined_radius = radius_a.max(0.0) + radius_b.max(0.0);
     (center_a - center_b).length_squared() <= combined_radius * combined_radius
@@ -1490,6 +1540,69 @@ fn playfield_circles_overlap(center_a: Vec2, radius_a: f32, center_b: Vec2, radi
     let delta = wrapped_delta(center_a, center_b);
     let combined_radius = radius_a.max(0.0) + radius_b.max(0.0);
     delta.length_squared() <= combined_radius * combined_radius
+}
+
+fn playfield_circle_ufo_outline_overlap(
+    circle_center: Vec2,
+    circle_radius: f32,
+    ufo: Ufo,
+    local_x_scale: f32,
+) -> bool {
+    let local_circle_center = wrapped_delta(circle_center, ufo.position);
+    circle_ufo_outline_overlap(
+        local_circle_center,
+        circle_radius,
+        ufo.radius_ndc(),
+        local_x_scale,
+    )
+}
+
+fn circle_ufo_outline_overlap(
+    local_circle_center: Vec2,
+    circle_radius: f32,
+    ufo_radius: f32,
+    local_x_scale: f32,
+) -> bool {
+    let radius = circle_radius.max(0.0);
+    ufo_outline_segments(ufo_radius).iter().any(|(start, end)| {
+        circle_segment_overlap(
+            local_circle_center,
+            radius,
+            aspect_correct_collision_local(*start, local_x_scale),
+            aspect_correct_collision_local(*end, local_x_scale),
+        )
+    })
+}
+
+fn circle_segment_overlap(center: Vec2, radius: f32, start: Vec2, end: Vec2) -> bool {
+    let segment = end - start;
+    let length_squared = segment.length_squared();
+    let closest = if length_squared > f32::EPSILON {
+        let t = (dot(center - start, segment) / length_squared).clamp(0.0, 1.0);
+        start + segment * t
+    } else {
+        start
+    };
+    (center - closest).length_squared() <= radius * radius
+}
+
+fn aspect_correct_collision_local(local: Vec2, local_x_scale: f32) -> Vec2 {
+    Vec2::new(
+        local.x * sanitized_object_local_x_scale(local_x_scale),
+        local.y,
+    )
+}
+
+fn sanitized_object_local_x_scale(local_x_scale: f32) -> f32 {
+    if local_x_scale.is_finite() && local_x_scale > 0.0 {
+        local_x_scale
+    } else {
+        1.0
+    }
+}
+
+fn dot(a: Vec2, b: Vec2) -> f32 {
+    a.x.mul_add(b.x, a.y * b.y)
 }
 
 fn wrapped_delta(a: Vec2, b: Vec2) -> Vec2 {
@@ -2284,6 +2397,21 @@ mod tests {
     }
 
     #[test]
+    fn extra_life_awards_every_ten_thousand_threshold_crossed_by_one_score_event() {
+        let mut state = empty_test_state();
+
+        state.add_score(42_000);
+
+        assert_eq!(state.lives, INITIAL_LIVES + 4);
+        for threshold in [10_000, 20_000, 30_000, 40_000] {
+            assert!(state.events().iter().any(|event| {
+                event.kind == GameEventKind::ExtraLifeAwarded
+                    && event.extra_life_threshold == Some(threshold)
+            }));
+        }
+    }
+
+    #[test]
     fn lives_display_count_clamps_to_design_maximum() {
         assert_eq!(displayed_lives(0), 0);
         assert_eq!(displayed_lives(INITIAL_LIVES), INITIAL_LIVES);
@@ -2411,6 +2539,57 @@ mod tests {
         assert!(circles_overlap(Vec2::ZERO, 0.5, Vec2::new(0.75, 0.0), 0.3));
         assert!(circles_overlap(Vec2::ZERO, 0.5, Vec2::new(0.8, 0.0), 0.3));
         assert!(!circles_overlap(Vec2::ZERO, 0.5, Vec2::new(0.81, 0.0), 0.3));
+    }
+
+    #[test]
+    fn bullet_ufo_collision_hits_visible_outline_segment() {
+        let mut state = empty_test_state();
+        let radius = UfoVariant::Large.radius_ndc();
+        let dome_top = ufo_outline_segments(radius)[7].0;
+        state.ufo = Some(Ufo::new(1, UfoVariant::Large, Vec2::ZERO, Vec2::ZERO));
+        state.bullets.push(Bullet::new(1, dome_top, Vec2::ZERO));
+
+        state.resolve_bullet_ufo_collisions(1.0);
+
+        assert!(state.ufo.is_none());
+        assert!(state.bullets.is_empty());
+    }
+
+    #[test]
+    fn bullet_ufo_collision_ignores_empty_space_above_saucer_outline() {
+        let mut state = empty_test_state();
+        let radius = UfoVariant::Large.radius_ndc();
+        let dome_top = ufo_outline_segments(radius)[7].0;
+        state.ufo = Some(Ufo::new(1, UfoVariant::Large, Vec2::ZERO, Vec2::ZERO));
+        state.bullets.push(Bullet::new(
+            1,
+            dome_top + Vec2::new(0.0, BULLET_RENDER_RADIUS_NDC * 2.0),
+            Vec2::ZERO,
+        ));
+
+        state.resolve_bullet_ufo_collisions(1.0);
+
+        assert!(state.ufo.is_some());
+        assert_eq!(state.bullets.len(), 1);
+    }
+
+    #[test]
+    fn bullet_ufo_collision_respects_aspect_corrected_outline_width() {
+        let mut state = empty_test_state();
+        let radius = UfoVariant::Large.radius_ndc();
+        let local_x_scale = 0.75;
+        let visible_tip_x = ufo_outline_segments(radius)[3].0.x * local_x_scale;
+        state.ufo = Some(Ufo::new(1, UfoVariant::Large, Vec2::ZERO, Vec2::ZERO));
+        state.bullets.push(Bullet::new(
+            1,
+            Vec2::new(visible_tip_x + BULLET_RENDER_RADIUS_NDC * 1.5, 0.0),
+            Vec2::ZERO,
+        ));
+
+        state.resolve_bullet_ufo_collisions(local_x_scale);
+
+        assert!(state.ufo.is_some());
+        assert_eq!(state.bullets.len(), 1);
     }
 
     #[test]
