@@ -1,0 +1,1 @@
+Green after adding missing aggregate verify soul-visible subcommand. Fresh /tmp/soul capture: 144 frames, 4 vertices every frame, rotation 3.001245 rad/s, max residual 0.005884 rad, weakest vertex luma 0.823529, trail luminance 7.560158. 10s frame-time log: 1441 samples, p99 0.655142 ms, max 1.043355 ms; no loop-back needed. Polish-pass should revisit bloom/tau by eye.

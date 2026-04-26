@@ -68,12 +68,11 @@ fn run() -> Result<(), String> {
         "xrun-count" => cmd_xrun_count(&mut args),
         "frame-time-p99" => cmd_frame_time_p99(&mut args),
         "state-trace" => cmd_state_trace(&mut args),
-        "soul-visible" | "asteroid-count" | "screen-wrap" | "lives-display" | "heartbeat-tempo" => {
-            Err(format!(
-                "{command} is reserved for a later gameplay/audio milestone\n\n{}",
-                subcommand_help(&command)
-            ))
-        }
+        "soul-visible" => cmd_soul_visible(&mut args),
+        "asteroid-count" | "screen-wrap" | "lives-display" | "heartbeat-tempo" => Err(format!(
+            "{command} is reserved for a later gameplay/audio milestone\n\n{}",
+            subcommand_help(&command)
+        )),
         _ => Err(format!(
             "unknown subcommand '{command}'\n\n{}",
             general_help()
@@ -268,6 +267,67 @@ fn cmd_trail_luminance(args: &mut CliArgs) -> Result<(), String> {
 
     let detections =
         detect_ship_angles(&frames, asteroids::tuning::SHIP_ROTATION_RATE_RAD_PER_SEC)?;
+    let best_luminance = ship_trail_luminance(&frames, &detections)?;
+    if best_luminance < min_luminance {
+        return Err(format!(
+            "trail-luminance failed: behind-vector luminance={best_luminance:.6}, expected >= {min_luminance:.6}"
+        ));
+    }
+    println!("trail-luminance ok: behind-vector luminance={best_luminance:.6}");
+    Ok(())
+}
+
+fn cmd_soul_visible(args: &mut CliArgs) -> Result<(), String> {
+    let frames = args.path("--frames")?;
+    let rotation_tolerance: f32 = args.value_or(
+        "--rotation-tolerance",
+        SOUL_VISIBLE_ROTATION_TOLERANCE_RAD_PER_SEC,
+    )?;
+    let min_trail_luminance: f32 =
+        args.value_or("--min-trail-luminance", SOUL_VISIBLE_MIN_TRAIL_LUMINANCE)?;
+    args.finish()?;
+
+    let frames = sorted_frame_paths(&frames)?;
+    if frames.len() < SOUL_VISIBLE_MIN_FRAMES {
+        return Err(format!(
+            "soul-visible failed: at least {SOUL_VISIBLE_MIN_FRAMES} frames are required, found {}",
+            frames.len()
+        ));
+    }
+
+    let rotation_rate = asteroids::tuning::SHIP_ROTATION_RATE_RAD_PER_SEC;
+    let detections = detect_ship_angles(&frames, rotation_rate)?;
+    let fit = fit_angle_rate(&detections, VERIFY_FIXED_DT_SECONDS);
+    let rate_error = (fit.rate_rad_per_sec - rotation_rate).abs();
+    if rate_error > rotation_tolerance {
+        return Err(format!(
+            "soul-visible failed: rate={:.6}rad/s expected={rotation_rate:.6} tolerance={rotation_tolerance:.6}, max_residual={:.6}rad",
+            fit.rate_rad_per_sec, fit.max_residual_rad
+        ));
+    }
+
+    let weakest_vertex = detections
+        .iter()
+        .flat_map(|detection| detection.vertex_luminance)
+        .fold(f32::INFINITY, f32::min);
+    let best_luminance = ship_trail_luminance(&frames, &detections)?;
+    let trail_floor = min_trail_luminance.max(f32::EPSILON);
+    if best_luminance < trail_floor {
+        return Err(format!(
+            "soul-visible failed: trail_luminance={best_luminance:.6}, expected >= {trail_floor:.6}"
+        ));
+    }
+
+    println!(
+        "soul-visible ok: frames={} vertices={SHIP_VERTEX_COUNT}, rate={:.6}rad/s, max_residual={:.6}rad, weakest_vertex_luma={weakest_vertex:.6}, trail_luminance={best_luminance:.6}",
+        detections.len(),
+        fit.rate_rad_per_sec,
+        fit.max_residual_rad,
+    );
+    Ok(())
+}
+
+fn ship_trail_luminance(frames: &[PathBuf], detections: &[ShipDetection]) -> Result<f32, String> {
     let image = verify::load_png(
         frames
             .last()
@@ -297,13 +357,7 @@ fn cmd_trail_luminance(args: &mut CliArgs) -> Result<(), String> {
         }
     }
 
-    if best_luminance < min_luminance {
-        return Err(format!(
-            "trail-luminance failed: behind-vector luminance={best_luminance:.6}, expected >= {min_luminance:.6}"
-        ));
-    }
-    println!("trail-luminance ok: behind-vector luminance={best_luminance:.6}");
-    Ok(())
+    Ok(best_luminance)
 }
 
 fn cmd_playfield_rect(args: &mut CliArgs) -> Result<(), String> {
@@ -584,6 +638,9 @@ fn brightest_pixel(image: &verify::PngImage) -> (u32, u32, f32) {
 
 const VERIFY_FIXED_DT_SECONDS: f32 = 0.00694;
 const PLAYFIELD_ASPECT_RATIO: f32 = 4.0 / 3.0;
+const SOUL_VISIBLE_MIN_FRAMES: usize = 8;
+const SOUL_VISIBLE_ROTATION_TOLERANCE_RAD_PER_SEC: f32 = 0.1;
+const SOUL_VISIBLE_MIN_TRAIL_LUMINANCE: f32 = 0.0;
 const SHIP_VERTEX_COUNT: usize = 4;
 const SHIP_VERTICES: [asteroids::beam::Vec2; SHIP_VERTEX_COUNT] = [
     asteroids::beam::Vec2::new(0.44, 0.0),
@@ -1033,7 +1090,7 @@ fn subcommand_help(command: &str) -> String {
         "peak-count" => "Usage: verify peak-count --frame <png> [--threshold <luma>] [--min <n>] [--max <n>]".to_string(),
         "ship-outline" => "Usage: verify ship-outline --frames <dir> --vertex-count <n> --rotation-rate-rad-per-sec <rate> --tolerance <value>".to_string(),
         "trail-luminance" => "Usage: verify trail-luminance --frames <dir> --behind-vector --min-luminance <value>".to_string(),
-        "soul-visible" => "Usage: verify soul-visible [task-specific args added by the soul-visible milestone]".to_string(),
+        "soul-visible" => "Usage: verify soul-visible --frames <dir> [--rotation-tolerance <rad/s>] [--min-trail-luminance <luma>]".to_string(),
         "asteroid-count" => "Usage: verify asteroid-count --frame <png> --count <n>".to_string(),
         "screen-wrap" => "Usage: verify screen-wrap --log <state-jsonl> --expect <event,...>".to_string(),
         "lives-display" => "Usage: verify lives-display --frame <png> --max-displayed <n> --state-log <state-jsonl>".to_string(),

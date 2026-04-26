@@ -330,7 +330,7 @@ tasks:
       details: |
         DESIGN.md Success Criteria gate - the spinning wireframe ship on a black background with phosphor glow that visibly trails behind motion must be present by this milestone.
         Sit with the renderer for several minutes. Confirm the museum-piece illusion holds for the visual half of the project (audio comes later). If the illusion breaks, loop back to bloom-pass or phosphor-accumulator before continuing into the audio path.
-      status: todo
+      status: done
       workflow: checkpoint
       deps:
         - spinning-ship
