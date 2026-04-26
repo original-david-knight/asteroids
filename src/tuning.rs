@@ -13,6 +13,7 @@ pub const ENDPOINT_DWELL_BONUS_US: f32 = 10.0;
 pub const DEFAULT_BEAM_RGB: [f32; 3] = [1.0, 1.0, 1.0];
 
 pub const SHIP_ROTATION_RATE_RAD_PER_SEC: f32 = 3.0;
+pub const SHIP_GAMEPLAY_SCALE: f32 = 0.10;
 pub const SHIP_SPINNING_SCALE: f32 = 0.55;
 
 /// Step-11 asteroid constants tuned against the original 6502 listings:

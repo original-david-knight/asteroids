@@ -46,7 +46,7 @@ pub const INITIAL_LIVES: u32 = 3;
 pub const BULLET_LIFETIME_SECONDS: f32 = 1.0;
 pub const BULLET_SPEED_NDC_PER_SEC: f32 = 1.65;
 pub const BULLET_RADIUS_NDC: f32 = 0.012;
-pub const SHIP_COLLISION_RADIUS_NDC: f32 = 0.44 * tuning::SHIP_SPINNING_SCALE;
+pub const SHIP_COLLISION_RADIUS_NDC: f32 = 0.44 * tuning::SHIP_GAMEPLAY_SCALE;
 pub const SHIP_RESPAWN_DELAY_SECONDS: f32 = 1.25;
 pub const SHIP_RESPAWN_INVULNERABILITY_SECONDS: f32 = 1.25;
 pub const HYPERSPACE_COOLDOWN_SECONDS: f32 = 1.0;
@@ -1701,7 +1701,7 @@ impl GameLoop {
                 ),
             ),
             angle: lerp_angle(self.previous.ship.angle, self.current.ship.angle, alpha),
-            scale: tuning::SHIP_SPINNING_SCALE,
+            scale: tuning::SHIP_GAMEPLAY_SCALE,
         }
     }
 
@@ -1993,6 +1993,16 @@ mod tests {
         ship.integrate(&input, 1.0);
 
         assert!((ship.angle - tuning::SHIP_ROTATION_RATE_RAD_PER_SEC).abs() < EPSILON);
+    }
+
+    #[test]
+    fn gameplay_ship_uses_playable_scale_instead_of_demo_scale() {
+        let game = GameLoop::new();
+        let ship = game.interpolated_ship();
+
+        assert_eq!(ship.scale, tuning::SHIP_GAMEPLAY_SCALE);
+        assert!(ship.scale < tuning::SHIP_SPINNING_SCALE * 0.25);
+        assert!((SHIP_COLLISION_RADIUS_NDC - 0.44 * tuning::SHIP_GAMEPLAY_SCALE).abs() < EPSILON);
     }
 
     #[test]
