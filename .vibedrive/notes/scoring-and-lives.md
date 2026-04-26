@@ -1,0 +1,1 @@
+Implemented disassembly-cited scoring: asteroids large/medium/small = 20/50/100, UFO large/small = 200/990. Extra lives award every 10000 points. Beam score/lives readouts use game state, with lives display clamped to 6 while state can exceed it. Required score-progression and eight-extra-lives verification gates passed.

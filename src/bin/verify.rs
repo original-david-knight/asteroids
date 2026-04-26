@@ -73,10 +73,7 @@ fn run() -> Result<(), String> {
         "asteroid-count" => cmd_asteroid_count(&mut args),
         "screen-wrap" => cmd_screen_wrap(&mut args),
         "heartbeat-tempo" => cmd_heartbeat_tempo(&mut args),
-        "lives-display" => Err(format!(
-            "{command} is reserved for a later gameplay/audio milestone\n\n{}",
-            subcommand_help(&command)
-        )),
+        "lives-display" => cmd_lives_display(&mut args),
         _ => Err(format!(
             "unknown subcommand '{command}'\n\n{}",
             general_help()
@@ -848,6 +845,119 @@ fn cmd_screen_wrap(args: &mut CliArgs) -> Result<(), String> {
     }
     println!("screen-wrap ok: tick_events={tick_events}");
     Ok(())
+}
+
+fn cmd_lives_display(args: &mut CliArgs) -> Result<(), String> {
+    let image = verify::load_png(&args.path("--frame")?)?;
+    let max_displayed = args.value("--max-displayed")?;
+    let state_log = args.path("--state-log")?;
+    args.finish()?;
+    if max_displayed == 0 {
+        return Err("--max-displayed must be greater than zero".to_string());
+    }
+
+    let state_lives = max_lives_in_state_log(&state_log)?;
+    if state_lives < max_displayed {
+        return Err(format!(
+            "lives-display failed: state log max lives={state_lives}, expected at least {max_displayed}"
+        ));
+    }
+
+    let scores = life_icon_scores(&image, max_displayed.saturating_add(2))?;
+    let present_scores = &scores[..max_displayed.min(scores.len())];
+    let min_present = present_scores.iter().copied().fold(f32::INFINITY, f32::min);
+    let present_threshold = 0.025;
+    if min_present < present_threshold {
+        return Err(format!(
+            "lives-display failed: weakest expected icon score={min_present:.6}, threshold={present_threshold:.6}, scores={scores:?}"
+        ));
+    }
+
+    let absent_limit = (min_present * 0.35).max(0.02);
+    let extra_visible = scores
+        .iter()
+        .copied()
+        .enumerate()
+        .skip(max_displayed)
+        .filter(|(_, score)| *score >= absent_limit)
+        .collect::<Vec<_>>();
+    if !extra_visible.is_empty() {
+        return Err(format!(
+            "lives-display failed: icons beyond cap are visible at {extra_visible:?}, absent_limit={absent_limit:.6}, scores={scores:?}"
+        ));
+    }
+
+    println!(
+        "lives-display ok: state_lives={state_lives}, displayed_cap={max_displayed}, weakest_icon={min_present:.6}"
+    );
+    Ok(())
+}
+
+fn max_lives_in_state_log(path: &Path) -> Result<usize, String> {
+    let events = verify::load_state_trace(path)?;
+    let mut best = None;
+    for event in events {
+        if event.event.as_deref() != Some("tick") {
+            continue;
+        }
+        let Some(lives) = event.value.get("lives").and_then(Value::as_u64) else {
+            continue;
+        };
+        best = Some(best.unwrap_or(0).max(lives as usize));
+    }
+    best.ok_or_else(|| {
+        format!(
+            "lives-display failed: no tick events with lives in {}",
+            path.display()
+        )
+    })
+}
+
+fn life_icon_scores(image: &verify::PngImage, count: usize) -> Result<Vec<f32>, String> {
+    let playfield = centered_aspect_rect(image.width, image.height, PLAYFIELD_ASPECT_RATIO)?;
+    if playfield.right >= image.width {
+        return Err("lives-display failed: image has no right bezel margin".to_string());
+    }
+
+    let margin_width_ndc =
+        image.width.saturating_sub(playfield.right) as f32 / image.width.max(1) as f32 * 2.0;
+    let icon_scale = (margin_width_ndc * 0.62 / 0.44).clamp(0.055, 0.16);
+    let center_x_px = (playfield.right + image.width) as f32 * 0.5;
+    let center_x_ndc = center_x_px / image.width.max(1) as f32 * 2.0 - 1.0;
+
+    Ok((0..count)
+        .map(|index| {
+            life_icon_score(
+                image,
+                asteroids::beam::Vec2::new(center_x_ndc, 0.82 - index as f32 * 0.14),
+                icon_scale,
+            )
+        })
+        .collect())
+}
+
+fn life_icon_score(image: &verify::PngImage, center: asteroids::beam::Vec2, scale: f32) -> f32 {
+    let angle = PI * 0.5;
+    let mut score = 0.0;
+    let mut samples = 0;
+    for (start, end) in SHIP_SEGMENTS {
+        let local_start = SHIP_VERTICES[start] * scale;
+        let local_end = SHIP_VERTICES[end] * scale;
+        for sample in [0.25_f32, 0.5, 0.75] {
+            let local = local_start + (local_end - local_start) * sample;
+            let point = frame_ndc_to_pixel(image, center + rotate_vec2(local, angle));
+            score += max_signal_near(image, point, 4);
+            samples += 1;
+        }
+    }
+    score / samples.max(1) as f32
+}
+
+fn frame_ndc_to_pixel(image: &verify::PngImage, point: asteroids::beam::Vec2) -> (f32, f32) {
+    (
+        (point.x * 0.5 + 0.5) * image.width.saturating_sub(1) as f32,
+        (0.5 - point.y * 0.5) * image.height.saturating_sub(1) as f32,
+    )
 }
 
 fn load_frame_metadata(frames: &Path) -> Result<Vec<Value>, String> {

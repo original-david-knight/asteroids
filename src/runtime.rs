@@ -581,7 +581,7 @@ fn sleep_until(deadline: Instant) {
 }
 
 pub fn runtime_usage() -> String {
-    "Usage: asteroids [--headless] [--screenshot <path>] [--capture-frames <N> --frames-out <dir>] [--audio-capture <secs> --wav-out <path>] [--seed <u64>] [--fixed-dt <secs>] [--simulate-secs <secs>] [--scenario <name>] [--xrun-log <path>] [--frame-time-log <path>] [--state-log <path>] [--bloom-intensity <value>] [--bloom-threshold <value>]\n\nScenarios: demo, idle, ship-spinning, horizontal-sweep, static-bright-line, static-bright-line-low-dwell, static-bright-line-high-dwell, gamma-ramp, thrust-1s, ship-spinning-with-thrust, heavy-input, asteroids-round-1, bullet-hit-asteroid, ship-collides-with-asteroid, lose-all-lives, explosion-storm, heartbeat-curve, fire-3, ufo-large, ufo-small".to_string()
+    "Usage: asteroids [--headless] [--screenshot <path>] [--capture-frames <N> --frames-out <dir>] [--audio-capture <secs> --wav-out <path>] [--seed <u64>] [--fixed-dt <secs>] [--simulate-secs <secs>] [--scenario <name>] [--xrun-log <path>] [--frame-time-log <path>] [--state-log <path>] [--bloom-intensity <value>] [--bloom-threshold <value>]\n\nScenarios: demo, idle, ship-spinning, horizontal-sweep, static-bright-line, static-bright-line-low-dwell, static-bright-line-high-dwell, gamma-ramp, thrust-1s, ship-spinning-with-thrust, heavy-input, asteroids-round-1, bullet-hit-asteroid, ship-collides-with-asteroid, lose-all-lives, explosion-storm, heartbeat-curve, fire-3, ufo-large, ufo-small, score-progression, eight-extra-lives".to_string()
 }
 
 fn game_loop_for_scenario(scenario: Scenario, seed: Option<u64>) -> GameLoop {
@@ -597,6 +597,12 @@ fn game_loop_for_scenario(scenario: Scenario, seed: Option<u64>) -> GameLoop {
         }
         Scenario::UfoLarge => GameLoop::from_state(game::GameState::ufo_large_scenario(seed)),
         Scenario::UfoSmall => GameLoop::from_state(game::GameState::ufo_small_scenario(seed)),
+        Scenario::ScoreProgression => {
+            GameLoop::from_state(game::GameState::score_progression_scenario(seed))
+        }
+        Scenario::EightExtraLives => {
+            GameLoop::from_state(game::GameState::eight_extra_lives_scenario(seed))
+        }
         _ => GameLoop::new_seeded(seed),
     }
 }
@@ -628,7 +634,8 @@ fn render_tick(
             .with_bullets(game_loop.interpolated_bullets())
             .with_ufo(game_loop.interpolated_ufo())
             .with_ufo_bullets(game_loop.interpolated_ufo_bullets())
-            .with_game_over(game_loop.current().game_over);
+            .with_game_over(game_loop.current().game_over)
+            .with_readouts(game_loop.current().score, game_loop.current().lives);
         if let Some(ship) = game_loop.interpolated_ship_if_alive() {
             params = params.with_ship(ship);
         }
@@ -659,7 +666,7 @@ fn render_tick(
             dropped_accumulator_seconds,
         )?;
         for event in events {
-            write_state_event(writer, tick_state, config, event.name())?;
+            write_state_event(writer, tick_state, config, &event.state_log_name())?;
         }
     } else {
         drop(events);
@@ -1086,6 +1093,8 @@ mod tests {
             "bullet-hit-asteroid",
             "ship-collides-with-asteroid",
             "lose-all-lives",
+            "score-progression",
+            "eight-extra-lives",
         ] {
             let config = RuntimeConfig::from_args(
                 ["--headless", "--scenario", name]

@@ -14,6 +14,22 @@ pub const PLAYFIELD_MAX: Vec2 = Vec2::new(1.0, 1.0);
 pub const SHIP_MAX_VELOCITY_UNITS_PER_SEC: f32 = 6.0;
 pub const SHIP_THRUST_ACCEL_UNITS_PER_SEC_SQUARED: f32 = 0.05 * 60.0;
 pub const SCORE_PLACEHOLDER: u32 = 0;
+/// Original score constants from the 6502 disassembly:
+/// - Asteroid table `AstPointsTbl` at $7659 is BCD `$10,$05,$02`, documented
+///   as score increases 100, 50, 20.
+/// - Saucer hit code at $6b85/$6b89 loads `SmallScrPnts` `$99` and
+///   `LargeScrPnts` `$20`, documented as 990 and 200 points.
+///
+/// Sources:
+/// https://6502disassembly.com/va-asteroids/Asteroids.html#SymAstPointsTbl
+/// https://6502disassembly.com/va-asteroids/Asteroids.html#SymSaucerHit
+pub const ASTEROID_LARGE_SCORE: u32 = 20;
+pub const ASTEROID_MEDIUM_SCORE: u32 = 50;
+pub const ASTEROID_SMALL_SCORE: u32 = 100;
+pub const UFO_LARGE_SCORE: u32 = 200;
+pub const UFO_SMALL_SCORE: u32 = 990;
+pub const EXTRA_LIFE_SCORE_INTERVAL: u32 = 10_000;
+pub const MAX_DISPLAYED_LIVES: u32 = 6;
 pub const ASTEROIDS_PER_WAVE_BOOTSTRAP: u32 = 2;
 pub const ASTEROIDS_PER_WAVE_INCREMENT: u32 = 2;
 pub const ASTEROIDS_PER_WAVE_MAX: u32 = 11;
@@ -101,6 +117,14 @@ impl AsteroidSize {
             Self::Large => "large",
             Self::Medium => "medium",
             Self::Small => "small",
+        }
+    }
+
+    pub fn score_value(self) -> u32 {
+        match self {
+            Self::Large => ASTEROID_LARGE_SCORE,
+            Self::Medium => ASTEROID_MEDIUM_SCORE,
+            Self::Small => ASTEROID_SMALL_SCORE,
         }
     }
 }
@@ -237,8 +261,8 @@ impl UfoVariant {
 
     pub fn score_value(self) -> u32 {
         match self {
-            Self::Large => 200,
-            Self::Small => 1_000,
+            Self::Large => UFO_LARGE_SCORE,
+            Self::Small => UFO_SMALL_SCORE,
         }
     }
 
@@ -338,6 +362,8 @@ pub enum GameEventKind {
     UfoDestroyed,
     UfoFiredRandom,
     UfoFiredAimed,
+    ScoreIncreased,
+    ExtraLifeAwarded,
     ScoreGte10000,
     ShipDied,
     LivesDecremented,
@@ -360,6 +386,8 @@ impl GameEventKind {
             Self::UfoDestroyed => "ufo-destroyed",
             Self::UfoFiredRandom => "ufo-fired-random",
             Self::UfoFiredAimed => "ufo-fired-aimed",
+            Self::ScoreIncreased => "score-increased",
+            Self::ExtraLifeAwarded => "extra-life-awarded",
             Self::ScoreGte10000 => "score-gte-10000",
             Self::ShipDied => "ship-died",
             Self::LivesDecremented => "lives-decremented",
@@ -374,6 +402,8 @@ pub struct GameEvent {
     pub kind: GameEventKind,
     pub asteroid_size: Option<AsteroidSize>,
     pub ufo_variant: Option<UfoVariant>,
+    pub score_delta: Option<u32>,
+    pub extra_life_threshold: Option<u32>,
 }
 
 impl GameEvent {
@@ -382,6 +412,8 @@ impl GameEvent {
             kind,
             asteroid_size: None,
             ufo_variant: None,
+            score_delta: None,
+            extra_life_threshold: None,
         }
     }
 
@@ -390,6 +422,8 @@ impl GameEvent {
             kind,
             asteroid_size: Some(asteroid_size),
             ufo_variant: None,
+            score_delta: None,
+            extra_life_threshold: None,
         }
     }
 
@@ -398,12 +432,50 @@ impl GameEvent {
             kind,
             asteroid_size: None,
             ufo_variant: Some(ufo_variant),
+            score_delta: None,
+            extra_life_threshold: None,
+        }
+    }
+
+    fn score(delta: u32) -> Self {
+        Self {
+            kind: GameEventKind::ScoreIncreased,
+            asteroid_size: None,
+            ufo_variant: None,
+            score_delta: Some(delta),
+            extra_life_threshold: None,
+        }
+    }
+
+    fn extra_life(threshold: u32) -> Self {
+        Self {
+            kind: GameEventKind::ExtraLifeAwarded,
+            asteroid_size: None,
+            ufo_variant: None,
+            score_delta: None,
+            extra_life_threshold: Some(threshold),
         }
     }
 
     pub fn name(self) -> &'static str {
         self.kind.name()
     }
+
+    pub fn state_log_name(self) -> String {
+        match (self.kind, self.extra_life_threshold) {
+            (GameEventKind::ExtraLifeAwarded, Some(threshold)) => {
+                format!("extra-life-at-{threshold}")
+            }
+            _ => self.name().to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ScriptedScenario {
+    #[default]
+    None,
+    ScoreProgression,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -422,12 +494,15 @@ pub struct GameState {
     next_asteroid_id: u32,
     next_bullet_id: u32,
     next_ufo_id: u32,
+    next_extra_life_score: u32,
     respawn_timer_seconds: f32,
     invulnerability_timer_seconds: f32,
     ufo_spawn_timer_seconds: f32,
     fire_was_down: bool,
     events: Vec<GameEvent>,
     rng: SeededRng,
+    script: ScriptedScenario,
+    script_tick: u32,
 }
 
 impl Default for GameState {
@@ -484,16 +559,31 @@ impl GameState {
 
     pub fn ufo_large_scenario(seed: Option<u64>) -> Self {
         let mut state = Self::empty_seeded(seed);
-        state.score = 0;
+        state.set_score_without_bonus(0);
         state.reset_ufo_spawn_timer();
         state
     }
 
     pub fn ufo_small_scenario(seed: Option<u64>) -> Self {
         let mut state = Self::empty_seeded(seed);
-        state.score = UFO_SMALL_SCORE_THRESHOLD;
+        state.set_score_without_bonus(UFO_SMALL_SCORE_THRESHOLD);
         state.ship.position = Vec2::new(0.18, -0.12);
         state.reset_ufo_spawn_timer();
+        state
+    }
+
+    pub fn score_progression_scenario(seed: Option<u64>) -> Self {
+        let mut state = Self::empty_seeded(seed);
+        state.script = ScriptedScenario::ScoreProgression;
+        state.ufo_spawn_timer_seconds = f32::INFINITY;
+        state
+    }
+
+    pub fn eight_extra_lives_scenario(seed: Option<u64>) -> Self {
+        let mut state = Self::empty_seeded(seed);
+        state.set_score_without_bonus(50_000);
+        state.lives = 8;
+        state.ufo_spawn_timer_seconds = f32::INFINITY;
         state
     }
 
@@ -513,17 +603,21 @@ impl GameState {
             next_asteroid_id: 1,
             next_bullet_id: 1,
             next_ufo_id: 1,
+            next_extra_life_score: EXTRA_LIFE_SCORE_INTERVAL,
             respawn_timer_seconds: 0.0,
             invulnerability_timer_seconds: 0.0,
             ufo_spawn_timer_seconds: ufo_spawn_interval_seconds_for_score(SCORE_PLACEHOLDER),
             fire_was_down: false,
             events: Vec::new(),
             rng: rng_for_seed(seed),
+            script: ScriptedScenario::None,
+            script_tick: 0,
         }
     }
 
     fn step(&mut self, input: &ControlState, dt: f32) {
         self.events.clear();
+        self.update_scripted_scenario();
         self.update_respawn(dt);
         if self.alive {
             self.ship.integrate(input, dt);
@@ -554,6 +648,18 @@ impl GameState {
         self.sync_asteroid_count();
     }
 
+    fn update_scripted_scenario(&mut self) {
+        match self.script {
+            ScriptedScenario::None => {}
+            ScriptedScenario::ScoreProgression => {
+                if matches!(self.script_tick, 0 | 1) {
+                    self.add_score(EXTRA_LIFE_SCORE_INTERVAL);
+                }
+                self.script_tick = self.script_tick.saturating_add(1);
+            }
+        }
+    }
+
     pub fn snapshot(&self) -> GameSnapshot {
         GameSnapshot::with_game_over(self.asteroid_count, self.alive, self.score, self.game_over)
     }
@@ -571,11 +677,18 @@ impl GameState {
     }
 
     pub fn hit_asteroid_by_id(&mut self, id: u32) -> bool {
+        self.hit_asteroid_by_id_with_score(id, true)
+    }
+
+    fn hit_asteroid_by_id_with_score(&mut self, id: u32, award_score: bool) -> bool {
         let Some(index) = self.asteroids.iter().position(|asteroid| asteroid.id == id) else {
             return false;
         };
         let parent = self.asteroids.remove(index);
         self.push_asteroid_event(GameEventKind::BulletHitAsteroid, parent.size);
+        if award_score {
+            self.add_score(parent.size.score_value());
+        }
         if let Some(child_size) = parent.size.next_smaller() {
             for child_index in 0..2 {
                 let velocity = split_child_velocity(parent.velocity, child_index);
@@ -865,7 +978,7 @@ impl GameState {
 
             if let Some(asteroid_id) = hit_asteroid_id {
                 self.ufo_bullets.remove(bullet_index);
-                self.hit_asteroid_by_id(asteroid_id);
+                self.hit_asteroid_by_id_with_score(asteroid_id, false);
             } else {
                 bullet_index += 1;
             }
@@ -942,7 +1055,7 @@ impl GameState {
             })
             .map(|asteroid| asteroid.id);
         if let Some(asteroid_id) = hit_asteroid_id {
-            self.hit_asteroid_by_id(asteroid_id);
+            self.hit_asteroid_by_id_with_score(asteroid_id, false);
             self.clear_ufo(GameEventKind::UfoDestroyed, false);
         }
     }
@@ -952,7 +1065,7 @@ impl GameState {
             return;
         };
         if award_score {
-            self.score = self.score.saturating_add(ufo.variant.score_value());
+            self.add_score(ufo.variant.score_value());
         }
         self.push_ufo_event(kind, ufo.variant);
         self.push_ufo_event(GameEventKind::UfoSirenOff, ufo.variant);
@@ -961,6 +1074,31 @@ impl GameState {
 
     fn reset_ufo_spawn_timer(&mut self) {
         self.ufo_spawn_timer_seconds = ufo_spawn_interval_seconds_for_score(self.score);
+    }
+
+    fn set_score_without_bonus(&mut self, score: u32) {
+        self.score = score;
+        self.next_extra_life_score = next_extra_life_score_after(score);
+    }
+
+    fn add_score(&mut self, delta: u32) {
+        if delta == 0 {
+            return;
+        }
+        self.score = self.score.saturating_add(delta);
+        self.events.push(GameEvent::score(delta));
+
+        let mut threshold = self.next_extra_life_score;
+        while threshold <= self.score {
+            self.lives = self.lives.saturating_add(1);
+            self.events.push(GameEvent::extra_life(threshold));
+            let Some(next_threshold) = threshold.checked_add(EXTRA_LIFE_SCORE_INTERVAL) else {
+                threshold = u32::MAX;
+                break;
+            };
+            threshold = next_threshold;
+        }
+        self.next_extra_life_score = threshold;
     }
 
     fn kill_ship(&mut self) {
@@ -1082,6 +1220,17 @@ pub fn ufo_spawn_reload_ticks_for_score(score: u32) -> u32 {
 
 pub fn ufo_spawn_interval_seconds_for_score(score: u32) -> f32 {
     ufo_spawn_reload_ticks_for_score(score) as f32 * UFO_ORIGINAL_TIMER_TICK_SECONDS
+}
+
+pub fn displayed_lives(lives: u32) -> u32 {
+    lives.min(MAX_DISPLAYED_LIVES)
+}
+
+fn next_extra_life_score_after(score: u32) -> u32 {
+    let completed_intervals = score / EXTRA_LIFE_SCORE_INTERVAL;
+    completed_intervals
+        .saturating_add(1)
+        .saturating_mul(EXTRA_LIFE_SCORE_INTERVAL)
 }
 
 fn ufo_shot_interval_seconds() -> f32 {
@@ -1715,6 +1864,79 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn asteroid_kill_scores_match_disassembly_table() {
+        for (size, expected_score) in [
+            (AsteroidSize::Large, ASTEROID_LARGE_SCORE),
+            (AsteroidSize::Medium, ASTEROID_MEDIUM_SCORE),
+            (AsteroidSize::Small, ASTEROID_SMALL_SCORE),
+        ] {
+            let mut state = state_with_one_asteroid(size);
+
+            assert!(state.hit_asteroid_by_id(1));
+
+            assert_eq!(state.score, expected_score);
+            assert!(state.events().iter().any(|event| {
+                event.kind == GameEventKind::ScoreIncreased
+                    && event.score_delta == Some(expected_score)
+            }));
+        }
+    }
+
+    #[test]
+    fn ufo_kill_scores_match_disassembly_constants() {
+        for (variant, expected_score) in [
+            (UfoVariant::Large, UFO_LARGE_SCORE),
+            (UfoVariant::Small, UFO_SMALL_SCORE),
+        ] {
+            let mut state = empty_test_state();
+            state.ufo = Some(Ufo::new(
+                1,
+                variant,
+                Vec2::new(0.4, 0.0),
+                Vec2::new(-0.1, 0.0),
+            ));
+
+            state.clear_ufo(GameEventKind::UfoDestroyed, true);
+
+            assert_eq!(state.score, expected_score);
+            assert!(state.events().iter().any(|event| {
+                event.kind == GameEventKind::ScoreIncreased
+                    && event.score_delta == Some(expected_score)
+            }));
+        }
+    }
+
+    #[test]
+    fn extra_life_awards_once_per_ten_thousand_point_threshold() {
+        let mut state = empty_test_state();
+
+        state.add_score(EXTRA_LIFE_SCORE_INTERVAL - 10);
+        assert_eq!(state.lives, INITIAL_LIVES);
+
+        state.add_score(10);
+        assert_eq!(state.lives, INITIAL_LIVES + 1);
+        assert!(state.events().iter().any(|event| {
+            event.kind == GameEventKind::ExtraLifeAwarded
+                && event.extra_life_threshold == Some(10_000)
+        }));
+
+        state.events.clear();
+        state.add_score(EXTRA_LIFE_SCORE_INTERVAL);
+        assert_eq!(state.lives, INITIAL_LIVES + 2);
+        assert!(state.events().iter().any(|event| {
+            event.kind == GameEventKind::ExtraLifeAwarded
+                && event.extra_life_threshold == Some(20_000)
+        }));
+    }
+
+    #[test]
+    fn lives_display_count_clamps_to_design_maximum() {
+        assert_eq!(displayed_lives(0), 0);
+        assert_eq!(displayed_lives(INITIAL_LIVES), INITIAL_LIVES);
+        assert_eq!(displayed_lives(8), MAX_DISPLAYED_LIVES);
     }
 
     #[test]

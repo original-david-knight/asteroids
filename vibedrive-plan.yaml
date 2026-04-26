@@ -663,7 +663,7 @@ tasks:
         Lives display: max 6 lives shown onscreen even if more are earned (per DESIGN.md Game Constants). Lives drawn as miniature beam-rendered ship outlines reusing the ship outline from spinning-ship.
         Score display: beam-rendered numerical readout in the playfield or bezel margin (depending on aspect-ratio-decision).
         Add unit tests for: scoring totals on each kill type, extra-life threshold (one bonus at 10k, second at 20k, etc), and max-6 lives display cap (8 earned shows 6).
-      status: todo
+      status: done
       workflow: implement
       deps:
         - ufo-ai

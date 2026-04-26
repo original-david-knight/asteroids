@@ -444,7 +444,8 @@ impl ApplicationHandler for AsteroidsApp {
                         .with_bullets(self.game.interpolated_bullets())
                         .with_ufo(self.game.interpolated_ufo())
                         .with_ufo_bullets(self.game.interpolated_ufo_bullets())
-                        .with_game_over(self.game.current().game_over);
+                        .with_game_over(self.game.current().game_over)
+                        .with_readouts(self.game.current().score, self.game.current().lives);
                 if let Some(ship) = self.game.interpolated_ship_if_alive() {
                     params = params.with_ship(ship);
                 }

@@ -11,7 +11,10 @@ use winit::{dpi::PhysicalSize, window::Window};
 
 use crate::{
     beam::{self, BeamCommand, BeamEmitter, BeamVertex, Vec2},
-    game::{ASTEROID_HULL_VERTEX_COUNT, RenderAsteroid, RenderBullet, RenderShip, RenderUfo},
+    game::{
+        ASTEROID_HULL_VERTEX_COUNT, INITIAL_LIVES, RenderAsteroid, RenderBullet, RenderShip,
+        RenderUfo, displayed_lives,
+    },
     tuning,
 };
 
@@ -38,6 +41,8 @@ pub enum Scenario {
     Fire3,
     UfoLarge,
     UfoSmall,
+    ScoreProgression,
+    EightExtraLives,
 }
 
 impl Scenario {
@@ -63,6 +68,8 @@ impl Scenario {
             "fire-3" => Some(Self::Fire3),
             "ufo-large" => Some(Self::UfoLarge),
             "ufo-small" => Some(Self::UfoSmall),
+            "score-progression" => Some(Self::ScoreProgression),
+            "eight-extra-lives" => Some(Self::EightExtraLives),
             _ => None,
         }
     }
@@ -89,6 +96,8 @@ impl Scenario {
             Self::Fire3 => "fire-3",
             Self::UfoLarge => "ufo-large",
             Self::UfoSmall => "ufo-small",
+            Self::ScoreProgression => "score-progression",
+            Self::EightExtraLives => "eight-extra-lives",
         }
     }
 
@@ -102,6 +111,8 @@ impl Scenario {
                 | Self::LoseAllLives
                 | Self::UfoLarge
                 | Self::UfoSmall
+                | Self::ScoreProgression
+                | Self::EightExtraLives
         )
     }
 
@@ -128,6 +139,8 @@ pub struct FrameParams {
     pub ufo: Option<RenderUfo>,
     pub ufo_bullets: Vec<RenderBullet>,
     pub game_over: bool,
+    pub score: u32,
+    pub lives: u32,
 }
 
 impl FrameParams {
@@ -142,6 +155,8 @@ impl FrameParams {
             ufo: None,
             ufo_bullets: Vec::new(),
             game_over: false,
+            score: 0,
+            lives: INITIAL_LIVES,
         }
     }
 
@@ -172,6 +187,12 @@ impl FrameParams {
 
     pub fn with_game_over(mut self, game_over: bool) -> Self {
         self.game_over = game_over;
+        self
+    }
+
+    pub fn with_readouts(mut self, score: u32, lives: u32) -> Self {
+        self.score = score;
+        self.lives = lives;
         self
     }
 }
@@ -929,7 +950,7 @@ fn emit_frame_beams(
     frame_emitter.clear();
     gameplay_emitter.clear();
 
-    emit_bezel_readouts(frame_emitter, playfield, size);
+    emit_bezel_readouts(frame_emitter, playfield, size, params.score, params.lives);
     if let Some(ship) = params.ship {
         emit_gameplay_objects(gameplay_emitter, params);
         emit_ship_outline(gameplay_emitter, ship.position, ship.angle, ship.scale, 1.0);
@@ -975,16 +996,23 @@ fn emit_bezel_readouts(
     emitter: &mut BeamEmitter,
     playfield: PlayfieldRect,
     size: PhysicalSize<u32>,
+    score: u32,
+    lives: u32,
 ) {
     if let Some(left) = playfield.left_margin() {
-        emit_score_readout(emitter, left, size);
+        emit_score_readout(emitter, left, size, score);
     }
     if let Some(right) = playfield.right_margin() {
-        emit_lives_readout(emitter, right);
+        emit_lives_readout(emitter, right, lives);
     }
 }
 
-fn emit_score_readout(emitter: &mut BeamEmitter, margin: NdcRect, size: PhysicalSize<u32>) {
+fn emit_score_readout(
+    emitter: &mut BeamEmitter,
+    margin: NdcRect,
+    size: PhysicalSize<u32>,
+    score: u32,
+) {
     let aspect_correction = size.height.max(1) as f32 / size.width.max(1) as f32;
     let natural_digit_height = 0.082;
     let natural_digit_width = natural_digit_height * 0.56 * aspect_correction;
@@ -998,11 +1026,12 @@ fn emit_score_readout(emitter: &mut BeamEmitter, margin: NdcRect, size: Physical
     let total_width = digit_width * digits + gap * gaps;
     let start_x = margin.center_x() - total_width * 0.5;
     let bottom_y = 0.72;
+    let score_digits = score_digits(score);
 
-    for index in 0..6 {
+    for (index, digit) in score_digits.iter().copied().enumerate() {
         emit_seven_segment_digit(
             emitter,
-            0,
+            digit,
             Vec2::new(start_x + index as f32 * (digit_width + gap), bottom_y),
             Vec2::new(digit_width, digit_height),
             BEZEL_READOUT_INTENSITY,
@@ -1010,10 +1039,12 @@ fn emit_score_readout(emitter: &mut BeamEmitter, margin: NdcRect, size: Physical
     }
 }
 
-fn emit_lives_readout(emitter: &mut BeamEmitter, margin: NdcRect) {
+fn emit_lives_readout(emitter: &mut BeamEmitter, margin: NdcRect, lives: u32) {
     let icon_scale = (margin.width() * 0.62 / 0.44).clamp(0.055, 0.16);
     let x = margin.center_x();
-    for y in [0.80, 0.66, 0.52] {
+    let icon_count = displayed_lives(lives);
+    for index in 0..icon_count {
+        let y = 0.82 - index as f32 * 0.14;
         emit_ship_outline(
             emitter,
             Vec2::new(x, y),
@@ -1022,6 +1053,16 @@ fn emit_lives_readout(emitter: &mut BeamEmitter, margin: NdcRect) {
             BEZEL_READOUT_INTENSITY,
         );
     }
+}
+
+fn score_digits(score: u32) -> [u8; 6] {
+    let mut remaining = score % 1_000_000;
+    let mut digits = [0; 6];
+    for digit in digits.iter_mut().rev() {
+        *digit = (remaining % 10) as u8;
+        remaining /= 10;
+    }
+    digits
 }
 
 fn emit_seven_segment_digit(
@@ -1110,7 +1151,9 @@ fn emit_scenario_beams(emitter: &mut BeamEmitter, scenario: Scenario, time_s: f3
         | Scenario::HeartbeatCurve
         | Scenario::Fire3
         | Scenario::UfoLarge
-        | Scenario::UfoSmall => emit_idle_beams(emitter),
+        | Scenario::UfoSmall
+        | Scenario::ScoreProgression
+        | Scenario::EightExtraLives => emit_idle_beams(emitter),
     }
 }
 
@@ -3035,5 +3078,12 @@ mod tests {
         assert_eq!(rect.map_point(Vec2::new(-1.0, -1.0)), rect.min);
         assert_eq!(rect.map_point(Vec2::new(1.0, 1.0)), rect.max);
         assert_eq!(rect.map_point(Vec2::ZERO), Vec2::ZERO);
+    }
+
+    #[test]
+    fn score_digits_emit_six_digit_beam_readout_values() {
+        assert_eq!(score_digits(0), [0, 0, 0, 0, 0, 0]);
+        assert_eq!(score_digits(20_990), [0, 2, 0, 9, 9, 0]);
+        assert_eq!(score_digits(1_234_567), [2, 3, 4, 5, 6, 7]);
     }
 }
