@@ -1,1 +1,1 @@
-cargo run --release starts the Rgba16Float phosphor renderer at tau=70ms, and a moving 18/30/80us dwell verification trio was added. Subjective confirmation is blocked because the Wayland session is locked and screenshots show the lock screen, so Open Question 3 is not fully closed.
+Verified horizontal-sweep tau=69.681ms r_squared=0.999963 with peak=1.098386; dwell 10us vs 60us widened interpolated FWHM 2.160px to 2.723px (ratio=1.261), peaks 0.257403/1.768392. Review follow-up recorded tuning audit trail and added FWHM/frame-name tests; default tau remains 70.0ms.

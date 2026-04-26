@@ -179,6 +179,7 @@ pub async fn run_automated(config: &RuntimeConfig) -> Result<(), String> {
     if let (Some(frame_count), Some(frames_out)) = (config.capture_frames, &config.frames_out) {
         fs::create_dir_all(frames_out)
             .map_err(|error| format!("failed to create {}: {error}", frames_out.display()))?;
+        let frame_digits = capture_frame_digits(frame_count);
         for frame_index in 0..frame_count {
             render_tick(
                 &mut renderer,
@@ -189,7 +190,7 @@ pub async fn run_automated(config: &RuntimeConfig) -> Result<(), String> {
                 state_log.as_mut(),
             )?;
             let rgba = renderer.capture_rgba8()?;
-            let path = frames_out.join(format!("frame_{frame_index:05}.png"));
+            let path = frames_out.join(format!("frame_{frame_index:0frame_digits$}.png"));
             verify::save_png(&path, renderer.size().width, renderer.size().height, &rgba)?;
         }
     }
@@ -346,6 +347,10 @@ fn frames_for_duration(duration_secs: f64, fixed_dt: f32) -> usize {
     (duration_secs / f64::from(fixed_dt)).ceil() as usize
 }
 
+fn capture_frame_digits(frame_count: usize) -> usize {
+    frame_count.saturating_sub(1).to_string().len().max(2)
+}
+
 fn headless_render_size() -> PhysicalSize<u32> {
     env::var("ASTEROIDS_HEADLESS_SIZE")
         .ok()
@@ -421,5 +426,19 @@ mod tests {
         assert_eq!(config.fixed_dt, Some(0.00694));
         assert_eq!(config.scenario, Scenario::Idle);
         assert!(!config.should_run_interactive());
+    }
+
+    #[test]
+    fn capture_frame_digits_preserves_checkpoint_frame_name() {
+        let width = capture_frame_digits(60);
+        assert_eq!(width, 2);
+        assert_eq!(format!("frame_{:0width$}.png", 0), "frame_00.png");
+    }
+
+    #[test]
+    fn capture_frame_digits_expands_when_hundreds_are_present() {
+        let width = capture_frame_digits(101);
+        assert_eq!(width, 3);
+        assert_eq!(format!("frame_{:0width$}.png", 100), "frame_100.png");
     }
 }

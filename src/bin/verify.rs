@@ -420,14 +420,73 @@ fn brightest_pixel(image: &verify::PngImage) -> (u32, u32, f32) {
 
 fn estimated_fwhm_width(image: &verify::PngImage) -> f32 {
     let best = brightest_pixel(image);
-    let threshold = best.2 * 0.5;
-    let row_width = (0..image.width)
-        .filter(|x| image.luminance(*x, best.1) >= threshold)
-        .count() as f32;
-    let col_width = (0..image.height)
-        .filter(|y| image.luminance(best.0, *y) >= threshold)
-        .count() as f32;
-    row_width.max(col_width)
+    let row_values = (0..image.width)
+        .map(|x| image.luminance(x, best.1))
+        .collect::<Vec<_>>();
+    let col_values = (0..image.height)
+        .map(|y| image.luminance(best.0, y))
+        .collect::<Vec<_>>();
+    let row_width = fwhm_width_1d(&row_values, best.0 as usize);
+    let col_width = fwhm_width_1d(&col_values, best.1 as usize);
+    if row_width <= 0.0 {
+        col_width
+    } else if col_width <= 0.0 {
+        row_width
+    } else {
+        row_width.min(col_width)
+    }
+}
+
+fn fwhm_width_1d(values: &[f32], peak_index: usize) -> f32 {
+    if values.is_empty() || peak_index >= values.len() {
+        return 0.0;
+    }
+    let peak = values[peak_index];
+    if peak <= 0.0 {
+        return 0.0;
+    }
+    let threshold = peak * 0.5;
+
+    let mut left_index = peak_index;
+    while left_index > 0 && values[left_index] >= threshold {
+        left_index -= 1;
+    }
+    let left = if values[left_index] >= threshold {
+        0.0
+    } else {
+        half_crossing(
+            values[left_index],
+            values[left_index + 1],
+            threshold,
+            left_index,
+        )
+    };
+
+    let mut right_index = peak_index;
+    while right_index + 1 < values.len() && values[right_index + 1] >= threshold {
+        right_index += 1;
+    }
+    let right = if right_index + 1 == values.len() {
+        (values.len() - 1) as f32
+    } else {
+        half_crossing(
+            values[right_index],
+            values[right_index + 1],
+            threshold,
+            right_index,
+        )
+    };
+
+    (right - left).max(0.0)
+}
+
+fn half_crossing(a: f32, b: f32, threshold: f32, left_index: usize) -> f32 {
+    let denom = b - a;
+    if denom.abs() <= f32::EPSILON {
+        left_index as f32
+    } else {
+        left_index as f32 + ((threshold - a) / denom).clamp(0.0, 1.0)
+    }
 }
 
 fn general_help() -> String {
@@ -518,5 +577,31 @@ impl CliArgs {
         } else {
             Err(format!("unexpected arguments: {}", self.args.join(" ")))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fwhm_width_1d;
+
+    #[test]
+    fn fwhm_width_1d_interpolates_narrow_peak() {
+        let values = [0.0, 0.25, 1.0, 0.25, 0.0];
+        let width = fwhm_width_1d(&values, 2);
+        assert!((width - 4.0 / 3.0).abs() < 0.0001, "width={width}");
+    }
+
+    #[test]
+    fn fwhm_width_1d_handles_peak_at_left_edge() {
+        let values = [1.0, 0.25, 0.0];
+        let width = fwhm_width_1d(&values, 0);
+        assert!((width - 2.0 / 3.0).abs() < 0.0001, "width={width}");
+    }
+
+    #[test]
+    fn fwhm_width_1d_handles_peak_at_right_edge() {
+        let values = [0.0, 0.25, 1.0];
+        let width = fwhm_width_1d(&values, 2);
+        assert!((width - 2.0 / 3.0).abs() < 0.0001, "width={width}");
     }
 }

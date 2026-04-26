@@ -632,12 +632,7 @@ fn emit_horizontal_sweep_beams(emitter: &mut BeamEmitter, time_s: f32) {
 }
 
 fn emit_static_bright_line(emitter: &mut BeamEmitter, dwell_us: f32) {
-    emitter.emit_segment_with_endpoint_bonus(
-        Vec2::new(-0.55, 0.0),
-        Vec2::new(0.55, 0.0),
-        1.0,
-        dwell_us,
-    );
+    emitter.emit_segment(Vec2::new(-0.55, 0.0), Vec2::new(0.55, 0.0), 1.0, dwell_us);
 }
 
 fn emit_gamma_ramp_beams(emitter: &mut BeamEmitter) {

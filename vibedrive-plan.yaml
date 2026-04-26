@@ -210,7 +210,7 @@ tasks:
         Use the instrumentation harness scenario horizontal-sweep (a single bright beam segment moving across the screen at a known speed) with --seed 1 --fixed-dt 0.00694 --capture-frames 60. For pixels along the trailing path behind the beam head, fit exp(-t/tau) to the per-pixel luminance timeline using verify decay-fit. Tau must land in [50ms, 100ms] with r_squared >= 0.95.
         Verify dwell coupling separately - capture two stills of static high-dwell vs low-dwell lines (extend --scenario static-bright-line with --dwell-us flag, or add scenarios static-bright-line-low-dwell at 10us and static-bright-line-high-dwell at 60us) and confirm peak-luminance and full-width-half-max ratios match the dwell-coupling model.
         If any check fails (curve is not exponential, tau outside range, peak luminance clipping at MAX_LUMA, dwell coupling missing), do not press on - reopen phosphor-accumulator with the failure measurement recorded in notes and the explicit loop-back target named.
-      status: todo
+      status: done
       workflow: checkpoint
       deps:
         - phosphor-accumulator
