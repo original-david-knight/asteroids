@@ -3,4 +3,13 @@ pub const ASTEROID_HULL_SEGMENT_DWELL_US: f32 = 25.0;
 pub const BULLET_DOT_DWELL_US: f32 = 40.0;
 pub const ENDPOINT_DWELL_BONUS_US: f32 = 10.0;
 
-pub const BEAM_QUAD_HALF_WIDTH_NDC: f32 = 0.004;
+pub const BEAM_QUAD_HALF_WIDTH_PIXELS: f32 = 6.0;
+pub const BEAM_SIGMA_PIXELS: f32 = 1.0;
+pub const BEAM_SIGMA_DWELL_GROWTH: f32 = 0.22;
+
+pub const PHOSPHOR_TAU_DEFAULT_MS: f32 = 70.0;
+pub const PHOSPHOR_TAU_MIN_MS: f32 = 50.0;
+pub const PHOSPHOR_TAU_MAX_MS: f32 = 100.0;
+pub const PHOSPHOR_TAU_STEP_MS: f32 = 5.0;
+pub const PHOSPHOR_MAX_LUMA: f32 = 8.0;
+pub const PHOSPHOR_FALLBACK_MAX_LUMA: f32 = 1.0;

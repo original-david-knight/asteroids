@@ -138,7 +138,7 @@ tasks:
         Default tau = 70ms. Expose tau as a debug F-key slider so it can be tuned with the renderer running (also covers DESIGN.md Open Question 3 about persistence-of-vision target).
         With hard white lines and beam-driven dwell coupling, the trail effect must be visible at this step.
         If Rgba16Float was not supported per the probe, fall back to Rgba8Unorm with reduced MAX_LUMA and document the loss in notes.
-      status: todo
+      status: done
       workflow: implement
       deps:
         - beam-emit-api

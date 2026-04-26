@@ -85,13 +85,15 @@ impl ApplicationHandler for AsteroidsApp {
         match pollster::block_on(Renderer::new(Arc::clone(&window), target_size)) {
             Ok(renderer) => {
                 println!(
-                    "display: {}; surface={}x{}, scale={:.3}, format={:?}, present_mode={:?}",
+                    "display: {}; surface={}x{}, scale={:.3}, format={:?}, present_mode={:?}, phosphor={:?}, tau={:.0}ms",
                     renderer::display_server_note(),
                     renderer.size().width,
                     renderer.size().height,
                     window.scale_factor(),
                     renderer.surface_format(),
                     renderer.present_mode(),
+                    renderer.phosphor_format(),
+                    renderer.phosphor_tau_ms(),
                 );
                 println!(
                     "audio scaffold: {} voices, channel capacity {} messages, cpal stream not spawned",
@@ -129,6 +131,48 @@ impl ApplicationHandler for AsteroidsApp {
                     },
                 ..
             } => event_loop.exit(),
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::F1),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    let tau = renderer.reset_phosphor_tau_ms();
+                    println!("debug phosphor tau reset: {tau:.0}ms");
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::F2),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    let tau = renderer.adjust_phosphor_tau_ms(-tuning::PHOSPHOR_TAU_STEP_MS);
+                    println!("debug phosphor tau: {tau:.0}ms");
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::F3),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    let tau = renderer.adjust_phosphor_tau_ms(tuning::PHOSPHOR_TAU_STEP_MS);
+                    println!("debug phosphor tau: {tau:.0}ms");
+                }
+            }
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize_for_window(window);

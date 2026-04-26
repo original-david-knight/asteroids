@@ -1,5 +1,6 @@
-use std::{env, sync::Arc};
+use std::{env, sync::Arc, time::Instant};
 
+use bytemuck::{Pod, Zeroable};
 use wgpu::CurrentSurfaceTexture;
 use winit::{dpi::PhysicalSize, window::Window};
 
@@ -16,7 +17,14 @@ pub struct Renderer {
     size: PhysicalSize<u32>,
     fullscreen_size: Option<PhysicalSize<u32>>,
     beam_pipeline: BeamLinePipeline,
+    phosphor_blend_pipeline: PhosphorBlendPipeline,
+    composite_pipeline: CompositePipeline,
+    phosphor: PhosphorTargets,
+    phosphor_bind_groups: PhosphorBindGroups,
     beam_emitter: BeamEmitter,
+    phosphor_tau_ms: f32,
+    last_frame: Instant,
+    demo_start: Instant,
 }
 
 impl Renderer {
@@ -74,7 +82,25 @@ impl Renderer {
             view_formats: vec![],
         };
         surface.configure(&device, &config);
-        let beam_pipeline = BeamLinePipeline::new(&device, format);
+
+        let phosphor_config = choose_phosphor_format(&adapter);
+        if phosphor_config.fallback {
+            eprintln!(
+                "phosphor accumulator: Rgba16Float unavailable; using {:?} with max_luma={:.1}",
+                phosphor_config.format, phosphor_config.max_luma
+            );
+        }
+
+        let beam_pipeline = BeamLinePipeline::new(&device, phosphor_config.format);
+        let phosphor_blend_pipeline = PhosphorBlendPipeline::new(&device, phosphor_config.format);
+        let composite_pipeline = CompositePipeline::new(&device, format, phosphor_config.format);
+        let phosphor = PhosphorTargets::new(&device, size, phosphor_config);
+        let phosphor_bind_groups = PhosphorBindGroups::new(
+            &device,
+            &phosphor,
+            &phosphor_blend_pipeline,
+            &composite_pipeline,
+        );
 
         Ok(Self {
             surface,
@@ -84,7 +110,14 @@ impl Renderer {
             size,
             fullscreen_size,
             beam_pipeline,
+            phosphor_blend_pipeline,
+            composite_pipeline,
+            phosphor,
+            phosphor_bind_groups,
             beam_emitter: BeamEmitter::new(),
+            phosphor_tau_ms: tuning::PHOSPHOR_TAU_DEFAULT_MS,
+            last_frame: Instant::now(),
+            demo_start: Instant::now(),
         })
     }
 
@@ -98,16 +131,37 @@ impl Renderer {
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
+        self.phosphor = PhosphorTargets::new(&self.device, size, self.phosphor.config);
+        self.phosphor_bind_groups = PhosphorBindGroups::new(
+            &self.device,
+            &self.phosphor,
+            &self.phosphor_blend_pipeline,
+            &self.composite_pipeline,
+        );
+        self.last_frame = Instant::now();
     }
 
     pub fn render(&mut self) -> Result<(), String> {
+        let frame_dt_seconds = self.frame_dt_seconds();
+
         self.beam_emitter.clear();
-        emit_demo_beams(&mut self.beam_emitter);
+        emit_demo_beams(
+            &mut self.beam_emitter,
+            self.demo_start.elapsed().as_secs_f32(),
+        );
         self.beam_pipeline.upload(
             &self.device,
             &self.queue,
             self.beam_emitter.commands(),
-            tuning::BEAM_QUAD_HALF_WIDTH_NDC,
+            beam_quad_half_width_ndc(self.size),
+            self.size,
+            self.phosphor.max_luma(),
+        );
+        self.phosphor_blend_pipeline.update_uniforms(
+            &self.queue,
+            frame_dt_seconds,
+            self.phosphor_tau_ms * 0.001,
+            self.phosphor.max_luma(),
         );
 
         let frame = match self.surface.get_current_texture() {
@@ -124,20 +178,27 @@ impl Renderer {
             }
         };
 
-        let view = frame
+        let surface_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Asteroids Clear Encoder"),
+                label: Some("Asteroids Phosphor Encoder"),
             });
+
+        if self.phosphor.needs_clear() {
+            self.phosphor.encode_clear(&mut encoder);
+            self.phosphor.mark_clear();
+        }
+
+        let target_index = self.phosphor.target_index();
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Asteroids Beam Pass"),
+                label: Some("Asteroids Beam SDF Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: self.phosphor.view(target_index),
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -153,9 +214,66 @@ impl Renderer {
             self.beam_pipeline.draw(&mut pass);
         }
 
+        self.phosphor
+            .copy_target_to_beam_scratch(&mut encoder, target_index);
+
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Asteroids Phosphor Decay Blend Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: self.phosphor.view(target_index),
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.phosphor_blend_pipeline
+                .draw(&mut pass, self.phosphor_bind_groups.blend(target_index));
+        }
+
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Asteroids Composite Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &surface_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.composite_pipeline
+                .draw(&mut pass, self.phosphor_bind_groups.composite(target_index));
+        }
+
         self.queue.submit([encoder.finish()]);
         frame.present();
+        self.phosphor.advance();
         Ok(())
+    }
+
+    pub fn adjust_phosphor_tau_ms(&mut self, delta_ms: f32) -> f32 {
+        self.phosphor_tau_ms = (self.phosphor_tau_ms + delta_ms)
+            .clamp(tuning::PHOSPHOR_TAU_MIN_MS, tuning::PHOSPHOR_TAU_MAX_MS);
+        self.phosphor_tau_ms
+    }
+
+    pub fn reset_phosphor_tau_ms(&mut self) -> f32 {
+        self.phosphor_tau_ms = tuning::PHOSPHOR_TAU_DEFAULT_MS;
+        self.phosphor_tau_ms
     }
 
     pub fn size(&self) -> PhysicalSize<u32> {
@@ -166,29 +284,59 @@ impl Renderer {
         self.config.format
     }
 
+    pub fn phosphor_format(&self) -> wgpu::TextureFormat {
+        self.phosphor.format()
+    }
+
+    pub fn phosphor_tau_ms(&self) -> f32 {
+        self.phosphor_tau_ms
+    }
+
     pub fn present_mode(&self) -> wgpu::PresentMode {
         self.config.present_mode
     }
+
+    fn frame_dt_seconds(&mut self) -> f32 {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_frame).as_secs_f32();
+        self.last_frame = now;
+
+        if dt.is_finite() {
+            dt.clamp(1.0 / 1000.0, 0.1)
+        } else {
+            1.0 / 144.0
+        }
+    }
 }
 
-fn emit_demo_beams(emitter: &mut BeamEmitter) {
+fn emit_demo_beams(emitter: &mut BeamEmitter, time_s: f32) {
+    let center = Vec2::ZERO + Vec2::new((time_s * 0.47).sin() * 0.24, (time_s * 0.31).cos() * 0.16);
+    let angle = time_s * 1.65;
+    let (angle_sin, angle_cos) = angle.sin_cos();
+    let nose_direction = Vec2::new(angle_cos, angle_sin);
+    let side_direction = nose_direction.left_perp();
+
+    let nose = center + nose_direction * 0.44;
+    let left = center - nose_direction * 0.30 + side_direction * 0.22;
+    let right = center - nose_direction * 0.30 - side_direction * 0.22;
+    let notch = center - nose_direction * 0.12;
+
     emitter
         .emit(
-            BeamCommand::builder(Vec2::new(-0.82, -0.82), Vec2::new(0.82, 0.82))
+            BeamCommand::builder(nose, left)
                 .intensity(1.0)
                 .dwell_us(tuning::SHIP_OUTLINE_SEGMENT_DWELL_US)
                 .endpoint_dwell_bonus()
                 .build(),
         )
-        .emit_segment_with_endpoint_bonus(
-            Vec2::new(-0.82, 0.82),
-            Vec2::new(0.82, -0.82),
-            1.0,
-            tuning::SHIP_OUTLINE_SEGMENT_DWELL_US,
-        )
-        .emit_ship_outline_segment(Vec2::new(-0.35, 0.36), Vec2::new(0.35, 0.36), 0.75)
-        .emit_asteroid_hull_segment(Vec2::new(-0.58, 0.0), Vec2::new(0.58, 0.0), 0.9)
-        .emit_bullet_dot(Vec2::ZERO, 0.018, 1.0);
+        .emit_ship_outline_segment(left, notch, 1.0)
+        .emit_segment_with_endpoint_bonus(notch, right, 1.0, tuning::SHIP_OUTLINE_SEGMENT_DWELL_US)
+        .emit_segment_with_endpoint_bonus(right, nose, 1.0, tuning::SHIP_OUTLINE_SEGMENT_DWELL_US);
+
+    let sweep_x = (time_s * 0.73).sin() * 0.78;
+    emitter
+        .emit_bullet_dot(Vec2::new(sweep_x, -0.54), 0.018, 1.0)
+        .emit_asteroid_hull_segment(Vec2::new(-0.86, 0.62), Vec2::new(-0.58, 0.70), 0.45);
 }
 
 pub fn target_surface_size(
@@ -226,17 +374,304 @@ pub fn display_server_note() -> String {
 fn choose_surface_format(formats: &[wgpu::TextureFormat]) -> Option<wgpu::TextureFormat> {
     [
         wgpu::TextureFormat::Rgba16Float,
-        wgpu::TextureFormat::Bgra8UnormSrgb,
-        wgpu::TextureFormat::Rgba8UnormSrgb,
         wgpu::TextureFormat::Bgra8Unorm,
         wgpu::TextureFormat::Rgba8Unorm,
+        wgpu::TextureFormat::Bgra8UnormSrgb,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
     ]
     .into_iter()
     .find(|format| formats.contains(format))
 }
 
+fn choose_phosphor_format(adapter: &wgpu::Adapter) -> PhosphorFormatConfig {
+    let required_usages = wgpu::TextureUsages::RENDER_ATTACHMENT
+        | wgpu::TextureUsages::TEXTURE_BINDING
+        | wgpu::TextureUsages::COPY_SRC
+        | wgpu::TextureUsages::COPY_DST;
+    let rgba16_features = adapter.get_texture_format_features(wgpu::TextureFormat::Rgba16Float);
+    if rgba16_features.allowed_usages.contains(required_usages) {
+        PhosphorFormatConfig {
+            format: wgpu::TextureFormat::Rgba16Float,
+            max_luma: tuning::PHOSPHOR_MAX_LUMA,
+            fallback: false,
+        }
+    } else {
+        PhosphorFormatConfig {
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            max_luma: tuning::PHOSPHOR_FALLBACK_MAX_LUMA,
+            fallback: true,
+        }
+    }
+}
+
+fn beam_quad_half_width_ndc(size: PhysicalSize<u32>) -> f32 {
+    let min_axis = size.width.min(size.height).max(1) as f32;
+    tuning::BEAM_QUAD_HALF_WIDTH_PIXELS * 2.0 / min_axis
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct BeamUniforms {
+    target_size_sigma_dwell: [f32; 4],
+    growth_max_luma_pad: [f32; 4],
+}
+
+impl BeamUniforms {
+    fn new(size: PhysicalSize<u32>, max_luma: f32) -> Self {
+        Self {
+            target_size_sigma_dwell: [
+                size.width.max(1) as f32,
+                size.height.max(1) as f32,
+                tuning::BEAM_SIGMA_PIXELS,
+                tuning::SHIP_OUTLINE_SEGMENT_DWELL_US,
+            ],
+            growth_max_luma_pad: [tuning::BEAM_SIGMA_DWELL_GROWTH, max_luma, 0.0, 0.0],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct PhosphorBlendUniforms {
+    frame_dt_tau_max_luma: [f32; 4],
+}
+
+impl PhosphorBlendUniforms {
+    fn new(frame_dt_seconds: f32, tau_seconds: f32, max_luma: f32) -> Self {
+        Self {
+            frame_dt_tau_max_luma: [
+                frame_dt_seconds.max(0.0),
+                tau_seconds.max(0.0001),
+                max_luma,
+                0.0,
+            ],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PhosphorFormatConfig {
+    format: wgpu::TextureFormat,
+    max_luma: f32,
+    fallback: bool,
+}
+
+struct PhosphorTargets {
+    config: PhosphorFormatConfig,
+    size: PhysicalSize<u32>,
+    history: [PhosphorTexture; 2],
+    beam_scratch: PhosphorTexture,
+    previous_index: usize,
+    needs_clear: bool,
+}
+
+impl PhosphorTargets {
+    fn new(device: &wgpu::Device, size: PhysicalSize<u32>, config: PhosphorFormatConfig) -> Self {
+        let size = PhysicalSize::new(size.width.max(1), size.height.max(1));
+        let history_usage = wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC;
+        let scratch_usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
+
+        let history_a = PhosphorTexture::new(
+            device,
+            "Phosphor History A",
+            size,
+            config.format,
+            history_usage,
+        );
+        let history_b = PhosphorTexture::new(
+            device,
+            "Phosphor History B",
+            size,
+            config.format,
+            history_usage,
+        );
+        let beam_scratch = PhosphorTexture::new(
+            device,
+            "Current Beam Scratch",
+            size,
+            config.format,
+            scratch_usage,
+        );
+
+        Self {
+            config,
+            size,
+            history: [history_a, history_b],
+            beam_scratch,
+            previous_index: 0,
+            needs_clear: true,
+        }
+    }
+
+    fn target_index(&self) -> usize {
+        1 - self.previous_index
+    }
+
+    fn view(&self, index: usize) -> &wgpu::TextureView {
+        &self.history[index].view
+    }
+
+    fn format(&self) -> wgpu::TextureFormat {
+        self.config.format
+    }
+
+    fn max_luma(&self) -> f32 {
+        self.config.max_luma
+    }
+
+    fn needs_clear(&self) -> bool {
+        self.needs_clear
+    }
+
+    fn mark_clear(&mut self) {
+        self.needs_clear = false;
+    }
+
+    fn encode_clear(&self, encoder: &mut wgpu::CommandEncoder) {
+        let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Asteroids Phosphor History Clear"),
+            color_attachments: &[
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &self.history[0].view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &self.history[1].view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                }),
+            ],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+    }
+
+    fn copy_target_to_beam_scratch(&self, encoder: &mut wgpu::CommandEncoder, target_index: usize) {
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.history[target_index].texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.beam_scratch.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: self.size.width,
+                height: self.size.height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    fn advance(&mut self) {
+        self.previous_index = self.target_index();
+    }
+}
+
+struct PhosphorTexture {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
+impl PhosphorTexture {
+    fn new(
+        device: &wgpu::Device,
+        label: &'static str,
+        size: PhysicalSize<u32>,
+        format: wgpu::TextureFormat,
+        usage: wgpu::TextureUsages,
+    ) -> Self {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: size.width,
+                height: size.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        Self { texture, view }
+    }
+}
+
+struct PhosphorBindGroups {
+    blend: [wgpu::BindGroup; 2],
+    composite: [wgpu::BindGroup; 2],
+}
+
+impl PhosphorBindGroups {
+    fn new(
+        device: &wgpu::Device,
+        phosphor: &PhosphorTargets,
+        blend_pipeline: &PhosphorBlendPipeline,
+        composite_pipeline: &CompositePipeline,
+    ) -> Self {
+        let blend_target_0 = blend_pipeline.create_bind_group(
+            device,
+            phosphor.view(1),
+            &phosphor.beam_scratch.view,
+            "Phosphor Blend Bind Group Target 0",
+        );
+        let blend_target_1 = blend_pipeline.create_bind_group(
+            device,
+            phosphor.view(0),
+            &phosphor.beam_scratch.view,
+            "Phosphor Blend Bind Group Target 1",
+        );
+        let composite_0 = composite_pipeline.create_bind_group(
+            device,
+            phosphor.view(0),
+            "Composite Bind Group Phosphor 0",
+        );
+        let composite_1 = composite_pipeline.create_bind_group(
+            device,
+            phosphor.view(1),
+            "Composite Bind Group Phosphor 1",
+        );
+
+        Self {
+            blend: [blend_target_0, blend_target_1],
+            composite: [composite_0, composite_1],
+        }
+    }
+
+    fn blend(&self, target_index: usize) -> &wgpu::BindGroup {
+        &self.blend[target_index]
+    }
+
+    fn composite(&self, target_index: usize) -> &wgpu::BindGroup {
+        &self.composite[target_index]
+    }
+}
+
 struct BeamLinePipeline {
     pipeline: wgpu::RenderPipeline,
+    bind_group: wgpu::BindGroup,
+    uniform_buffer: wgpu::Buffer,
     vertex_buffer: wgpu::Buffer,
     vertex_capacity: usize,
     vertex_count: u32,
@@ -249,9 +684,36 @@ impl BeamLinePipeline {
             label: Some("Beam Line Shader"),
             source: wgpu::ShaderSource::Wgsl(BEAM_LINE_SHADER.into()),
         });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Beam Line Bind Group Layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Beam Line Uniform Buffer"),
+            size: size_of::<BeamUniforms>() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Beam Line Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Beam Line Pipeline Layout"),
-            bind_group_layouts: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -280,7 +742,7 @@ impl BeamLinePipeline {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: target_format,
-                    blend: None,
+                    blend: Some(additive_blend_state()),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -296,6 +758,8 @@ impl BeamLinePipeline {
 
         Self {
             pipeline,
+            bind_group,
+            uniform_buffer,
             vertex_buffer,
             vertex_capacity: 0,
             vertex_count: 0,
@@ -309,7 +773,15 @@ impl BeamLinePipeline {
         queue: &wgpu::Queue,
         commands: &[BeamCommand],
         half_width: f32,
+        size: PhysicalSize<u32>,
+        max_luma: f32,
     ) {
+        queue.write_buffer(
+            &self.uniform_buffer,
+            0,
+            bytemuck::bytes_of(&BeamUniforms::new(size, max_luma)),
+        );
+
         beam::expand_beam_commands(commands, half_width, &mut self.vertices);
         self.vertex_count = self.vertices.len() as u32;
 
@@ -342,8 +814,180 @@ impl BeamLinePipeline {
         }
 
         pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.draw(0..self.vertex_count, 0..1);
+    }
+}
+
+struct PhosphorBlendPipeline {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    uniform_buffer: wgpu::Buffer,
+}
+
+impl PhosphorBlendPipeline {
+    fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Phosphor Blend Shader"),
+            source: wgpu::ShaderSource::Wgsl(PHOSPHOR_BLEND_SHADER.into()),
+        });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Phosphor Blend Bind Group Layout"),
+            entries: &[
+                texture_bind_group_layout_entry(0, texture_sample_filterable(target_format)),
+                texture_bind_group_layout_entry(1, texture_sample_filterable(target_format)),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Phosphor Blend Uniform Buffer"),
+            size: size_of::<PhosphorBlendUniforms>() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Phosphor Blend Pipeline Layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = fullscreen_pipeline(
+            device,
+            &pipeline_layout,
+            &shader,
+            target_format,
+            "Phosphor Blend Pipeline",
+        );
+
+        Self {
+            pipeline,
+            bind_group_layout,
+            uniform_buffer,
+        }
+    }
+
+    fn update_uniforms(
+        &self,
+        queue: &wgpu::Queue,
+        frame_dt_seconds: f32,
+        tau_seconds: f32,
+        max_luma: f32,
+    ) {
+        queue.write_buffer(
+            &self.uniform_buffer,
+            0,
+            bytemuck::bytes_of(&PhosphorBlendUniforms::new(
+                frame_dt_seconds,
+                tau_seconds,
+                max_luma,
+            )),
+        );
+    }
+
+    fn create_bind_group(
+        &self,
+        device: &wgpu::Device,
+        previous_view: &wgpu::TextureView,
+        beam_view: &wgpu::TextureView,
+        label: &'static str,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(previous_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(beam_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.uniform_buffer.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    fn draw(&self, pass: &mut wgpu::RenderPass<'_>, bind_group: &wgpu::BindGroup) {
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
+
+struct CompositePipeline {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl CompositePipeline {
+    fn new(
+        device: &wgpu::Device,
+        target_format: wgpu::TextureFormat,
+        phosphor_format: wgpu::TextureFormat,
+    ) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Phosphor Composite Shader"),
+            source: wgpu::ShaderSource::Wgsl(COMPOSITE_SHADER.into()),
+        });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Composite Bind Group Layout"),
+            entries: &[texture_bind_group_layout_entry(
+                0,
+                texture_sample_filterable(phosphor_format),
+            )],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Composite Pipeline Layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = fullscreen_pipeline(
+            device,
+            &pipeline_layout,
+            &shader,
+            target_format,
+            "Composite Pipeline",
+        );
+
+        Self {
+            pipeline,
+            bind_group_layout,
+        }
+    }
+
+    fn create_bind_group(
+        &self,
+        device: &wgpu::Device,
+        phosphor_view: &wgpu::TextureView,
+        label: &'static str,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &self.bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(phosphor_view),
+            }],
+        })
+    }
+
+    fn draw(&self, pass: &mut wgpu::RenderPass<'_>, bind_group: &wgpu::BindGroup) {
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.draw(0..3, 0..1);
     }
 }
 
@@ -365,6 +1009,83 @@ const BEAM_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_arr
     4 => Float32,
 ];
 
+fn texture_bind_group_layout_entry(binding: u32, filterable: bool) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn texture_sample_filterable(format: wgpu::TextureFormat) -> bool {
+    matches!(
+        format,
+        wgpu::TextureFormat::Rgba8Unorm
+            | wgpu::TextureFormat::Rgba8UnormSrgb
+            | wgpu::TextureFormat::Bgra8Unorm
+            | wgpu::TextureFormat::Bgra8UnormSrgb
+    )
+}
+
+fn additive_blend_state() -> wgpu::BlendState {
+    let component = wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Add,
+    };
+    wgpu::BlendState {
+        color: component,
+        alpha: component,
+    }
+}
+
+fn fullscreen_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    target_format: wgpu::TextureFormat,
+    label: &'static str,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: target_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 const BEAM_LINE_SHADER: &str = r#"
 struct VertexInput {
     @location(0) position: vec2<f32>,
@@ -375,18 +1096,137 @@ struct VertexInput {
 };
 
 struct VertexOutput {
-    @builtin(position) clip_position: vec4<f32>,
+    @builtin(position) position: vec4<f32>,
+    @location(0) segment_start: vec2<f32>,
+    @location(1) segment_end: vec2<f32>,
+    @location(2) intensity: f32,
+    @location(3) dwell_us: f32,
 };
+
+struct BeamUniforms {
+    target_size_sigma_dwell: vec4<f32>,
+    growth_max_luma_pad: vec4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> beam: BeamUniforms;
 
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
-    output.clip_position = vec4<f32>(input.position, 0.0, 1.0);
+    output.position = vec4<f32>(input.position, 0.0, 1.0);
+    output.segment_start = input.segment_start;
+    output.segment_end = input.segment_end;
+    output.intensity = input.intensity;
+    output.dwell_us = input.dwell_us;
+    return output;
+}
+
+fn ndc_to_pixel(ndc: vec2<f32>) -> vec2<f32> {
+    let target_size = beam.target_size_sigma_dwell.xy;
+    return vec2<f32>(
+        (ndc.x * 0.5 + 0.5) * target_size.x,
+        (0.5 - ndc.y * 0.5) * target_size.y,
+    );
+}
+
+fn distance_to_segment_px(point: vec2<f32>, start: vec2<f32>, end: vec2<f32>) -> f32 {
+    let segment = end - start;
+    let segment_len_sq = max(dot(segment, segment), 0.000001);
+    let t = clamp(dot(point - start, segment) / segment_len_sq, 0.0, 1.0);
+    let closest = start + segment * t;
+    return length(point - closest);
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let start_px = ndc_to_pixel(input.segment_start);
+    let end_px = ndc_to_pixel(input.segment_end);
+    let distance = distance_to_segment_px(input.position.xy, start_px, end_px);
+
+    let base_sigma = beam.target_size_sigma_dwell.z;
+    let dwell_reference = max(beam.target_size_sigma_dwell.w, 0.001);
+    let dwell_factor = max(input.dwell_us / dwell_reference, 0.0);
+    let sigma_growth = beam.growth_max_luma_pad.x;
+    let sigma = base_sigma * (1.0 + sigma_growth * max(dwell_factor - 1.0, 0.0));
+    let sigma_sq = max(sigma * sigma, 0.0001);
+    let brightness = input.intensity * dwell_factor * exp(-(distance * distance) / sigma_sq);
+    let luma = clamp(brightness, 0.0, beam.growth_max_luma_pad.y);
+
+    return vec4<f32>(vec3<f32>(luma), luma);
+}
+"#;
+
+const PHOSPHOR_BLEND_SHADER: &str = r#"
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+};
+
+struct PhosphorBlendUniforms {
+    frame_dt_tau_max_luma: vec4<f32>,
+};
+
+@group(0) @binding(0)
+var previous_phosphor: texture_2d<f32>;
+@group(0) @binding(1)
+var current_beam: texture_2d<f32>;
+@group(0) @binding(2)
+var<uniform> phosphor: PhosphorBlendUniforms;
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -3.0),
+        vec2<f32>(-1.0,  1.0),
+        vec2<f32>( 3.0,  1.0),
+    );
+    var output: VertexOutput;
+    output.position = vec4<f32>(positions[vertex_index], 0.0, 1.0);
     return output;
 }
 
 @fragment
-fn fs_main() -> @location(0) vec4<f32> {
-    return vec4<f32>(1.0, 1.0, 1.0, 1.0);
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let coord = vec2<i32>(input.position.xy);
+    let previous = textureLoad(previous_phosphor, coord, 0).rgb;
+    let beam = textureLoad(current_beam, coord, 0).rgb;
+    let frame_dt = max(phosphor.frame_dt_tau_max_luma.x, 0.0);
+    let tau = max(phosphor.frame_dt_tau_max_luma.y, 0.0001);
+    let max_luma = phosphor.frame_dt_tau_max_luma.z;
+    let decay = exp(-frame_dt / tau);
+    let combined = clamp(beam + previous * decay, vec3<f32>(0.0), vec3<f32>(max_luma));
+
+    return vec4<f32>(combined, 1.0);
+}
+"#;
+
+const COMPOSITE_SHADER: &str = r#"
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+};
+
+@group(0) @binding(0)
+var phosphor_texture: texture_2d<f32>;
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -3.0),
+        vec2<f32>(-1.0,  1.0),
+        vec2<f32>( 3.0,  1.0),
+    );
+    var output: VertexOutput;
+    output.position = vec4<f32>(positions[vertex_index], 0.0, 1.0);
+    return output;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let coord = vec2<i32>(input.position.xy);
+    let hdr = max(textureLoad(phosphor_texture, coord, 0).rgb, vec3<f32>(0.0));
+    let reinhard = hdr / (hdr + vec3<f32>(1.0));
+    let gamma_encoded = pow(clamp(reinhard, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
+
+    return vec4<f32>(gamma_encoded, 1.0);
 }
 "#;
