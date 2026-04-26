@@ -54,7 +54,7 @@ tasks:
           - Sketch a Voice trait or struct family that pre-allocates DSP nodes once at app startup and exposes parameter mutation through AtomicF32 cells (no allocation in the audio callback).
           - Leave a placeholder cpal stream creation behind a feature flag or function that the audio-scaffolding task wires for real.
         Constraint reminder: the project is single-player only; no alternating 2-player even for v2 per DESIGN.md Constraints. Do not introduce 2-player abstractions.
-      status: todo
+      status: done
       workflow: implement
       deps:
         - capability-probe

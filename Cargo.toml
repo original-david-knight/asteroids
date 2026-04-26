@@ -1,0 +1,17 @@
+[package]
+name = "asteroids"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+audio-scaffolding = []
+
+[dependencies]
+bytemuck = { version = "=1.25.0", features = ["derive"] }
+cpal = "=0.17.3"
+fundsp = "=0.23.0"
+pollster = "=0.4.0"
+ringbuf = "=0.4.8"
+wgpu = "=29.0.1"
+winit = "=0.30.13"
