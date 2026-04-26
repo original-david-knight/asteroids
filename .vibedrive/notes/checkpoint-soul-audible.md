@@ -1,0 +1,1 @@
+Combined scenario wired and verified. Final gates pass: soul-visible OK, xrun-count 0, frame-time p99 0.468593 ms, audio RMS 0.068704. Initial xrun-count 913 was capture-ring overflow during simultaneous PNG/WAV output; fixed by increasing preallocated capture queue.

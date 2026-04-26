@@ -449,7 +449,7 @@ tasks:
       details: |
         DESIGN.md Success Criteria gate - both visual (spinning ship with phosphor trail) and the first synth voice (thrust hum on W) are alive together.
         Verify both run together with no audio xruns and no visible frame judder. If either side regressed since its own checkpoint, loop back rather than pressing on.
-      status: todo
+      status: done
       workflow: checkpoint
       deps:
         - thrust-voice

@@ -317,15 +317,16 @@ fn start_automated_audio_capture(
     let runtime = audio::AudioRuntime::start(receiver, voices, Some(capture_producer))?;
     eprintln!("{}", runtime.info().startup_summary());
 
-    let thrust_release_deadline = if config.scenario == Scenario::Thrust1s {
-        enqueue_audio_msg(
-            &mut sender,
-            audio::AudioMsg::Trigger(audio::VOICE_THRUST),
-            "thrust trigger",
-        )?;
-        Some(Instant::now() + Duration::from_secs(1))
-    } else {
-        None
+    let thrust_release_deadline = match config.scenario {
+        Scenario::Thrust1s | Scenario::ShipSpinningWithThrust => {
+            enqueue_audio_msg(
+                &mut sender,
+                audio::AudioMsg::Trigger(audio::VOICE_THRUST),
+                "thrust trigger",
+            )?;
+            (config.scenario == Scenario::Thrust1s).then(|| Instant::now() + Duration::from_secs(1))
+        }
+        _ => None,
     };
 
     Ok(Some(AutomatedAudioCapture {
@@ -355,7 +356,7 @@ fn enqueue_audio_msg(
 }
 
 pub fn runtime_usage() -> String {
-    "Usage: asteroids [--headless] [--screenshot <path>] [--capture-frames <N> --frames-out <dir>] [--audio-capture <secs> --wav-out <path>] [--seed <u64>] [--fixed-dt <secs>] [--simulate-secs <secs>] [--scenario <name>] [--xrun-log <path>] [--frame-time-log <path>] [--state-log <path>] [--bloom-intensity <value>] [--bloom-threshold <value>]\n\nScenarios: demo, idle, ship-spinning, horizontal-sweep, static-bright-line, static-bright-line-low-dwell, static-bright-line-high-dwell, gamma-ramp, thrust-1s".to_string()
+    "Usage: asteroids [--headless] [--screenshot <path>] [--capture-frames <N> --frames-out <dir>] [--audio-capture <secs> --wav-out <path>] [--seed <u64>] [--fixed-dt <secs>] [--simulate-secs <secs>] [--scenario <name>] [--xrun-log <path>] [--frame-time-log <path>] [--state-log <path>] [--bloom-intensity <value>] [--bloom-threshold <value>]\n\nScenarios: demo, idle, ship-spinning, horizontal-sweep, static-bright-line, static-bright-line-low-dwell, static-bright-line-high-dwell, gamma-ramp, thrust-1s, ship-spinning-with-thrust".to_string()
 }
 
 fn render_tick(
@@ -556,5 +557,31 @@ mod tests {
         let width = capture_frame_digits(101);
         assert_eq!(width, 3);
         assert_eq!(format!("frame_{:0width$}.png", 100), "frame_100.png");
+    }
+
+    #[test]
+    fn parses_combined_soul_visible_and_audible_scenario() {
+        let config = RuntimeConfig::from_args(
+            [
+                "--headless",
+                "--scenario",
+                "ship-spinning-with-thrust",
+                "--capture-frames",
+                "144",
+                "--frames-out",
+                "/tmp/sa-frames",
+                "--audio-capture",
+                "10",
+                "--wav-out",
+                "/tmp/sa-audio.wav",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap();
+
+        assert_eq!(config.scenario, Scenario::ShipSpinningWithThrust);
+        assert_eq!(config.capture_frames, Some(144));
+        assert_eq!(config.audio_capture_secs, Some(10.0));
     }
 }

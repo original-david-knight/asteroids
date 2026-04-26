@@ -26,6 +26,7 @@ pub enum Scenario {
     StaticBrightLineHighDwell,
     GammaRamp,
     Thrust1s,
+    ShipSpinningWithThrust,
 }
 
 impl Scenario {
@@ -40,6 +41,7 @@ impl Scenario {
             "static-bright-line-high-dwell" => Some(Self::StaticBrightLineHighDwell),
             "gamma-ramp" => Some(Self::GammaRamp),
             "thrust-1s" => Some(Self::Thrust1s),
+            "ship-spinning-with-thrust" => Some(Self::ShipSpinningWithThrust),
             _ => None,
         }
     }
@@ -55,6 +57,7 @@ impl Scenario {
             Self::StaticBrightLineHighDwell => "static-bright-line-high-dwell",
             Self::GammaRamp => "gamma-ramp",
             Self::Thrust1s => "thrust-1s",
+            Self::ShipSpinningWithThrust => "ship-spinning-with-thrust",
         }
     }
 }
@@ -955,7 +958,9 @@ fn emit_scenario_beams(emitter: &mut BeamEmitter, scenario: Scenario, time_s: f3
     match scenario {
         Scenario::Demo => emit_demo_beams(emitter, time_s),
         Scenario::Idle => emit_idle_beams(emitter),
-        Scenario::ShipSpinning => emit_ship_spinning_beams(emitter, time_s),
+        Scenario::ShipSpinning | Scenario::ShipSpinningWithThrust => {
+            emit_ship_spinning_beams(emitter, time_s)
+        }
         Scenario::HorizontalSweep => emit_horizontal_sweep_beams(emitter, time_s),
         Scenario::StaticBrightLine => {
             emit_static_bright_line(emitter, tuning::SHIP_OUTLINE_SEGMENT_DWELL_US)

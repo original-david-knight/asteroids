@@ -30,7 +30,9 @@ pub const AUDIO_MSG_CAPACITY: usize = 1024;
 pub const CAPTURE_SAMPLE_RATE: u32 = 48_000;
 pub const CAPTURE_CHANNELS: u16 = 2;
 pub const AUDIO_CAPTURE_BATCH_FRAMES: usize = 256;
-pub const AUDIO_CAPTURE_QUEUE_BATCHES: usize = 256;
+// Headless frame captures can briefly saturate CPU/disk while the audio callback
+// keeps running. Keep enough preallocated capture slack to avoid dropped batches.
+pub const AUDIO_CAPTURE_QUEUE_BATCHES: usize = 4096;
 const AUDIO_CAPTURE_BATCH_SAMPLES: usize = AUDIO_CAPTURE_BATCH_FRAMES * CAPTURE_CHANNELS as usize;
 const TARGET_OUTPUT_SAMPLE_RATE: u32 = 48_000;
 const TARGET_OUTPUT_BLOCK_FRAMES: u32 = 256;
