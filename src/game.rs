@@ -1302,7 +1302,7 @@ impl GameState {
     fn spawn_large_asteroid(&mut self, index: u32) -> Asteroid {
         let side = index % 4;
         let position = edge_spawn_position(side, &mut self.rng);
-        let velocity = edge_spawn_velocity(side, index, &mut self.rng);
+        let velocity = large_asteroid_spawn_velocity(side, index, &mut self.rng);
         let hull = AsteroidHull::random(&mut self.rng);
         self.allocate_asteroid(AsteroidSize::Large, position, velocity, hull)
     }
@@ -1461,6 +1461,10 @@ fn edge_spawn_velocity(side: u32, index: u32, rng: &mut SeededRng) -> Vec2 {
         _ => Vec2::new(secondary_raw, -primary_raw),
     };
     raw * tuning::ASTEROID_RAW_VELOCITY_TO_DRIFT_NDC_PER_SEC
+}
+
+fn large_asteroid_spawn_velocity(side: u32, index: u32, rng: &mut SeededRng) -> Vec2 {
+    edge_spawn_velocity(side, index, rng) * tuning::ASTEROID_LARGE_DRIFT_SPEED_SCALE
 }
 
 fn signed_random_raw_velocity(rng: &mut SeededRng) -> f32 {
@@ -2208,12 +2212,14 @@ mod tests {
     #[test]
     fn asteroid_spawn_velocity_uses_playable_drift_scale() {
         let mut rng = rng_for_seed(Some(11));
-        let velocity = edge_spawn_velocity(0, 0, &mut rng);
+        let velocity = large_asteroid_spawn_velocity(0, 0, &mut rng);
         let unscaled_max =
             tuning::ASTEROID_RAW_VELOCITY_MAX * tuning::ASTEROID_RAW_VELOCITY_TO_NDC_PER_SEC;
+        let scaled_max =
+            tuning::ASTEROID_DRIFT_SPEED_MAX_NDC_PER_SEC * tuning::ASTEROID_LARGE_DRIFT_SPEED_SCALE;
 
         assert!(
-            (velocity.x - tuning::ASTEROID_DRIFT_SPEED_MAX_NDC_PER_SEC).abs() < EPSILON,
+            (velocity.x - scaled_max).abs() < EPSILON,
             "velocity.x={}",
             velocity.x
         );
