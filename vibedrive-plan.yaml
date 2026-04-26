@@ -275,7 +275,7 @@ tasks:
           - (a) Letterbox the original 4:3 playfield with black bars on the sides.
           - (b) Stretch the playfield to widescreen (more space, asteroids spread out, slightly easier game).
         Implement option (c) in the renderer - define a playfield rectangle centered on the native render target with the original 4:3 aspect ratio, build bezel beam commands for the score and lives readouts in the side margins (stubs until scoring-and-lives lands), and route all subsequent gameplay beam commands through the playfield mapping.
-      status: todo
+      status: done
       workflow: implement
       deps:
         - bloom-pass

@@ -56,6 +56,7 @@ fn run() -> Result<(), String> {
         "gamma-ramp" => cmd_gamma_ramp(&mut args),
         "banding" => cmd_banding(&mut args),
         "peak-count" => cmd_peak_count(&mut args),
+        "playfield-rect" => cmd_playfield_rect(&mut args),
         "audio-rms" => cmd_audio_rms(&mut args),
         "audio-dominant-freq" => cmd_audio_dominant_freq(&mut args),
         "audio-band-energy" => cmd_audio_band_energy(&mut args),
@@ -63,7 +64,7 @@ fn run() -> Result<(), String> {
         "frame-time-p99" => cmd_frame_time_p99(&mut args),
         "state-trace" => cmd_state_trace(&mut args),
         "ship-outline" | "soul-visible" | "asteroid-count" | "screen-wrap" | "lives-display"
-        | "playfield-rect" | "heartbeat-tempo" => Err(format!(
+        | "heartbeat-tempo" => Err(format!(
             "{command} is reserved for a later gameplay/audio milestone\n\n{}",
             subcommand_help(&command)
         )),
@@ -201,6 +202,76 @@ fn cmd_peak_count(args: &mut CliArgs) -> Result<(), String> {
         ));
     }
     println!("peak-count ok: count={count}");
+    Ok(())
+}
+
+fn cmd_playfield_rect(args: &mut CliArgs) -> Result<(), String> {
+    let image = verify::load_png(&args.path("--frame")?)?;
+    let aspect = parse_aspect_ratio(&args.value_or("--aspect", "4:3".to_string())?)?;
+    let centered = args.flag("--centered");
+    let bezel_min_fraction = args.value_or("--bezel-min-fraction", 0.0_f32)?;
+    args.finish()?;
+
+    let rect = centered_aspect_rect(image.width, image.height, aspect)?;
+    let actual_aspect = rect.width() as f32 / rect.height().max(1) as f32;
+    let aspect_error = ((actual_aspect - aspect) / aspect).abs();
+    if aspect_error > 0.002 {
+        return Err(format!(
+            "playfield-rect failed: rect aspect={actual_aspect:.6}, expected {aspect:.6}"
+        ));
+    }
+
+    let left_margin = rect.left as f32 / image.width.max(1) as f32;
+    let right_margin = image.width.saturating_sub(rect.right) as f32 / image.width.max(1) as f32;
+    if centered && (left_margin - right_margin).abs() > (1.5 / image.width.max(1) as f32) {
+        return Err(format!(
+            "playfield-rect failed: margins not centered left={left_margin:.6} right={right_margin:.6}"
+        ));
+    }
+    if left_margin < bezel_min_fraction || right_margin < bezel_min_fraction {
+        return Err(format!(
+            "playfield-rect failed: bezel margins left={left_margin:.6} right={right_margin:.6}, expected >= {bezel_min_fraction:.6}"
+        ));
+    }
+
+    let peak = image.max_luminance();
+    if peak <= 0.0 {
+        return Err("playfield-rect failed: frame has no visible beam signal".to_string());
+    }
+    let threshold = (peak * 0.08).max(0.015);
+    let min_signal_pixels = 12;
+    let left_signal = signal_count(&image, 0, rect.left, 0, image.height, threshold);
+    let right_signal = signal_count(&image, rect.right, image.width, 0, image.height, threshold);
+    let playfield_signal = signal_count(
+        &image,
+        rect.left,
+        rect.right,
+        rect.top,
+        rect.bottom,
+        threshold,
+    );
+
+    if left_signal < min_signal_pixels || right_signal < min_signal_pixels {
+        return Err(format!(
+            "playfield-rect failed: bezel readout signal too low left={left_signal} right={right_signal}, threshold={threshold:.6}"
+        ));
+    }
+    if playfield_signal < min_signal_pixels {
+        return Err(format!(
+            "playfield-rect failed: playfield signal too low count={playfield_signal}, threshold={threshold:.6}"
+        ));
+    }
+
+    println!(
+        "playfield-rect ok: rect={}x{} at ({},{}), margins left={left_margin:.6} right={right_margin:.6}, bezel_signal=({},{}), playfield_signal={}",
+        rect.width(),
+        rect.height(),
+        rect.left,
+        rect.top,
+        left_signal,
+        right_signal,
+        playfield_signal
+    );
     Ok(())
 }
 
@@ -520,6 +591,98 @@ fn fwhm_width_1d(values: &[f32], peak_index: usize) -> f32 {
     (right - left).max(0.0)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PixelRect {
+    left: u32,
+    right: u32,
+    top: u32,
+    bottom: u32,
+}
+
+impl PixelRect {
+    fn width(self) -> u32 {
+        self.right.saturating_sub(self.left)
+    }
+
+    fn height(self) -> u32 {
+        self.bottom.saturating_sub(self.top)
+    }
+}
+
+fn parse_aspect_ratio(value: &str) -> Result<f32, String> {
+    let (width, height) = value
+        .split_once(':')
+        .ok_or_else(|| format!("--aspect must use <width>:<height>, got '{value}'"))?;
+    let width: f32 = width
+        .trim()
+        .parse()
+        .map_err(|error| format!("--aspect width is invalid: {error}"))?;
+    let height: f32 = height
+        .trim()
+        .parse()
+        .map_err(|error| format!("--aspect height is invalid: {error}"))?;
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return Err(format!(
+            "--aspect must be positive and finite, got '{value}'"
+        ));
+    }
+    Ok(width / height)
+}
+
+fn centered_aspect_rect(width: u32, height: u32, aspect: f32) -> Result<PixelRect, String> {
+    if width == 0 || height == 0 {
+        return Err("playfield-rect failed: image dimensions must be non-zero".to_string());
+    }
+    if !aspect.is_finite() || aspect <= 0.0 {
+        return Err(format!("invalid aspect ratio {aspect}"));
+    }
+
+    let image_aspect = width as f32 / height as f32;
+    let (rect_width, rect_height) = if image_aspect >= aspect {
+        (
+            ((height as f32 * aspect).round() as u32).clamp(1, width),
+            height,
+        )
+    } else {
+        (
+            width,
+            ((width as f32 / aspect).round() as u32).clamp(1, height),
+        )
+    };
+    let left = (width - rect_width) / 2;
+    let top = (height - rect_height) / 2;
+
+    Ok(PixelRect {
+        left,
+        right: left + rect_width,
+        top,
+        bottom: top + rect_height,
+    })
+}
+
+fn signal_count(
+    image: &verify::PngImage,
+    x_start: u32,
+    x_end: u32,
+    y_start: u32,
+    y_end: u32,
+    threshold: f32,
+) -> usize {
+    let x_start = x_start.min(image.width);
+    let x_end = x_end.min(image.width).max(x_start);
+    let y_start = y_start.min(image.height);
+    let y_end = y_end.min(image.height).max(y_start);
+    let mut count = 0;
+    for y in y_start..y_end {
+        for x in x_start..x_end {
+            if image.luminance(x, y) >= threshold {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
 fn half_crossing(a: f32, b: f32, threshold: f32, left_index: usize) -> f32 {
     let denom = b - a;
     if denom.abs() <= f32::EPSILON {
@@ -568,6 +731,14 @@ struct CliArgs {
 impl CliArgs {
     fn new(args: Vec<String>) -> Self {
         Self { args }
+    }
+
+    fn flag(&mut self, flag: &str) -> bool {
+        let Some(index) = self.args.iter().position(|arg| arg == flag) else {
+            return false;
+        };
+        self.args.remove(index);
+        true
     }
 
     fn path(&mut self, flag: &str) -> Result<PathBuf, String> {

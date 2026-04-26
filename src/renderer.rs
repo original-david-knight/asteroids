@@ -1,5 +1,6 @@
 use std::{
     env,
+    f32::consts::FRAC_PI_2,
     sync::{Arc, mpsc},
     time::Instant,
 };
@@ -119,6 +120,7 @@ pub struct Renderer {
     bloom: BloomTargets,
     bloom_bind_groups: BloomBindGroups,
     beam_emitter: BeamEmitter,
+    gameplay_beam_emitter: BeamEmitter,
     phosphor_tau_ms: f32,
     bloom_params: BloomParams,
     last_frame: Instant,
@@ -139,6 +141,7 @@ pub struct HeadlessRenderer {
     bloom: BloomTargets,
     bloom_bind_groups: BloomBindGroups,
     beam_emitter: BeamEmitter,
+    gameplay_beam_emitter: BeamEmitter,
     phosphor_tau_ms: f32,
     bloom_params: BloomParams,
 }
@@ -243,6 +246,7 @@ impl Renderer {
             bloom,
             bloom_bind_groups,
             beam_emitter: BeamEmitter::new(),
+            gameplay_beam_emitter: BeamEmitter::new(),
             phosphor_tau_ms: tuning::PHOSPHOR_TAU_DEFAULT_MS,
             bloom_params: BloomParams::default(),
             last_frame: Instant::now(),
@@ -289,8 +293,13 @@ impl Renderer {
     }
 
     pub fn render_with_params(&mut self, params: FrameParams) -> Result<(), String> {
-        self.beam_emitter.clear();
-        emit_scenario_beams(&mut self.beam_emitter, params.scenario, params.time_seconds);
+        emit_frame_beams(
+            &mut self.beam_emitter,
+            &mut self.gameplay_beam_emitter,
+            params.scenario,
+            params.time_seconds,
+            self.size,
+        );
 
         let frame = match self.surface.get_current_texture() {
             CurrentSurfaceTexture::Success(frame) | CurrentSurfaceTexture::Suboptimal(frame) => {
@@ -477,14 +486,20 @@ impl HeadlessRenderer {
             bloom,
             bloom_bind_groups,
             beam_emitter: BeamEmitter::new(),
+            gameplay_beam_emitter: BeamEmitter::new(),
             phosphor_tau_ms: tuning::PHOSPHOR_TAU_DEFAULT_MS,
             bloom_params: BloomParams::default(),
         })
     }
 
     pub fn render(&mut self, params: FrameParams) -> Result<(), String> {
-        self.beam_emitter.clear();
-        emit_scenario_beams(&mut self.beam_emitter, params.scenario, params.time_seconds);
+        emit_frame_beams(
+            &mut self.beam_emitter,
+            &mut self.gameplay_beam_emitter,
+            params.scenario,
+            params.time_seconds,
+            self.size,
+        );
 
         let mut encoder = self
             .device
@@ -716,6 +731,218 @@ fn encode_scene_to_view(ctx: SceneRenderContext<'_>) {
 fn align_to_copy_bytes_per_row(bytes_per_row: u32) -> u32 {
     let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
     bytes_per_row.div_ceil(alignment) * alignment
+}
+
+// Aspect strategy is locked to DESIGN.md Open Question 1 option (c):
+// centered 4:3 gameplay with score/lives vector readout bezels in the side margins.
+// This follows DESIGN.md's default lean and keeps the autonomous run from making
+// a subjective taste call between the recorded alternatives.
+const PLAYFIELD_ASPECT_RATIO: f32 = 4.0 / 3.0;
+const BEZEL_READOUT_INTENSITY: f32 = 0.56;
+const BEZEL_READOUT_DWELL_US: f32 = 24.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PlayfieldRect {
+    min: Vec2,
+    max: Vec2,
+}
+
+impl PlayfieldRect {
+    fn centered_4_3(size: PhysicalSize<u32>) -> Self {
+        let width = size.width.max(1) as f32;
+        let height = size.height.max(1) as f32;
+        let target_aspect = width / height;
+
+        if target_aspect >= PLAYFIELD_ASPECT_RATIO {
+            let half_width = PLAYFIELD_ASPECT_RATIO / target_aspect;
+            Self {
+                min: Vec2::new(-half_width, -1.0),
+                max: Vec2::new(half_width, 1.0),
+            }
+        } else {
+            let half_height = target_aspect / PLAYFIELD_ASPECT_RATIO;
+            Self {
+                min: Vec2::new(-1.0, -half_height),
+                max: Vec2::new(1.0, half_height),
+            }
+        }
+    }
+
+    fn map_point(self, point: Vec2) -> Vec2 {
+        let center = (self.min + self.max) * 0.5;
+        let half_extent = (self.max - self.min) * 0.5;
+        center + Vec2::new(point.x * half_extent.x, point.y * half_extent.y)
+    }
+
+    fn map_command(self, command: BeamCommand) -> BeamCommand {
+        BeamCommand {
+            start: self.map_point(command.start),
+            end: self.map_point(command.end),
+            intensity: command.intensity,
+            dwell_us: command.dwell_us,
+        }
+    }
+
+    fn left_margin(self) -> Option<NdcRect> {
+        (self.min.x > -1.0).then_some(NdcRect {
+            min: Vec2::new(-1.0, -1.0),
+            max: Vec2::new(self.min.x, 1.0),
+        })
+    }
+
+    fn right_margin(self) -> Option<NdcRect> {
+        (self.max.x < 1.0).then_some(NdcRect {
+            min: Vec2::new(self.max.x, -1.0),
+            max: Vec2::new(1.0, 1.0),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NdcRect {
+    min: Vec2,
+    max: Vec2,
+}
+
+impl NdcRect {
+    fn width(self) -> f32 {
+        self.max.x - self.min.x
+    }
+
+    fn center_x(self) -> f32 {
+        (self.min.x + self.max.x) * 0.5
+    }
+}
+
+fn emit_frame_beams(
+    frame_emitter: &mut BeamEmitter,
+    gameplay_emitter: &mut BeamEmitter,
+    scenario: Scenario,
+    time_s: f32,
+    size: PhysicalSize<u32>,
+) {
+    let playfield = PlayfieldRect::centered_4_3(size);
+
+    frame_emitter.clear();
+    gameplay_emitter.clear();
+
+    emit_bezel_readouts(frame_emitter, playfield, size);
+    emit_scenario_beams(gameplay_emitter, scenario, time_s);
+
+    for command in gameplay_emitter.commands() {
+        frame_emitter.emit(playfield.map_command(*command));
+    }
+}
+
+fn emit_bezel_readouts(
+    emitter: &mut BeamEmitter,
+    playfield: PlayfieldRect,
+    size: PhysicalSize<u32>,
+) {
+    if let Some(left) = playfield.left_margin() {
+        emit_score_readout(emitter, left, size);
+    }
+    if let Some(right) = playfield.right_margin() {
+        emit_lives_readout(emitter, right);
+    }
+}
+
+fn emit_score_readout(emitter: &mut BeamEmitter, margin: NdcRect, size: PhysicalSize<u32>) {
+    let aspect_correction = size.height.max(1) as f32 / size.width.max(1) as f32;
+    let natural_digit_height = 0.082;
+    let natural_digit_width = natural_digit_height * 0.56 * aspect_correction;
+    let digit_gap_ratio = 0.36;
+    let digits = 6.0;
+    let gaps = digits - 1.0;
+    let max_digit_width = margin.width() * 0.78 / (digits + gaps * digit_gap_ratio);
+    let digit_width = natural_digit_width.min(max_digit_width).max(0.006);
+    let digit_height = digit_width / (0.56 * aspect_correction).max(0.001);
+    let gap = digit_width * digit_gap_ratio;
+    let total_width = digit_width * digits + gap * gaps;
+    let start_x = margin.center_x() - total_width * 0.5;
+    let bottom_y = 0.72;
+
+    for index in 0..6 {
+        emit_seven_segment_digit(
+            emitter,
+            0,
+            Vec2::new(start_x + index as f32 * (digit_width + gap), bottom_y),
+            Vec2::new(digit_width, digit_height),
+            BEZEL_READOUT_INTENSITY,
+        );
+    }
+}
+
+fn emit_lives_readout(emitter: &mut BeamEmitter, margin: NdcRect) {
+    let icon_scale = (margin.width() * 0.62 / 0.44).clamp(0.055, 0.16);
+    let x = margin.center_x();
+    for y in [0.80, 0.66, 0.52] {
+        emit_ship_outline(
+            emitter,
+            Vec2::new(x, y),
+            FRAC_PI_2,
+            icon_scale,
+            BEZEL_READOUT_INTENSITY,
+        );
+    }
+}
+
+fn emit_seven_segment_digit(
+    emitter: &mut BeamEmitter,
+    digit: u8,
+    origin: Vec2,
+    size: Vec2,
+    intensity: f32,
+) {
+    let segments = match digit {
+        0 => [true, true, true, false, true, true, true],
+        1 => [false, false, true, false, false, true, false],
+        2 => [true, false, true, true, true, false, true],
+        3 => [true, false, true, true, false, true, true],
+        4 => [false, true, true, true, false, true, false],
+        5 => [true, true, false, true, false, true, true],
+        6 => [true, true, false, true, true, true, true],
+        7 => [true, false, true, false, false, true, false],
+        8 => [true, true, true, true, true, true, true],
+        9 => [true, true, true, true, false, true, true],
+        _ => [false; 7],
+    };
+
+    let x0 = origin.x;
+    let x1 = origin.x + size.x;
+    let y0 = origin.y;
+    let y1 = origin.y + size.y;
+    let ym = (y0 + y1) * 0.5;
+    let inset = size.x * 0.16;
+    let vertical_gap = size.y * 0.08;
+
+    let segment_points = [
+        (Vec2::new(x0 + inset, y1), Vec2::new(x1 - inset, y1)),
+        (
+            Vec2::new(x0, ym + vertical_gap),
+            Vec2::new(x0, y1 - vertical_gap),
+        ),
+        (
+            Vec2::new(x1, ym + vertical_gap),
+            Vec2::new(x1, y1 - vertical_gap),
+        ),
+        (Vec2::new(x0 + inset, ym), Vec2::new(x1 - inset, ym)),
+        (
+            Vec2::new(x0, y0 + vertical_gap),
+            Vec2::new(x0, ym - vertical_gap),
+        ),
+        (
+            Vec2::new(x1, y0 + vertical_gap),
+            Vec2::new(x1, ym - vertical_gap),
+        ),
+        (Vec2::new(x0 + inset, y0), Vec2::new(x1 - inset, y0)),
+    ];
+
+    for (enabled, (start, end)) in segments.into_iter().zip(segment_points) {
+        if enabled {
+            emitter.emit_segment(start, end, intensity, BEZEL_READOUT_DWELL_US);
+        }
+    }
 }
 
 fn emit_scenario_beams(emitter: &mut BeamEmitter, scenario: Scenario, time_s: f32) {
@@ -2483,3 +2710,36 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(gamma_encoded, 1.0);
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() <= 0.00001,
+            "actual={actual}, expected={expected}"
+        );
+    }
+
+    #[test]
+    fn centered_playfield_uses_side_margins_on_widescreen() {
+        let rect = PlayfieldRect::centered_4_3(PhysicalSize::new(1920, 1080));
+
+        assert_close(rect.min.x, -0.75);
+        assert_close(rect.max.x, 0.75);
+        assert_close(rect.min.y, -1.0);
+        assert_close(rect.max.y, 1.0);
+        assert!(rect.left_margin().is_some());
+        assert!(rect.right_margin().is_some());
+    }
+
+    #[test]
+    fn playfield_mapping_preserves_corners_inside_centered_rect() {
+        let rect = PlayfieldRect::centered_4_3(PhysicalSize::new(5120, 2160));
+
+        assert_eq!(rect.map_point(Vec2::new(-1.0, -1.0)), rect.min);
+        assert_eq!(rect.map_point(Vec2::new(1.0, 1.0)), rect.max);
+        assert_eq!(rect.map_point(Vec2::ZERO), Vec2::ZERO);
+    }
+}

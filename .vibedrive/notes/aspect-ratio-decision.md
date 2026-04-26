@@ -1,0 +1,1 @@
+Implemented locked option (c): gameplay beams map into a centered 4:3 playfield, with left score-zero and right lives-icon vector bezel stubs. Verified at 5120x2160: playfield 2880x2160 centered with 1120px side margins (0.21875 each); cargo test and requested screenshot/playfield-rect verification passed.
