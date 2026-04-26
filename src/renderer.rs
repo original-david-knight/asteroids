@@ -41,6 +41,7 @@ pub enum Scenario {
     Fire3,
     UfoLarge,
     UfoSmall,
+    LongPlay5Min,
     ScoreProgression,
     EightExtraLives,
     HyperspaceSpam,
@@ -73,6 +74,7 @@ impl Scenario {
             "fire-3" => Some(Self::Fire3),
             "ufo-large" => Some(Self::UfoLarge),
             "ufo-small" => Some(Self::UfoSmall),
+            "long-play-5min" => Some(Self::LongPlay5Min),
             "score-progression" => Some(Self::ScoreProgression),
             "eight-extra-lives" => Some(Self::EightExtraLives),
             "hyperspace-spam" => Some(Self::HyperspaceSpam),
@@ -106,6 +108,7 @@ impl Scenario {
             Self::Fire3 => "fire-3",
             Self::UfoLarge => "ufo-large",
             Self::UfoSmall => "ufo-small",
+            Self::LongPlay5Min => "long-play-5min",
             Self::ScoreProgression => "score-progression",
             Self::EightExtraLives => "eight-extra-lives",
             Self::HyperspaceSpam => "hyperspace-spam",
@@ -126,6 +129,7 @@ impl Scenario {
                 | Self::LoseAllLives
                 | Self::UfoLarge
                 | Self::UfoSmall
+                | Self::LongPlay5Min
                 | Self::ScoreProgression
                 | Self::EightExtraLives
                 | Self::HyperspaceSpam
@@ -906,7 +910,7 @@ fn align_to_copy_bytes_per_row(bytes_per_row: u32) -> u32 {
     bytes_per_row.div_ceil(alignment) * alignment
 }
 
-// Aspect strategy is locked to DESIGN.md Open Question 1 option (c):
+// Closed DESIGN aspect strategy: option (c) is locked for v1:
 // centered 4:3 gameplay with score/lives vector readout bezels in the side margins.
 // This follows DESIGN.md's default lean and keeps the autonomous run from making
 // a subjective taste call between the recorded alternatives.
@@ -1206,6 +1210,7 @@ fn emit_scenario_beams(emitter: &mut BeamEmitter, scenario: Scenario, time_s: f3
         | Scenario::Fire3
         | Scenario::UfoLarge
         | Scenario::UfoSmall
+        | Scenario::LongPlay5Min
         | Scenario::ScoreProgression
         | Scenario::EightExtraLives
         | Scenario::HyperspaceSpam
@@ -3248,9 +3253,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let bloom = max(textureLoad(bloom_texture, coord, 0).rgb, vec3<f32>(0.0));
 
     // v1 intentionally skips CRT curvature: Asteroids used a vector XY tube,
-    // which had little geometric distortion compared with raster CRTs. TODO:
-    // add only subtle curvature later if original cabinet reference photos
-    // show it is warranted.
+    // which had little geometric distortion compared with raster CRTs. For v2,
+    // add only subtle curvature if original cabinet reference photos warrant it.
     let phosphor_luma = max(max(phosphor.r, phosphor.g), phosphor.b);
     let core_guard = 1.0 - smoothstep(0.35, 0.72, phosphor_luma);
     let hdr = phosphor + bloom * composite.bloom_intensity_pad.x * core_guard;

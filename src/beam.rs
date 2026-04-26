@@ -251,7 +251,6 @@ impl BeamEmitter {
         &self.commands
     }
 
-    #[allow(dead_code)]
     pub fn into_commands(self) -> Vec<BeamCommand> {
         self.commands
     }

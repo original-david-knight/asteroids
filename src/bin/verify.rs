@@ -1038,19 +1038,24 @@ fn decay_fit_from_frames(dir: &Path, fixed_dt: f64) -> Result<verify::DecayFit, 
         ));
     }
     let first = verify::load_png(&frames[0])?;
-    let (peak_x, peak_y, peak_luma) = brightest_pixel(&first);
+    let playfield = centered_aspect_rect(first.width, first.height, PLAYFIELD_ASPECT_RATIO)?;
+    let (peak_x, peak_y, peak_luma) = brightest_pixel_in_rect(&first, playfield);
     if peak_luma <= 0.0 {
         return Err(format!("first frame in {} has no luminance", dir.display()));
     }
 
-    let mut coords = Vec::with_capacity(first.width as usize * 5 + 5);
+    let mut coords = Vec::with_capacity(playfield.width() as usize * 5 + 5);
     for y_offset in -2_i32..=2 {
-        let y = (peak_y as i32 + y_offset).clamp(0, first.height.saturating_sub(1) as i32) as u32;
-        for x in 0..first.width {
+        let y = (peak_y as i32 + y_offset)
+            .clamp(
+                playfield.top as i32,
+                playfield.bottom.saturating_sub(1) as i32,
+            ) as u32;
+        for x in playfield.left..playfield.right {
             coords.push((x, y));
         }
     }
-    for y in 0..first.height {
+    for y in playfield.top..playfield.bottom {
         coords.push((peak_x, y));
     }
     coords.sort_unstable();
@@ -1126,10 +1131,14 @@ fn frame_index(file_name: &str) -> Option<usize> {
         .ok()
 }
 
-fn brightest_pixel(image: &verify::PngImage) -> (u32, u32, f32) {
+fn brightest_pixel_in_rect(image: &verify::PngImage, rect: PixelRect) -> (u32, u32, f32) {
     let mut best = (0, 0, 0.0);
-    for y in 0..image.height {
-        for x in 0..image.width {
+    let left = rect.left.min(image.width);
+    let right = rect.right.min(image.width);
+    let top = rect.top.min(image.height);
+    let bottom = rect.bottom.min(image.height);
+    for y in top..bottom {
+        for x in left..right {
             let luma = image.luminance(x, y);
             if luma > best.2 {
                 best = (x, y, luma);
@@ -1137,6 +1146,18 @@ fn brightest_pixel(image: &verify::PngImage) -> (u32, u32, f32) {
         }
     }
     best
+}
+
+fn brightest_pixel(image: &verify::PngImage) -> (u32, u32, f32) {
+    brightest_pixel_in_rect(
+        image,
+        PixelRect {
+            left: 0,
+            right: image.width,
+            top: 0,
+            bottom: image.height,
+        },
+    )
 }
 
 const VERIFY_FIXED_DT_SECONDS: f32 = 0.00694;
@@ -1400,15 +1421,23 @@ fn fit_angle_rate(detections: &[ShipDetection], fixed_dt: f32) -> AngleRateFit {
 }
 
 fn estimated_fwhm_width(image: &verify::PngImage) -> f32 {
-    let best = brightest_pixel(image);
-    let row_values = (0..image.width)
+    let playfield = centered_aspect_rect(image.width, image.height, PLAYFIELD_ASPECT_RATIO).unwrap_or(
+        PixelRect {
+            left: 0,
+            right: image.width,
+            top: 0,
+            bottom: image.height,
+        },
+    );
+    let best = brightest_pixel_in_rect(image, playfield);
+    let row_values = (playfield.left..playfield.right)
         .map(|x| image.luminance(x, best.1))
         .collect::<Vec<_>>();
-    let col_values = (0..image.height)
+    let col_values = (playfield.top..playfield.bottom)
         .map(|y| image.luminance(best.0, y))
         .collect::<Vec<_>>();
-    let row_width = fwhm_width_1d(&row_values, best.0 as usize);
-    let col_width = fwhm_width_1d(&col_values, best.1 as usize);
+    let row_width = fwhm_width_1d(&row_values, best.0.saturating_sub(playfield.left) as usize);
+    let col_width = fwhm_width_1d(&col_values, best.1.saturating_sub(playfield.top) as usize);
     if row_width <= 0.0 {
         col_width
     } else if col_width <= 0.0 {

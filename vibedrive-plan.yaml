@@ -767,7 +767,7 @@ tasks:
         Replace any placeholder game-over text with beam-drawn vector glyphs if not already done.
         Sweep for warnings, dead code, and any Open Question stragglers that were not closed inline (color, persistence-of-vision tau, CRT curvature, hyperspace randomness, collision model, disassembly references should all already be closed - confirm).
         This task has a planning-time expectation of broad cross-cutting touch (renderer constants, audio constants, gameplay constants), but the scope is bounded by PLAN.md step 15 and does not need a separate follow-up tech-debt task.
-      status: todo
+      status: done
       workflow: implement
       deps:
         - highscore-and-attract

@@ -1,11 +1,15 @@
+/// Polish-pass beam dwell defaults. These keep the original Asteroids object
+/// hierarchy readable on a modern high-DPI display: ship lines are the
+/// reference brightness, asteroids sit slightly behind them, bullets pop, and
+/// corners retain a small endpoint pause.
 pub const SHIP_OUTLINE_SEGMENT_DWELL_US: f32 = 30.0;
 pub const ASTEROID_HULL_SEGMENT_DWELL_US: f32 = 25.0;
 pub const BULLET_DOT_DWELL_US: f32 = 40.0;
 pub const ENDPOINT_DWELL_BONUS_US: f32 = 10.0;
 
-/// DESIGN.md Open Question 2 autonomous-run lock:
-/// original Asteroids was a monochrome XY display, so the default beam is
-/// pure white-on-black instead of a taste-tuned green/amber phosphor tint.
+/// Closed DESIGN color question: original Asteroids was a monochrome XY
+/// display, so v1 stays pure white-on-black instead of a taste-tuned
+/// green/amber phosphor tint.
 pub const DEFAULT_BEAM_RGB: [f32; 3] = [1.0, 1.0, 1.0];
 
 pub const SHIP_ROTATION_RATE_RAD_PER_SEC: f32 = 3.0;
@@ -38,13 +42,17 @@ pub const ASTEROID_MEDIUM_RADIUS_UNITS: f32 = 15.0;
 pub const ASTEROID_SMALL_RADIUS_UNITS: f32 = 7.0;
 
 pub const BEAM_QUAD_HALF_WIDTH_PIXELS: f32 = 6.0;
+/// Final v1 beam spot radius in physical pixels.
 pub const BEAM_SIGMA_PIXELS: f32 = 1.0;
+/// Extra spot growth when dwell rises above the ship-line reference dwell.
 pub const BEAM_SIGMA_DWELL_GROWTH: f32 = 0.50;
 
 pub const PHOSPHOR_TRAIL_LOW_DWELL_US: f32 = 10.0;
 pub const PHOSPHOR_TRAIL_MID_DWELL_US: f32 = SHIP_OUTLINE_SEGMENT_DWELL_US;
 pub const PHOSPHOR_TRAIL_HIGH_DWELL_US: f32 = 60.0;
 
+/// Final v1 phosphor decay time constant. Kept inside the 50-100ms DESIGN
+/// band after decay-fit and soul-visible captures.
 pub const PHOSPHOR_TAU_DEFAULT_MS: f32 = 70.0;
 pub const PHOSPHOR_TAU_MIN_MS: f32 = 50.0;
 pub const PHOSPHOR_TAU_MAX_MS: f32 = 100.0;

@@ -11,6 +11,14 @@ pub const FIXED_TIMESTEP_SECONDS: f32 = 1.0 / 240.0;
 pub const MAX_SUBSTEPS_PER_FRAME: u32 = 4;
 pub const PLAYFIELD_MIN: Vec2 = Vec2::new(-1.0, -1.0);
 pub const PLAYFIELD_MAX: Vec2 = Vec2::new(1.0, 1.0);
+/// Polish-pass disassembly recheck:
+/// - ship direction changes by +/-3 direction bytes per input sample at $7086-$7099,
+///   which this build keeps as the DESIGN-level 3 rad/s feel constant in tuning.rs;
+/// - thrust is applied through the original acceleration registers every other
+///   60 Hz frame at $709b-$70de, represented here as the DESIGN 0.05 units/frame
+///   normalized to the 240 Hz fixed step;
+/// - ship max velocity remains the DESIGN gameplay-unit cap, because the
+///   original byte clamp is hardware-scale specific.
 pub const SHIP_MAX_VELOCITY_UNITS_PER_SEC: f32 = 6.0;
 pub const SHIP_THRUST_ACCEL_UNITS_PER_SEC_SQUARED: f32 = 0.05 * 60.0;
 pub const SCORE_PLACEHOLDER: u32 = 0;
@@ -43,7 +51,10 @@ pub const SHIP_RESPAWN_DELAY_SECONDS: f32 = 1.25;
 pub const SHIP_RESPAWN_INVULNERABILITY_SECONDS: f32 = 1.25;
 pub const HYPERSPACE_COOLDOWN_SECONDS: f32 = 1.0;
 pub const HYPERSPACE_SELF_DESTRUCT_CHANCE: f32 = 0.10;
-pub const UFO_SMALL_SCORE_THRESHOLD: u32 = 10_000;
+/// SourceGen/Computer Archeology gate the guaranteed small saucer at BCD #$30
+/// in PlayerScores+1 ($6c19-$6c20), annotated as 3,000 points. The earlier
+/// DESIGN draft said 10k; the polish pass closes that discrepancy here.
+pub const UFO_SMALL_SCORE_THRESHOLD: u32 = 3_000;
 pub const UFO_SPAWN_SCORE_STEP_POINTS: u32 = 2_500;
 pub const UFO_BULLET_SPEED_NDC_PER_SEC: f32 = 1.25;
 
@@ -366,7 +377,7 @@ pub enum GameEventKind {
     UfoFiredAimed,
     ScoreIncreased,
     ExtraLifeAwarded,
-    ScoreGte10000,
+    ScoreGte3000,
     ShipDied,
     LivesDecremented,
     Respawn,
@@ -394,7 +405,7 @@ impl GameEventKind {
             Self::UfoFiredAimed => "ufo-fired-aimed",
             Self::ScoreIncreased => "score-increased",
             Self::ExtraLifeAwarded => "extra-life-awarded",
-            Self::ScoreGte10000 => "score-gte-10000",
+            Self::ScoreGte3000 => "score-gte-3000",
             Self::ShipDied => "ship-died",
             Self::LivesDecremented => "lives-decremented",
             Self::Respawn => "respawn",
@@ -957,7 +968,7 @@ impl GameState {
         self.next_ufo_id = self.next_ufo_id.wrapping_add(1).max(1);
         self.ufo = Some(Ufo::new(id, variant, Vec2::new(x, y), velocity));
         if self.score >= UFO_SMALL_SCORE_THRESHOLD {
-            self.push_event(GameEventKind::ScoreGte10000);
+            self.push_event(GameEventKind::ScoreGte3000);
         }
         self.push_ufo_event(GameEventKind::UfoSpawned, variant);
         self.push_ufo_event(GameEventKind::UfoSirenOn, variant);
@@ -1317,7 +1328,7 @@ fn ufo_shot_interval_seconds() -> f32 {
     UFO_SHOT_RELOAD_TICKS as f32 * UFO_ORIGINAL_TIMER_TICK_SECONDS
 }
 
-/// DESIGN.md Open Question 7 decision: gameplay collisions use circle-vs-circle
+/// Closed DESIGN collision-model question: gameplay collisions use circle-vs-circle
 /// tests with sprite-extent radii. This is modern, fast, deterministic at edge
 /// touch, and accurate enough for the wireframe sprites used in this build.
 pub fn circles_overlap(center_a: Vec2, radius_a: f32, center_b: Vec2, radius_b: f32) -> bool {
@@ -2318,7 +2329,7 @@ mod tests {
     }
 
     #[test]
-    fn ufo_variant_switches_at_design_score_threshold() {
+    fn ufo_variant_switches_at_disassembly_score_threshold() {
         assert_eq!(
             ufo_variant_for_score(UFO_SMALL_SCORE_THRESHOLD - 1),
             UfoVariant::Large
@@ -2355,7 +2366,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|event| event.kind == GameEventKind::ScoreGte10000)
+                .any(|event| event.kind == GameEventKind::ScoreGte3000)
         );
     }
 

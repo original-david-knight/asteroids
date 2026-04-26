@@ -593,7 +593,7 @@ fn sleep_until(deadline: Instant) {
 }
 
 pub fn runtime_usage() -> String {
-    "Usage: asteroids [--headless] [--screenshot <path>] [--capture-frames <N> --frames-out <dir>] [--audio-capture <secs> --wav-out <path>] [--seed <u64>] [--fixed-dt <secs>] [--simulate-secs <secs>] [--scenario <name>] [--xrun-log <path>] [--frame-time-log <path>] [--state-log <path>] [--bloom-intensity <value>] [--bloom-threshold <value>]\n\nScenarios: demo, idle, ship-spinning, horizontal-sweep, static-bright-line, static-bright-line-low-dwell, static-bright-line-high-dwell, gamma-ramp, thrust-1s, ship-spinning-with-thrust, heavy-input, asteroids-round-1, bullet-hit-asteroid, ship-collides-with-asteroid, lose-all-lives, explosion-storm, heartbeat-curve, fire-3, ufo-large, ufo-small, score-progression, eight-extra-lives, hyperspace-spam, title-idle, attract-then-input, set-highscore-12345, read-highscore".to_string()
+    "Usage: asteroids [--headless] [--screenshot <path>] [--capture-frames <N> --frames-out <dir>] [--audio-capture <secs> --wav-out <path>] [--seed <u64>] [--fixed-dt <secs>] [--simulate-secs <secs>] [--scenario <name>] [--xrun-log <path>] [--frame-time-log <path>] [--state-log <path>] [--bloom-intensity <value>] [--bloom-threshold <value>]\n\nScenarios: demo, idle, ship-spinning, horizontal-sweep, static-bright-line, static-bright-line-low-dwell, static-bright-line-high-dwell, gamma-ramp, thrust-1s, ship-spinning-with-thrust, heavy-input, asteroids-round-1, bullet-hit-asteroid, ship-collides-with-asteroid, lose-all-lives, explosion-storm, heartbeat-curve, fire-3, ufo-large, ufo-small, long-play-5min, score-progression, eight-extra-lives, hyperspace-spam, title-idle, attract-then-input, set-highscore-12345, read-highscore".to_string()
 }
 
 fn load_persisted_high_score() -> u32 {
@@ -755,6 +755,7 @@ struct TickIo<'a> {
 fn scripted_controls(scenario: Scenario, time_seconds: f32) -> ControlState {
     match scenario {
         Scenario::HeavyInput => game::heavy_input_controls(time_seconds),
+        Scenario::LongPlay5Min => long_play_controls(time_seconds),
         Scenario::BulletHitAsteroid => ControlState {
             fire: time_seconds < 0.02,
             ..ControlState::default()
@@ -772,6 +773,19 @@ fn hyperspace_spam_pressed(time_seconds: f32) -> bool {
     [0.0, 0.25, 1.10, 1.25, 2.20]
         .into_iter()
         .any(|start| time_seconds >= start && time_seconds < start + PULSE_SECONDS)
+}
+
+fn long_play_controls(time_seconds: f32) -> ControlState {
+    let rotate_phase = (time_seconds * 0.55).floor() as i32;
+    let fire_phase = (time_seconds * 6.0).floor() as i32;
+    let hyperspace_phase = time_seconds.rem_euclid(47.0);
+    ControlState {
+        rotate_left: rotate_phase.rem_euclid(4) == 0,
+        rotate_right: rotate_phase.rem_euclid(4) == 2,
+        thrust: (time_seconds * 0.75).sin() > -0.25,
+        fire: fire_phase.rem_euclid(4) == 0,
+        hyperspace: (12.0..12.04).contains(&hyperspace_phase),
+    }
 }
 
 fn write_state_event(
@@ -1225,6 +1239,7 @@ mod tests {
             "bullet-hit-asteroid",
             "ship-collides-with-asteroid",
             "lose-all-lives",
+            "long-play-5min",
             "score-progression",
             "eight-extra-lives",
             "hyperspace-spam",

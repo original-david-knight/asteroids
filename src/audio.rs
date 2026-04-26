@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::{
     array,
     f32::consts::{PI, TAU},
@@ -45,16 +43,18 @@ const RTKIT_PRIORITY: u32 = 10;
 pub const THRUST_FREQUENCY_HZ: f32 = 118.0;
 pub const THRUST_LOW_PASS_CUTOFF_HZ: f32 = 620.0;
 pub const THRUST_LOW_PASS_Q: f32 = 0.82;
-pub const THRUST_GAIN: f32 = 0.24;
+/// Final v1 per-voice gains from the polish mix pass. The mixer still applies
+/// soft clipping, but normal scripted combinations should stay below it.
+pub const THRUST_GAIN: f32 = 0.23;
 pub const THRUST_ATTACK_SECONDS: f32 = 0.020;
 pub const THRUST_DECAY_SECONDS: f32 = 0.090;
 pub const THRUST_SUSTAIN_LEVEL: f32 = 0.86;
 pub const THRUST_RELEASE_SECONDS: f32 = 0.120;
 pub const FIRE_FREQUENCY_HZ: f32 = 920.0;
-pub const FIRE_GAIN: f32 = 0.30;
-pub const EXPLOSION_GAIN: f32 = 0.48;
-pub const UFO_GAIN: f32 = 0.18;
-pub const HEARTBEAT_GAIN: f32 = 0.34;
+pub const FIRE_GAIN: f32 = 0.28;
+pub const EXPLOSION_GAIN: f32 = 0.42;
+pub const UFO_GAIN: f32 = 0.17;
+pub const HEARTBEAT_GAIN: f32 = 0.31;
 pub const HEARTBEAT_ORIGINAL_FRAME_RATE_HZ: f32 = 60.0;
 pub const HEARTBEAT_ORIGINAL_ON_FRAMES: u32 = 4;
 pub const HEARTBEAT_ORIGINAL_SLOW_OFF_RELOAD_FRAMES: u32 = 0x30;
@@ -528,7 +528,7 @@ pub const PARAM_HEARTBEAT_MAX_ASTEROIDS: ParamId = ParamId(1);
 pub const PARAM_HEARTBEAT_RUNNING: ParamId = ParamId(2);
 pub const PARAM_HEARTBEAT_GAIN: ParamId = ParamId(3);
 
-/// DESIGN.md Open Question 4: the disassembly's thump speed is not a
+/// Closed DESIGN heartbeat question: the disassembly's thump speed is not a
 /// rock-count table. Computer Archeology/SourceGen show ThmpOffReload starts at
 /// $30, ChkThmpFaster decrements it every 64 frames until $08, and the audible
 /// thump-on timer is always 4 frames. The audio contract only gives this voice
