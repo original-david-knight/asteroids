@@ -38,3 +38,9 @@ pub const BLOOM_INTENSITY_STEP: f32 = 0.05;
 pub const BLOOM_THRESHOLD_MIN: f32 = 0.0;
 pub const BLOOM_THRESHOLD_MAX: f32 = 4.0;
 pub const BLOOM_THRESHOLD_STEP: f32 = 0.05;
+
+pub const GAMMA_RAMP_BARS: usize = 11;
+pub const GAMMA_RAMP_X_MIN: f32 = -1.0;
+pub const GAMMA_RAMP_X_MAX: f32 = 1.0;
+pub const GAMMA_RAMP_Y_MIN: f32 = -0.88;
+pub const GAMMA_RAMP_Y_MAX: f32 = 0.22;

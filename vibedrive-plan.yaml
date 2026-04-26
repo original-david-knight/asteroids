@@ -357,7 +357,7 @@ tasks:
         Per PLAN.md step 7, finalize the composite path that combines phosphor and bloom into the swap-chain texture.
         DESIGN.md Open Question 5 (CRT curvature) is decided here by deferral - vector tubes had little geometric distortion, so v1 explicitly skips curvature and ships without it. Leave a TODO comment in the composite shader about adding subtle curvature later only if reference photos warrant it.
         Confirm tone-mapping, gamma, and bloom mix happen in the composite stage in the right order so colors are consistent across the gameplay.
-      status: todo
+      status: done
       workflow: implement
       deps:
         - checkpoint-soul-visible

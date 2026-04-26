@@ -995,13 +995,13 @@ fn emit_static_bright_line(emitter: &mut BeamEmitter, dwell_us: f32) {
 }
 
 fn emit_gamma_ramp_beams(emitter: &mut BeamEmitter) {
-    let bars = 17;
-    for i in 0..bars {
-        let t = i as f32 / (bars - 1) as f32;
-        let x = -0.78 + t * 1.56;
+    for i in 0..tuning::GAMMA_RAMP_BARS {
+        let t = i as f32 / (tuning::GAMMA_RAMP_BARS - 1) as f32;
+        let y =
+            tuning::GAMMA_RAMP_Y_MIN + t * (tuning::GAMMA_RAMP_Y_MAX - tuning::GAMMA_RAMP_Y_MIN);
         emitter.emit_segment(
-            Vec2::new(x, -0.38),
-            Vec2::new(x, 0.38),
+            Vec2::new(tuning::GAMMA_RAMP_X_MIN, y),
+            Vec2::new(tuning::GAMMA_RAMP_X_MAX, y),
             t,
             tuning::SHIP_OUTLINE_SEGMENT_DWELL_US,
         );
@@ -2690,6 +2690,11 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let coord = vec2<i32>(input.position.xy);
     let phosphor = max(textureLoad(phosphor_texture, coord, 0).rgb, vec3<f32>(0.0));
     let bloom = max(textureLoad(bloom_texture, coord, 0).rgb, vec3<f32>(0.0));
+
+    // v1 intentionally skips CRT curvature: Asteroids used a vector XY tube,
+    // which had little geometric distortion compared with raster CRTs. TODO:
+    // add only subtle curvature later if original cabinet reference photos
+    // show it is warranted.
     let phosphor_luma = max(max(phosphor.r, phosphor.g), phosphor.b);
     let core_guard = 1.0 - smoothstep(0.35, 0.72, phosphor_luma);
     let hdr = phosphor + bloom * composite.bloom_intensity_pad.x * core_guard;

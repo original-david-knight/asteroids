@@ -146,24 +146,49 @@ fn cmd_line_peak_luminance(args: &mut CliArgs) -> Result<(), String> {
 
 fn cmd_gamma_ramp(args: &mut CliArgs) -> Result<(), String> {
     let image = verify::load_png(&args.path("--frame")?)?;
+    let gamma = args.value_or("--gamma", 2.2_f32)?;
+    let tolerance = args.value_or("--tolerance", 0.05_f32)?;
     let min_steps = args.value_or("--min-steps", 8_usize)?;
     args.finish()?;
-    let values = verify::line_luminance(
-        &image,
-        (0.0, image.height as f32 * 0.5),
-        (
-            image.width.saturating_sub(1) as f32,
-            image.height as f32 * 0.5,
-        ),
-        image.width.min(512) as usize,
-    );
-    let increasing = values.windows(2).filter(|pair| pair[1] >= pair[0]).count();
-    if increasing < min_steps {
+    if !gamma.is_finite() || gamma <= 0.0 {
+        return Err("--gamma must be a finite positive number".to_string());
+    }
+    if !tolerance.is_finite() || tolerance < 0.0 {
+        return Err("--tolerance must be a finite non-negative number".to_string());
+    }
+
+    let playfield = centered_aspect_rect(image.width, image.height, PLAYFIELD_ASPECT_RATIO)?;
+    let samples = gamma_ramp_samples(&image, playfield, gamma);
+    let increasing = samples
+        .windows(2)
+        .filter(|pair| pair[1].actual + tolerance >= pair[0].actual)
+        .count();
+    if increasing < min_steps.min(samples.len().saturating_sub(1)) {
         return Err(format!(
             "gamma-ramp failed: monotonic_steps={increasing}, expected at least {min_steps}"
         ));
     }
-    println!("gamma-ramp ok: monotonic_steps={increasing}");
+
+    let mut max_error = 0.0_f32;
+    let mut worst_bar = 0;
+    for sample in &samples {
+        let error = (sample.actual - sample.expected).abs();
+        if error > max_error {
+            max_error = error;
+            worst_bar = sample.index;
+        }
+    }
+    if max_error > tolerance {
+        let sample = &samples[worst_bar];
+        return Err(format!(
+            "gamma-ramp failed: bar={} input={:.3} actual={:.6} expected={:.6} error={max_error:.6}, tolerance={tolerance:.6}",
+            sample.index, sample.input, sample.actual, sample.expected
+        ));
+    }
+    println!(
+        "gamma-ramp ok: bars={} gamma={gamma:.3} max_error={max_error:.6} worst_bar={worst_bar}",
+        samples.len()
+    );
     Ok(())
 }
 
@@ -655,6 +680,14 @@ const SHIP_ANGLE_FINE_RADIUS_RAD: f32 = 0.012;
 const SHIP_ANGLE_FINE_STEP_RAD: f32 = 0.001;
 
 #[derive(Clone, Debug)]
+struct GammaRampSample {
+    index: usize,
+    input: f32,
+    actual: f32,
+    expected: f32,
+}
+
+#[derive(Clone, Debug)]
 struct ShipDetection {
     angle_rad: f32,
     vertex_luminance: [f32; SHIP_VERTEX_COUNT],
@@ -788,6 +821,32 @@ fn gameplay_to_pixel(playfield: PixelRect, point: asteroids::beam::Vec2) -> (f32
     )
 }
 
+fn gamma_ramp_samples(
+    image: &verify::PngImage,
+    playfield: PixelRect,
+    gamma: f32,
+) -> Vec<GammaRampSample> {
+    let mut samples = Vec::with_capacity(asteroids::tuning::GAMMA_RAMP_BARS);
+    let center_x =
+        (asteroids::tuning::GAMMA_RAMP_X_MIN + asteroids::tuning::GAMMA_RAMP_X_MAX) * 0.5;
+    for index in 0..asteroids::tuning::GAMMA_RAMP_BARS {
+        let input = index as f32 / (asteroids::tuning::GAMMA_RAMP_BARS - 1) as f32;
+        let y = asteroids::tuning::GAMMA_RAMP_Y_MIN
+            + input * (asteroids::tuning::GAMMA_RAMP_Y_MAX - asteroids::tuning::GAMMA_RAMP_Y_MIN);
+        let point = gameplay_to_pixel(playfield, asteroids::beam::Vec2::new(center_x, y));
+        let actual = max_signal_near(image, point, 4);
+        let tone_mapped = input / (input + 1.0);
+        let expected = tone_mapped.clamp(0.0, 1.0).powf(1.0 / gamma);
+        samples.push(GammaRampSample {
+            index,
+            input,
+            actual,
+            expected,
+        });
+    }
+    samples
+}
+
 fn rotate_vec2(point: asteroids::beam::Vec2, angle: f32) -> asteroids::beam::Vec2 {
     let (sin, cos) = angle.sin_cos();
     asteroids::beam::Vec2::new(point.x * cos - point.y * sin, point.x * sin + point.y * cos)
@@ -883,8 +942,11 @@ fn estimated_fwhm_width(image: &verify::PngImage) -> f32 {
 
 fn banding_luminance_values(image: &verify::PngImage) -> Vec<f32> {
     let (_, peak_y, peak_luma) = brightest_pixel(image);
+    let x_range = centered_aspect_rect(image.width, image.height, PLAYFIELD_ASPECT_RATIO)
+        .map(|rect| (rect.left, rect.right.saturating_sub(1)))
+        .unwrap_or((0, image.width.saturating_sub(1)));
     if peak_luma <= 0.0 {
-        return horizontal_luminance_values(image, image.height / 2);
+        return horizontal_luminance_values(image, image.height / 2, x_range);
     }
 
     let min_signal = (peak_luma * 0.02).max(0.003);
@@ -900,7 +962,7 @@ fn banding_luminance_values(image: &verify::PngImage) -> Vec<f32> {
                 continue;
             }
 
-            let values = horizontal_luminance_values(image, y as u32);
+            let values = horizontal_luminance_values(image, y as u32, x_range);
             let row_max = values.iter().copied().fold(0.0_f32, f32::max);
             if row_max < min_signal || row_max > max_signal {
                 continue;
@@ -916,16 +978,18 @@ fn banding_luminance_values(image: &verify::PngImage) -> Vec<f32> {
     }
 
     best.map(|(_, _, values)| values)
-        .unwrap_or_else(|| horizontal_luminance_values(image, image.height / 2))
+        .unwrap_or_else(|| horizontal_luminance_values(image, image.height / 2, x_range))
 }
 
-fn horizontal_luminance_values(image: &verify::PngImage, y: u32) -> Vec<f32> {
+fn horizontal_luminance_values(image: &verify::PngImage, y: u32, x_range: (u32, u32)) -> Vec<f32> {
     let y = y.min(image.height.saturating_sub(1)) as f32;
+    let start_x = x_range.0.min(image.width.saturating_sub(1));
+    let end_x = x_range.1.min(image.width.saturating_sub(1)).max(start_x);
     verify::line_luminance(
         image,
-        (0.0, y),
-        (image.width.saturating_sub(1) as f32, y),
-        image.width.min(1024) as usize,
+        (start_x as f32, y),
+        (end_x as f32, y),
+        (end_x - start_x + 1).min(1024) as usize,
     )
 }
 
@@ -1085,7 +1149,7 @@ fn subcommand_help(command: &str) -> String {
         "decay-fit" => "Usage: verify decay-fit --frames <dir> --tau-min <secs> --tau-max <secs> --r2-min <value> [--fixed-dt <secs>]".to_string(),
         "line-glow-width" => "Usage: verify line-glow-width --lo <png> --hi <png> --fwhm-ratio-min <ratio> [--core-peak-tolerance <fraction>]".to_string(),
         "line-peak-luminance" => "Usage: verify line-peak-luminance --frame <png> --min <luma> --max <luma>".to_string(),
-        "gamma-ramp" => "Usage: verify gamma-ramp --frame <png> [--min-steps <n>]".to_string(),
+        "gamma-ramp" => "Usage: verify gamma-ramp --frame <png> [--gamma <value>] [--tolerance <value>] [--min-steps <n>]".to_string(),
         "banding" => "Usage: verify banding --frame <png> --max-step-jump <luma>".to_string(),
         "peak-count" => "Usage: verify peak-count --frame <png> [--threshold <luma>] [--min <n>] [--max <n>]".to_string(),
         "ship-outline" => "Usage: verify ship-outline --frames <dir> --vertex-count <n> --rotation-rate-rad-per-sec <rate> --tolerance <value>".to_string(),
