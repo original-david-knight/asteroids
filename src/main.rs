@@ -96,8 +96,9 @@ impl ApplicationHandler for AsteroidsApp {
 
         match pollster::block_on(Renderer::new(Arc::clone(&window), target_size)) {
             Ok(renderer) => {
+                let bloom = renderer.bloom_params();
                 println!(
-                    "display: {}; surface={}x{}, scale={:.3}, format={:?}, present_mode={:?}, phosphor={:?}, tau={:.0}ms",
+                    "display: {}; surface={}x{}, scale={:.3}, format={:?}, present_mode={:?}, phosphor={:?}, tau={:.0}ms, bloom_intensity={:.3}, bloom_threshold={:.3}",
                     renderer::display_server_note(),
                     renderer.size().width,
                     renderer.size().height,
@@ -106,6 +107,8 @@ impl ApplicationHandler for AsteroidsApp {
                     renderer.present_mode(),
                     renderer.phosphor_format(),
                     renderer.phosphor_tau_ms(),
+                    bloom.intensity,
+                    bloom.threshold,
                 );
                 println!(
                     "audio scaffold: {} voices, channel capacity {} messages, cpal stream not spawned",
@@ -183,6 +186,79 @@ impl ApplicationHandler for AsteroidsApp {
                 if let Some(renderer) = self.renderer.as_mut() {
                     let tau = renderer.adjust_phosphor_tau_ms(tuning::PHOSPHOR_TAU_STEP_MS);
                     println!("debug phosphor tau: {tau:.0}ms");
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::F4),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    let bloom = renderer.reset_bloom_params();
+                    println!(
+                        "debug bloom reset: intensity={:.3}, threshold={:.3}",
+                        bloom.intensity, bloom.threshold
+                    );
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::F5),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    let threshold = renderer.adjust_bloom_threshold(-tuning::BLOOM_THRESHOLD_STEP);
+                    println!("debug bloom threshold: {threshold:.3}");
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::F6),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    let threshold = renderer.adjust_bloom_threshold(tuning::BLOOM_THRESHOLD_STEP);
+                    println!("debug bloom threshold: {threshold:.3}");
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::F7),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    let intensity = renderer.adjust_bloom_intensity(-tuning::BLOOM_INTENSITY_STEP);
+                    println!("debug bloom intensity: {intensity:.3}");
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::F8),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    let intensity = renderer.adjust_bloom_intensity(tuning::BLOOM_INTENSITY_STEP);
+                    println!("debug bloom intensity: {intensity:.3}");
                 }
             }
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {

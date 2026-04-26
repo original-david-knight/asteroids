@@ -69,6 +69,40 @@ impl FrameParams {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct BloomParams {
+    pub intensity: f32,
+    pub threshold: f32,
+}
+
+impl BloomParams {
+    pub fn new(intensity: f32, threshold: f32) -> Self {
+        let intensity = if intensity.is_finite() {
+            intensity.clamp(tuning::BLOOM_INTENSITY_MIN, tuning::BLOOM_INTENSITY_MAX)
+        } else {
+            tuning::BLOOM_INTENSITY_DEFAULT
+        };
+        let threshold = if threshold.is_finite() {
+            threshold.clamp(tuning::BLOOM_THRESHOLD_MIN, tuning::BLOOM_THRESHOLD_MAX)
+        } else {
+            tuning::BLOOM_THRESHOLD_DEFAULT
+        };
+        Self {
+            intensity,
+            threshold,
+        }
+    }
+}
+
+impl Default for BloomParams {
+    fn default() -> Self {
+        Self::new(
+            tuning::BLOOM_INTENSITY_DEFAULT,
+            tuning::BLOOM_THRESHOLD_DEFAULT,
+        )
+    }
+}
+
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -78,11 +112,15 @@ pub struct Renderer {
     fullscreen_size: Option<PhysicalSize<u32>>,
     beam_pipeline: BeamLinePipeline,
     phosphor_blend_pipeline: PhosphorBlendPipeline,
+    bloom_pipeline: BloomPipeline,
     composite_pipeline: CompositePipeline,
     phosphor: PhosphorTargets,
     phosphor_bind_groups: PhosphorBindGroups,
+    bloom: BloomTargets,
+    bloom_bind_groups: BloomBindGroups,
     beam_emitter: BeamEmitter,
     phosphor_tau_ms: f32,
+    bloom_params: BloomParams,
     last_frame: Instant,
     demo_start: Instant,
 }
@@ -94,11 +132,15 @@ pub struct HeadlessRenderer {
     output: OutputTexture,
     beam_pipeline: BeamLinePipeline,
     phosphor_blend_pipeline: PhosphorBlendPipeline,
+    bloom_pipeline: BloomPipeline,
     composite_pipeline: CompositePipeline,
     phosphor: PhosphorTargets,
     phosphor_bind_groups: PhosphorBindGroups,
+    bloom: BloomTargets,
+    bloom_bind_groups: BloomBindGroups,
     beam_emitter: BeamEmitter,
     phosphor_tau_ms: f32,
+    bloom_params: BloomParams,
 }
 
 impl Renderer {
@@ -167,14 +209,23 @@ impl Renderer {
 
         let beam_pipeline = BeamLinePipeline::new(&device, phosphor_config.format);
         let phosphor_blend_pipeline = PhosphorBlendPipeline::new(&device, phosphor_config.format);
-        let composite_pipeline = CompositePipeline::new(&device, format, phosphor_config.format);
+        let bloom_pipeline = BloomPipeline::new(&device, phosphor_config.format);
+        let composite_pipeline = CompositePipeline::new(
+            &device,
+            format,
+            phosphor_config.format,
+            phosphor_config.format,
+        );
         let phosphor = PhosphorTargets::new(&device, size, phosphor_config);
+        let bloom = BloomTargets::new(&device, size, phosphor_config.format);
         let phosphor_bind_groups = PhosphorBindGroups::new(
             &device,
             &phosphor,
+            &bloom,
             &phosphor_blend_pipeline,
             &composite_pipeline,
         );
+        let bloom_bind_groups = BloomBindGroups::new(&device, &phosphor, &bloom, &bloom_pipeline);
 
         Ok(Self {
             surface,
@@ -185,11 +236,15 @@ impl Renderer {
             fullscreen_size,
             beam_pipeline,
             phosphor_blend_pipeline,
+            bloom_pipeline,
             composite_pipeline,
             phosphor,
             phosphor_bind_groups,
+            bloom,
+            bloom_bind_groups,
             beam_emitter: BeamEmitter::new(),
             phosphor_tau_ms: tuning::PHOSPHOR_TAU_DEFAULT_MS,
+            bloom_params: BloomParams::default(),
             last_frame: Instant::now(),
             demo_start: Instant::now(),
         })
@@ -206,11 +261,19 @@ impl Renderer {
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
         self.phosphor = PhosphorTargets::new(&self.device, size, self.phosphor.config);
+        self.bloom = BloomTargets::new(&self.device, size, self.phosphor.config.format);
         self.phosphor_bind_groups = PhosphorBindGroups::new(
             &self.device,
             &self.phosphor,
+            &self.bloom,
             &self.phosphor_blend_pipeline,
             &self.composite_pipeline,
+        );
+        self.bloom_bind_groups = BloomBindGroups::new(
+            &self.device,
+            &self.phosphor,
+            &self.bloom,
+            &self.bloom_pipeline,
         );
         self.last_frame = Instant::now();
     }
@@ -258,11 +321,15 @@ impl Renderer {
             size: self.size,
             beam_pipeline: &mut self.beam_pipeline,
             phosphor_blend_pipeline: &mut self.phosphor_blend_pipeline,
+            bloom_pipeline: &self.bloom_pipeline,
             composite_pipeline: &self.composite_pipeline,
             phosphor: &mut self.phosphor,
             phosphor_bind_groups: &self.phosphor_bind_groups,
+            bloom: &self.bloom,
+            bloom_bind_groups: &self.bloom_bind_groups,
             beam_emitter: &self.beam_emitter,
             phosphor_tau_ms: self.phosphor_tau_ms,
+            bloom_params: self.bloom_params,
             frame_dt_seconds: params.frame_dt_seconds,
             target_view: &surface_view,
             encoder: &mut encoder,
@@ -285,6 +352,27 @@ impl Renderer {
         self.phosphor_tau_ms
     }
 
+    pub fn set_bloom_params(&mut self, intensity: f32, threshold: f32) {
+        self.bloom_params = BloomParams::new(intensity, threshold);
+    }
+
+    pub fn adjust_bloom_intensity(&mut self, delta: f32) -> f32 {
+        self.bloom_params.intensity = (self.bloom_params.intensity + delta)
+            .clamp(tuning::BLOOM_INTENSITY_MIN, tuning::BLOOM_INTENSITY_MAX);
+        self.bloom_params.intensity
+    }
+
+    pub fn adjust_bloom_threshold(&mut self, delta: f32) -> f32 {
+        self.bloom_params.threshold = (self.bloom_params.threshold + delta)
+            .clamp(tuning::BLOOM_THRESHOLD_MIN, tuning::BLOOM_THRESHOLD_MAX);
+        self.bloom_params.threshold
+    }
+
+    pub fn reset_bloom_params(&mut self) -> BloomParams {
+        self.bloom_params = BloomParams::default();
+        self.bloom_params
+    }
+
     pub fn size(&self) -> PhysicalSize<u32> {
         self.size
     }
@@ -299,6 +387,10 @@ impl Renderer {
 
     pub fn phosphor_tau_ms(&self) -> f32 {
         self.phosphor_tau_ms
+    }
+
+    pub fn bloom_params(&self) -> BloomParams {
+        self.bloom_params
     }
 
     pub fn present_mode(&self) -> wgpu::PresentMode {
@@ -352,15 +444,23 @@ impl HeadlessRenderer {
         let output_format = wgpu::TextureFormat::Rgba8Unorm;
         let beam_pipeline = BeamLinePipeline::new(&device, phosphor_config.format);
         let phosphor_blend_pipeline = PhosphorBlendPipeline::new(&device, phosphor_config.format);
-        let composite_pipeline =
-            CompositePipeline::new(&device, output_format, phosphor_config.format);
+        let bloom_pipeline = BloomPipeline::new(&device, phosphor_config.format);
+        let composite_pipeline = CompositePipeline::new(
+            &device,
+            output_format,
+            phosphor_config.format,
+            phosphor_config.format,
+        );
         let phosphor = PhosphorTargets::new(&device, size, phosphor_config);
+        let bloom = BloomTargets::new(&device, size, phosphor_config.format);
         let phosphor_bind_groups = PhosphorBindGroups::new(
             &device,
             &phosphor,
+            &bloom,
             &phosphor_blend_pipeline,
             &composite_pipeline,
         );
+        let bloom_bind_groups = BloomBindGroups::new(&device, &phosphor, &bloom, &bloom_pipeline);
         let output = OutputTexture::new(&device, size, output_format);
 
         Ok(Self {
@@ -370,11 +470,15 @@ impl HeadlessRenderer {
             output,
             beam_pipeline,
             phosphor_blend_pipeline,
+            bloom_pipeline,
             composite_pipeline,
             phosphor,
             phosphor_bind_groups,
+            bloom,
+            bloom_bind_groups,
             beam_emitter: BeamEmitter::new(),
             phosphor_tau_ms: tuning::PHOSPHOR_TAU_DEFAULT_MS,
+            bloom_params: BloomParams::default(),
         })
     }
 
@@ -394,11 +498,15 @@ impl HeadlessRenderer {
             size: self.size,
             beam_pipeline: &mut self.beam_pipeline,
             phosphor_blend_pipeline: &mut self.phosphor_blend_pipeline,
+            bloom_pipeline: &self.bloom_pipeline,
             composite_pipeline: &self.composite_pipeline,
             phosphor: &mut self.phosphor,
             phosphor_bind_groups: &self.phosphor_bind_groups,
+            bloom: &self.bloom,
+            bloom_bind_groups: &self.bloom_bind_groups,
             beam_emitter: &self.beam_emitter,
             phosphor_tau_ms: self.phosphor_tau_ms,
+            bloom_params: self.bloom_params,
             frame_dt_seconds: params.frame_dt_seconds,
             target_view: &self.output.view,
             encoder: &mut encoder,
@@ -407,6 +515,10 @@ impl HeadlessRenderer {
         self.queue.submit([encoder.finish()]);
         self.phosphor.advance();
         Ok(())
+    }
+
+    pub fn set_bloom_params(&mut self, intensity: f32, threshold: f32) {
+        self.bloom_params = BloomParams::new(intensity, threshold);
     }
 
     pub fn capture_rgba8(&self) -> Result<Vec<u8>, String> {
@@ -491,11 +603,15 @@ struct SceneRenderContext<'a> {
     size: PhysicalSize<u32>,
     beam_pipeline: &'a mut BeamLinePipeline,
     phosphor_blend_pipeline: &'a mut PhosphorBlendPipeline,
+    bloom_pipeline: &'a BloomPipeline,
     composite_pipeline: &'a CompositePipeline,
     phosphor: &'a mut PhosphorTargets,
     phosphor_bind_groups: &'a PhosphorBindGroups,
+    bloom: &'a BloomTargets,
+    bloom_bind_groups: &'a BloomBindGroups,
     beam_emitter: &'a BeamEmitter,
     phosphor_tau_ms: f32,
+    bloom_params: BloomParams,
     frame_dt_seconds: f32,
     target_view: &'a wgpu::TextureView,
     encoder: &'a mut wgpu::CommandEncoder,
@@ -516,6 +632,10 @@ fn encode_scene_to_view(ctx: SceneRenderContext<'_>) {
         ctx.phosphor_tau_ms * 0.001,
         ctx.phosphor.max_luma(),
     );
+    ctx.bloom_bind_groups
+        .update_downsample_thresholds(ctx.queue, ctx.bloom_params.threshold);
+    ctx.composite_pipeline
+        .update_uniforms(ctx.queue, ctx.bloom_params.intensity);
 
     if ctx.phosphor.needs_clear() {
         ctx.phosphor.encode_clear(ctx.encoder);
@@ -567,6 +687,9 @@ fn encode_scene_to_view(ctx: SceneRenderContext<'_>) {
         ctx.phosphor_blend_pipeline
             .draw(&mut pass, ctx.phosphor_bind_groups.blend(target_index));
     }
+
+    ctx.bloom_pipeline
+        .encode(ctx.encoder, ctx.bloom, ctx.bloom_bind_groups, target_index);
 
     {
         let mut pass = ctx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -851,6 +974,34 @@ impl PhosphorBlendUniforms {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct BloomDownsampleUniforms {
+    threshold_pad: [f32; 4],
+}
+
+impl BloomDownsampleUniforms {
+    fn new(threshold: f32) -> Self {
+        Self {
+            threshold_pad: [threshold.max(0.0), 0.0, 0.0, 0.0],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct CompositeUniforms {
+    bloom_intensity_pad: [f32; 4],
+}
+
+impl CompositeUniforms {
+    fn new(bloom_intensity: f32) -> Self {
+        Self {
+            bloom_intensity_pad: [bloom_intensity.max(0.0), 0.0, 0.0, 0.0],
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PhosphorFormatConfig {
     format: wgpu::TextureFormat,
@@ -1020,6 +1171,106 @@ impl PhosphorTexture {
     }
 }
 
+struct BloomTargets {
+    levels: Vec<BloomTexture>,
+    accum: Vec<BloomTexture>,
+    full: BloomTexture,
+}
+
+impl BloomTargets {
+    fn new(device: &wgpu::Device, size: PhysicalSize<u32>, format: wgpu::TextureFormat) -> Self {
+        let size = PhysicalSize::new(size.width.max(1), size.height.max(1));
+        let usage = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
+        let mut level_size = size;
+        let mut levels = Vec::with_capacity(tuning::BLOOM_MIP_LEVELS);
+        for level in 0..tuning::BLOOM_MIP_LEVELS {
+            level_size = half_size(level_size);
+            let label = format!("Bloom Downsample Level {level}");
+            levels.push(BloomTexture::new(device, &label, level_size, format, usage));
+        }
+
+        let mut accum = Vec::with_capacity(tuning::BLOOM_MIP_LEVELS.saturating_sub(1));
+        for (level, source) in levels
+            .iter()
+            .enumerate()
+            .take(tuning::BLOOM_MIP_LEVELS.saturating_sub(1))
+        {
+            let label = format!("Bloom Upsample Accum Level {level}");
+            accum.push(BloomTexture::new(
+                device,
+                &label,
+                source.size,
+                format,
+                usage,
+            ));
+        }
+
+        let full = BloomTexture::new(device, "Bloom Full Resolution", size, format, usage);
+
+        Self {
+            levels,
+            accum,
+            full,
+        }
+    }
+
+    fn level_view(&self, level: usize) -> &wgpu::TextureView {
+        &self.levels[level].view
+    }
+
+    fn accum_view(&self, level: usize) -> &wgpu::TextureView {
+        &self.accum[level].view
+    }
+
+    fn full_view(&self) -> &wgpu::TextureView {
+        &self.full.view
+    }
+}
+
+struct BloomTexture {
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    size: PhysicalSize<u32>,
+}
+
+impl BloomTexture {
+    fn new(
+        device: &wgpu::Device,
+        label: &str,
+        size: PhysicalSize<u32>,
+        format: wgpu::TextureFormat,
+        usage: wgpu::TextureUsages,
+    ) -> Self {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: size.width.max(1),
+                height: size.height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        Self {
+            _texture: texture,
+            view,
+            size: PhysicalSize::new(size.width.max(1), size.height.max(1)),
+        }
+    }
+}
+
+fn half_size(size: PhysicalSize<u32>) -> PhysicalSize<u32> {
+    PhysicalSize::new(
+        size.width.div_ceil(2).max(1),
+        size.height.div_ceil(2).max(1),
+    )
+}
+
 struct OutputTexture {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -1055,6 +1306,7 @@ impl PhosphorBindGroups {
     fn new(
         device: &wgpu::Device,
         phosphor: &PhosphorTargets,
+        bloom: &BloomTargets,
         blend_pipeline: &PhosphorBlendPipeline,
         composite_pipeline: &CompositePipeline,
     ) -> Self {
@@ -1073,11 +1325,13 @@ impl PhosphorBindGroups {
         let composite_0 = composite_pipeline.create_bind_group(
             device,
             phosphor.view(0),
+            bloom.full_view(),
             "Composite Bind Group Phosphor 0",
         );
         let composite_1 = composite_pipeline.create_bind_group(
             device,
             phosphor.view(1),
+            bloom.full_view(),
             "Composite Bind Group Phosphor 1",
         );
 
@@ -1093,6 +1347,104 @@ impl PhosphorBindGroups {
 
     fn composite(&self, target_index: usize) -> &wgpu::BindGroup {
         &self.composite[target_index]
+    }
+}
+
+struct BloomBindGroups {
+    down_from_phosphor: [BloomDownsampleBindGroup; 2],
+    down_chain: Vec<BloomDownsampleBindGroup>,
+    up: Vec<wgpu::BindGroup>,
+    final_up: wgpu::BindGroup,
+}
+
+impl BloomBindGroups {
+    fn new(
+        device: &wgpu::Device,
+        phosphor: &PhosphorTargets,
+        bloom: &BloomTargets,
+        pipeline: &BloomPipeline,
+    ) -> Self {
+        let down_from_phosphor_0 = pipeline.create_downsample_bind_group(
+            device,
+            phosphor.view(0),
+            "Bloom Downsample Bind Group Phosphor 0",
+        );
+        let down_from_phosphor_1 = pipeline.create_downsample_bind_group(
+            device,
+            phosphor.view(1),
+            "Bloom Downsample Bind Group Phosphor 1",
+        );
+
+        let mut down_chain = Vec::with_capacity(tuning::BLOOM_MIP_LEVELS.saturating_sub(1));
+        for level in 1..tuning::BLOOM_MIP_LEVELS {
+            let label = format!("Bloom Downsample Bind Group Level {level}");
+            down_chain.push(pipeline.create_downsample_bind_group(
+                device,
+                bloom.level_view(level - 1),
+                &label,
+            ));
+        }
+
+        let mut up = Vec::with_capacity(tuning::BLOOM_MIP_LEVELS.saturating_sub(1));
+        for target_level in 0..tuning::BLOOM_MIP_LEVELS.saturating_sub(1) {
+            let lower_source = if target_level + 1 == tuning::BLOOM_MIP_LEVELS - 1 {
+                bloom.level_view(target_level + 1)
+            } else {
+                bloom.accum_view(target_level + 1)
+            };
+            let label = format!("Bloom Upsample Bind Group Level {target_level}");
+            up.push(pipeline.create_upsample_bind_group(
+                device,
+                lower_source,
+                bloom.level_view(target_level),
+                &label,
+            ));
+        }
+
+        let final_up = pipeline.create_final_upsample_bind_group(
+            device,
+            bloom.accum_view(0),
+            "Bloom Final Upsample Bind Group",
+        );
+
+        Self {
+            down_from_phosphor: [down_from_phosphor_0, down_from_phosphor_1],
+            down_chain,
+            up,
+            final_up,
+        }
+    }
+
+    fn update_downsample_thresholds(&self, queue: &wgpu::Queue, threshold: f32) {
+        for pass in &self.down_from_phosphor {
+            pass.update_threshold(queue, threshold);
+        }
+        for pass in &self.down_chain {
+            pass.update_threshold(queue, 0.0);
+        }
+    }
+
+    fn down_from_phosphor(&self, target_index: usize) -> &wgpu::BindGroup {
+        &self.down_from_phosphor[target_index].bind_group
+    }
+
+    fn down_chain(&self, level: usize) -> &wgpu::BindGroup {
+        &self.down_chain[level - 1].bind_group
+    }
+}
+
+struct BloomDownsampleBindGroup {
+    bind_group: wgpu::BindGroup,
+    uniform_buffer: wgpu::Buffer,
+}
+
+impl BloomDownsampleBindGroup {
+    fn update_threshold(&self, queue: &wgpu::Queue, threshold: f32) {
+        queue.write_buffer(
+            &self.uniform_buffer,
+            0,
+            bytemuck::bytes_of(&BloomDownsampleUniforms::new(threshold)),
+        );
     }
 }
 
@@ -1355,9 +1707,259 @@ impl PhosphorBlendPipeline {
     }
 }
 
+struct BloomPipeline {
+    downsample_pipeline: wgpu::RenderPipeline,
+    upsample_pipeline: wgpu::RenderPipeline,
+    final_upsample_pipeline: wgpu::RenderPipeline,
+    downsample_bind_group_layout: wgpu::BindGroupLayout,
+    upsample_bind_group_layout: wgpu::BindGroupLayout,
+    final_upsample_bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl BloomPipeline {
+    fn new(device: &wgpu::Device, bloom_format: wgpu::TextureFormat) -> Self {
+        let downsample_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Bloom Downsample Shader"),
+            source: wgpu::ShaderSource::Wgsl(BLOOM_DOWNSAMPLE_SHADER.into()),
+        });
+        let upsample_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Bloom Upsample Shader"),
+            source: wgpu::ShaderSource::Wgsl(BLOOM_UPSAMPLE_SHADER.into()),
+        });
+        let final_upsample_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Bloom Final Upsample Shader"),
+            source: wgpu::ShaderSource::Wgsl(BLOOM_FINAL_UPSAMPLE_SHADER.into()),
+        });
+        let downsample_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Bloom Downsample Bind Group Layout"),
+                entries: &[
+                    texture_bind_group_layout_entry(0, texture_sample_filterable(bloom_format)),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let upsample_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Bloom Upsample Bind Group Layout"),
+                entries: &[
+                    texture_bind_group_layout_entry(0, texture_sample_filterable(bloom_format)),
+                    texture_bind_group_layout_entry(1, texture_sample_filterable(bloom_format)),
+                ],
+            });
+        let final_upsample_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Bloom Final Upsample Bind Group Layout"),
+                entries: &[texture_bind_group_layout_entry(
+                    0,
+                    texture_sample_filterable(bloom_format),
+                )],
+            });
+        let downsample_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Bloom Downsample Pipeline Layout"),
+            bind_group_layouts: &[Some(&downsample_bind_group_layout)],
+            immediate_size: 0,
+        });
+        let upsample_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Bloom Upsample Pipeline Layout"),
+            bind_group_layouts: &[Some(&upsample_bind_group_layout)],
+            immediate_size: 0,
+        });
+        let final_upsample_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Bloom Final Upsample Pipeline Layout"),
+                bind_group_layouts: &[Some(&final_upsample_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let downsample_pipeline = fullscreen_pipeline(
+            device,
+            &downsample_layout,
+            &downsample_shader,
+            bloom_format,
+            "Bloom Downsample Pipeline",
+        );
+        let upsample_pipeline = fullscreen_pipeline(
+            device,
+            &upsample_layout,
+            &upsample_shader,
+            bloom_format,
+            "Bloom Upsample Pipeline",
+        );
+        let final_upsample_pipeline = fullscreen_pipeline(
+            device,
+            &final_upsample_layout,
+            &final_upsample_shader,
+            bloom_format,
+            "Bloom Final Upsample Pipeline",
+        );
+
+        Self {
+            downsample_pipeline,
+            upsample_pipeline,
+            final_upsample_pipeline,
+            downsample_bind_group_layout,
+            upsample_bind_group_layout,
+            final_upsample_bind_group_layout,
+        }
+    }
+
+    fn create_downsample_bind_group(
+        &self,
+        device: &wgpu::Device,
+        source_view: &wgpu::TextureView,
+        label: &str,
+    ) -> BloomDownsampleBindGroup {
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Bloom Downsample Uniform Buffer"),
+            size: size_of::<BloomDownsampleUniforms>() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &self.downsample_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(source_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        BloomDownsampleBindGroup {
+            bind_group,
+            uniform_buffer,
+        }
+    }
+
+    fn create_upsample_bind_group(
+        &self,
+        device: &wgpu::Device,
+        lower_source_view: &wgpu::TextureView,
+        base_view: &wgpu::TextureView,
+        label: &str,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &self.upsample_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(lower_source_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(base_view),
+                },
+            ],
+        })
+    }
+
+    fn create_final_upsample_bind_group(
+        &self,
+        device: &wgpu::Device,
+        source_view: &wgpu::TextureView,
+        label: &str,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &self.final_upsample_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(source_view),
+            }],
+        })
+    }
+
+    fn encode(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        bloom: &BloomTargets,
+        bind_groups: &BloomBindGroups,
+        phosphor_index: usize,
+    ) {
+        self.draw_to_view(
+            encoder,
+            &self.downsample_pipeline,
+            bind_groups.down_from_phosphor(phosphor_index),
+            bloom.level_view(0),
+            "Asteroids Bloom Downsample Pass 0",
+        );
+
+        for level in 1..tuning::BLOOM_MIP_LEVELS {
+            self.draw_to_view(
+                encoder,
+                &self.downsample_pipeline,
+                bind_groups.down_chain(level),
+                bloom.level_view(level),
+                "Asteroids Bloom Downsample Pass",
+            );
+        }
+
+        for target_level in (0..tuning::BLOOM_MIP_LEVELS.saturating_sub(1)).rev() {
+            self.draw_to_view(
+                encoder,
+                &self.upsample_pipeline,
+                &bind_groups.up[target_level],
+                bloom.accum_view(target_level),
+                "Asteroids Bloom Upsample Accum Pass",
+            );
+        }
+
+        self.draw_to_view(
+            encoder,
+            &self.final_upsample_pipeline,
+            &bind_groups.final_up,
+            bloom.full_view(),
+            "Asteroids Bloom Final Upsample Pass",
+        );
+    }
+
+    fn draw_to_view(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pipeline: &wgpu::RenderPipeline,
+        bind_group: &wgpu::BindGroup,
+        target_view: &wgpu::TextureView,
+        label: &'static str,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(label),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
+
 struct CompositePipeline {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    uniform_buffer: wgpu::Buffer,
 }
 
 impl CompositePipeline {
@@ -1365,6 +1967,7 @@ impl CompositePipeline {
         device: &wgpu::Device,
         target_format: wgpu::TextureFormat,
         phosphor_format: wgpu::TextureFormat,
+        bloom_format: wgpu::TextureFormat,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Phosphor Composite Shader"),
@@ -1372,10 +1975,26 @@ impl CompositePipeline {
         });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Composite Bind Group Layout"),
-            entries: &[texture_bind_group_layout_entry(
-                0,
-                texture_sample_filterable(phosphor_format),
-            )],
+            entries: &[
+                texture_bind_group_layout_entry(0, texture_sample_filterable(phosphor_format)),
+                texture_bind_group_layout_entry(1, texture_sample_filterable(bloom_format)),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Composite Uniform Buffer"),
+            size: size_of::<CompositeUniforms>() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Composite Pipeline Layout"),
@@ -1393,22 +2012,42 @@ impl CompositePipeline {
         Self {
             pipeline,
             bind_group_layout,
+            uniform_buffer,
         }
+    }
+
+    fn update_uniforms(&self, queue: &wgpu::Queue, bloom_intensity: f32) {
+        queue.write_buffer(
+            &self.uniform_buffer,
+            0,
+            bytemuck::bytes_of(&CompositeUniforms::new(bloom_intensity)),
+        );
     }
 
     fn create_bind_group(
         &self,
         device: &wgpu::Device,
         phosphor_view: &wgpu::TextureView,
+        bloom_view: &wgpu::TextureView,
         label: &'static str,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(label),
             layout: &self.bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(phosphor_view),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(phosphor_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(bloom_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.uniform_buffer.as_entire_binding(),
+                },
+            ],
         })
     }
 
@@ -1628,13 +2267,195 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
-const COMPOSITE_SHADER: &str = r#"
+const BLOOM_DOWNSAMPLE_SHADER: &str = r#"
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+};
+
+struct BloomDownsampleUniforms {
+    threshold_pad: vec4<f32>,
+};
+
+@group(0) @binding(0)
+var source_texture: texture_2d<f32>;
+@group(0) @binding(1)
+var<uniform> bloom: BloomDownsampleUniforms;
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -3.0),
+        vec2<f32>(-1.0,  1.0),
+        vec2<f32>( 3.0,  1.0),
+    );
+    var output: VertexOutput;
+    output.position = vec4<f32>(positions[vertex_index], 0.0, 1.0);
+    return output;
+}
+
+fn clamp_coord(coord: vec2<i32>, size: vec2<i32>) -> vec2<i32> {
+    return min(max(coord, vec2<i32>(0, 0)), max(size - vec2<i32>(1, 1), vec2<i32>(0, 0)));
+}
+
+fn prefilter(color: vec3<f32>) -> vec3<f32> {
+    let threshold = max(bloom.threshold_pad.x, 0.0);
+    if threshold <= 0.000001 {
+        return color;
+    }
+    let luma = max(max(color.r, color.g), color.b);
+    let scale = max(luma - threshold, 0.0) / max(luma, 0.0001);
+    return color * scale;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let size = vec2<i32>(textureDimensions(source_texture));
+    let coord = vec2<i32>(input.position.xy) * 2;
+    var weights = array<f32, 5>(1.0, 4.0, 6.0, 4.0, 1.0);
+    var sum = vec3<f32>(0.0);
+
+    for (var y: u32 = 0u; y < 5u; y = y + 1u) {
+        for (var x: u32 = 0u; x < 5u; x = x + 1u) {
+            let offset = vec2<i32>(i32(x) - 2, i32(y) - 2);
+            let sample_coord = clamp_coord(coord + offset, size);
+            let sample = max(textureLoad(source_texture, sample_coord, 0).rgb, vec3<f32>(0.0));
+            sum += prefilter(sample) * weights[x] * weights[y];
+        }
+    }
+
+    return vec4<f32>(sum / 256.0, 1.0);
+}
+"#;
+
+const BLOOM_UPSAMPLE_SHADER: &str = r#"
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
 };
 
 @group(0) @binding(0)
+var lower_texture: texture_2d<f32>;
+@group(0) @binding(1)
+var base_texture: texture_2d<f32>;
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -3.0),
+        vec2<f32>(-1.0,  1.0),
+        vec2<f32>( 3.0,  1.0),
+    );
+    var output: VertexOutput;
+    output.position = vec4<f32>(positions[vertex_index], 0.0, 1.0);
+    return output;
+}
+
+fn clamp_coord(coord: vec2<i32>, size: vec2<i32>) -> vec2<i32> {
+    return min(max(coord, vec2<i32>(0, 0)), max(size - vec2<i32>(1, 1), vec2<i32>(0, 0)));
+}
+
+fn sample_lower_bilinear(pixel: vec2<f32>) -> vec3<f32> {
+    let size = vec2<i32>(textureDimensions(lower_texture));
+    let base = vec2<i32>(floor(pixel));
+    let frac = pixel - floor(pixel);
+    let c00 = max(textureLoad(lower_texture, clamp_coord(base, size), 0).rgb, vec3<f32>(0.0));
+    let c10 = max(textureLoad(lower_texture, clamp_coord(base + vec2<i32>(1, 0), size), 0).rgb, vec3<f32>(0.0));
+    let c01 = max(textureLoad(lower_texture, clamp_coord(base + vec2<i32>(0, 1), size), 0).rgb, vec3<f32>(0.0));
+    let c11 = max(textureLoad(lower_texture, clamp_coord(base + vec2<i32>(1, 1), size), 0).rgb, vec3<f32>(0.0));
+    return mix(mix(c00, c10, frac.x), mix(c01, c11, frac.x), frac.y);
+}
+
+fn sample_lower_gaussian(pixel: vec2<f32>) -> vec3<f32> {
+    var weights = array<f32, 3>(1.0, 2.0, 1.0);
+    var sum = vec3<f32>(0.0);
+    for (var y: u32 = 0u; y < 3u; y = y + 1u) {
+        for (var x: u32 = 0u; x < 3u; x = x + 1u) {
+            let offset = vec2<f32>(f32(i32(x) - 1), f32(i32(y) - 1));
+            sum += sample_lower_bilinear(pixel + offset) * weights[x] * weights[y];
+        }
+    }
+    return sum / 16.0;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let base_size = vec2<i32>(textureDimensions(base_texture));
+    let coord = vec2<i32>(input.position.xy);
+    let base = max(textureLoad(base_texture, clamp_coord(coord, base_size), 0).rgb, vec3<f32>(0.0));
+    let lower_pixel = input.position.xy * 0.5 - vec2<f32>(0.25);
+    let glow = sample_lower_gaussian(lower_pixel);
+    return vec4<f32>(base + glow, 1.0);
+}
+"#;
+
+const BLOOM_FINAL_UPSAMPLE_SHADER: &str = r#"
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+};
+
+@group(0) @binding(0)
+var source_texture: texture_2d<f32>;
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -3.0),
+        vec2<f32>(-1.0,  1.0),
+        vec2<f32>( 3.0,  1.0),
+    );
+    var output: VertexOutput;
+    output.position = vec4<f32>(positions[vertex_index], 0.0, 1.0);
+    return output;
+}
+
+fn clamp_coord(coord: vec2<i32>, size: vec2<i32>) -> vec2<i32> {
+    return min(max(coord, vec2<i32>(0, 0)), max(size - vec2<i32>(1, 1), vec2<i32>(0, 0)));
+}
+
+fn sample_source_bilinear(pixel: vec2<f32>) -> vec3<f32> {
+    let size = vec2<i32>(textureDimensions(source_texture));
+    let base = vec2<i32>(floor(pixel));
+    let frac = pixel - floor(pixel);
+    let c00 = max(textureLoad(source_texture, clamp_coord(base, size), 0).rgb, vec3<f32>(0.0));
+    let c10 = max(textureLoad(source_texture, clamp_coord(base + vec2<i32>(1, 0), size), 0).rgb, vec3<f32>(0.0));
+    let c01 = max(textureLoad(source_texture, clamp_coord(base + vec2<i32>(0, 1), size), 0).rgb, vec3<f32>(0.0));
+    let c11 = max(textureLoad(source_texture, clamp_coord(base + vec2<i32>(1, 1), size), 0).rgb, vec3<f32>(0.0));
+    return mix(mix(c00, c10, frac.x), mix(c01, c11, frac.x), frac.y);
+}
+
+fn sample_source_gaussian(pixel: vec2<f32>) -> vec3<f32> {
+    var weights = array<f32, 3>(1.0, 2.0, 1.0);
+    var sum = vec3<f32>(0.0);
+    for (var y: u32 = 0u; y < 3u; y = y + 1u) {
+        for (var x: u32 = 0u; x < 3u; x = x + 1u) {
+            let offset = vec2<f32>(f32(i32(x) - 1), f32(i32(y) - 1));
+            sum += sample_source_bilinear(pixel + offset) * weights[x] * weights[y];
+        }
+    }
+    return sum / 16.0;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let source_pixel = input.position.xy * 0.5 - vec2<f32>(0.25);
+    return vec4<f32>(sample_source_gaussian(source_pixel), 1.0);
+}
+"#;
+
+const COMPOSITE_SHADER: &str = r#"
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+};
+
+struct CompositeUniforms {
+    bloom_intensity_pad: vec4<f32>,
+};
+
+@group(0) @binding(0)
 var phosphor_texture: texture_2d<f32>;
+@group(0) @binding(1)
+var bloom_texture: texture_2d<f32>;
+@group(0) @binding(2)
+var<uniform> composite: CompositeUniforms;
 
 @vertex
 fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
@@ -1651,7 +2472,11 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let coord = vec2<i32>(input.position.xy);
-    let hdr = max(textureLoad(phosphor_texture, coord, 0).rgb, vec3<f32>(0.0));
+    let phosphor = max(textureLoad(phosphor_texture, coord, 0).rgb, vec3<f32>(0.0));
+    let bloom = max(textureLoad(bloom_texture, coord, 0).rgb, vec3<f32>(0.0));
+    let phosphor_luma = max(max(phosphor.r, phosphor.g), phosphor.b);
+    let core_guard = 1.0 - smoothstep(0.35, 0.72, phosphor_luma);
+    let hdr = phosphor + bloom * composite.bloom_intensity_pad.x * core_guard;
     let reinhard = hdr / (hdr + vec3<f32>(1.0));
     let gamma_encoded = pow(clamp(reinhard, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
 

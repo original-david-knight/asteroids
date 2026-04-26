@@ -17,3 +17,16 @@ pub const PHOSPHOR_TAU_MAX_MS: f32 = 100.0;
 pub const PHOSPHOR_TAU_STEP_MS: f32 = 5.0;
 pub const PHOSPHOR_MAX_LUMA: f32 = 8.0;
 pub const PHOSPHOR_FALLBACK_MAX_LUMA: f32 = 1.0;
+
+/// Number of half-resolution bloom levels below the phosphor target.
+pub const BLOOM_MIP_LEVELS: usize = 4;
+/// Default bloom is intentionally restrained: enough to widen the glow, not the line core.
+pub const BLOOM_INTENSITY_DEFAULT: f32 = 1.90;
+/// HDR phosphor luma threshold used by the first Gaussian downsample prefilter.
+pub const BLOOM_THRESHOLD_DEFAULT: f32 = 0.20;
+pub const BLOOM_INTENSITY_MIN: f32 = 0.0;
+pub const BLOOM_INTENSITY_MAX: f32 = 3.0;
+pub const BLOOM_INTENSITY_STEP: f32 = 0.05;
+pub const BLOOM_THRESHOLD_MIN: f32 = 0.0;
+pub const BLOOM_THRESHOLD_MAX: f32 = 4.0;
+pub const BLOOM_THRESHOLD_STEP: f32 = 0.05;

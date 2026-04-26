@@ -165,15 +165,7 @@ fn cmd_banding(args: &mut CliArgs) -> Result<(), String> {
     let image = verify::load_png(&args.path("--frame")?)?;
     let max_step_jump = args.value("--max-step-jump")?;
     args.finish()?;
-    let values = verify::line_luminance(
-        &image,
-        (0.0, image.height as f32 * 0.5),
-        (
-            image.width.saturating_sub(1) as f32,
-            image.height as f32 * 0.5,
-        ),
-        image.width.min(1024) as usize,
-    );
+    let values = banding_luminance_values(&image);
     let max_jump = values
         .windows(2)
         .map(|pair| (pair[1] - pair[0]).abs())
@@ -435,6 +427,54 @@ fn estimated_fwhm_width(image: &verify::PngImage) -> f32 {
     } else {
         row_width.min(col_width)
     }
+}
+
+fn banding_luminance_values(image: &verify::PngImage) -> Vec<f32> {
+    let (_, peak_y, peak_luma) = brightest_pixel(image);
+    if peak_luma <= 0.0 {
+        return horizontal_luminance_values(image, image.height / 2);
+    }
+
+    let min_signal = (peak_luma * 0.02).max(0.003);
+    let target_signal = peak_luma * 0.25;
+    let max_signal = peak_luma * 0.55;
+    let max_offset = (image.height / 3).clamp(1, 512) as i32;
+    let mut best: Option<(f32, i32, Vec<f32>)> = None;
+
+    for offset in 1..=max_offset {
+        for sign in [1_i32, -1_i32] {
+            let y = peak_y as i32 + offset * sign;
+            if y < 0 || y >= image.height as i32 {
+                continue;
+            }
+
+            let values = horizontal_luminance_values(image, y as u32);
+            let row_max = values.iter().copied().fold(0.0_f32, f32::max);
+            if row_max < min_signal || row_max > max_signal {
+                continue;
+            }
+
+            let score = (row_max - target_signal).abs();
+            if best.as_ref().is_none_or(|(best_score, best_offset, _)| {
+                score < *best_score || (score == *best_score && offset < best_offset.abs())
+            }) {
+                best = Some((score, offset * sign, values));
+            }
+        }
+    }
+
+    best.map(|(_, _, values)| values)
+        .unwrap_or_else(|| horizontal_luminance_values(image, image.height / 2))
+}
+
+fn horizontal_luminance_values(image: &verify::PngImage, y: u32) -> Vec<f32> {
+    let y = y.min(image.height.saturating_sub(1)) as f32;
+    verify::line_luminance(
+        image,
+        (0.0, y),
+        (image.width.saturating_sub(1) as f32, y),
+        image.width.min(1024) as usize,
+    )
 }
 
 fn fwhm_width_1d(values: &[f32], peak_index: usize) -> f32 {

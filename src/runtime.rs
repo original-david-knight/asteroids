@@ -12,7 +12,7 @@ use crate::{
     audio,
     renderer::{FrameParams, HeadlessRenderer, Scenario},
     rng::{SeededRng, rng_for_seed},
-    verify,
+    tuning, verify,
 };
 
 const DEFAULT_FIXED_DT_SECONDS: f32 = 1.0 / 144.0;
@@ -32,6 +32,8 @@ pub struct RuntimeConfig {
     pub xrun_log: Option<PathBuf>,
     pub frame_time_log: Option<PathBuf>,
     pub state_log: Option<PathBuf>,
+    pub bloom_intensity: f32,
+    pub bloom_threshold: f32,
     saw_flag: bool,
 }
 
@@ -51,6 +53,8 @@ impl Default for RuntimeConfig {
             xrun_log: None,
             frame_time_log: None,
             state_log: None,
+            bloom_intensity: tuning::BLOOM_INTENSITY_DEFAULT,
+            bloom_threshold: tuning::BLOOM_THRESHOLD_DEFAULT,
             saw_flag: false,
         }
     }
@@ -93,6 +97,12 @@ impl RuntimeConfig {
                     config.frame_time_log = Some(next_path(&mut args, "--frame-time-log")?)
                 }
                 "--state-log" => config.state_log = Some(next_path(&mut args, "--state-log")?),
+                "--bloom-intensity" => {
+                    config.bloom_intensity = next_value(&mut args, "--bloom-intensity")?
+                }
+                "--bloom-threshold" => {
+                    config.bloom_threshold = next_value(&mut args, "--bloom-threshold")?
+                }
                 _ => return Err(format!("unknown argument '{arg}'\n\n{}", runtime_usage())),
             }
         }
@@ -123,6 +133,12 @@ impl RuntimeConfig {
         if matches!(self.audio_capture_secs, Some(secs) if !secs.is_finite() || secs < 0.0) {
             return Err("--audio-capture must be finite and non-negative".to_string());
         }
+        if !self.bloom_intensity.is_finite() || self.bloom_intensity < tuning::BLOOM_INTENSITY_MIN {
+            return Err("--bloom-intensity must be a finite non-negative number".to_string());
+        }
+        if !self.bloom_threshold.is_finite() || self.bloom_threshold < tuning::BLOOM_THRESHOLD_MIN {
+            return Err("--bloom-threshold must be a finite non-negative number".to_string());
+        }
         Ok(())
     }
 }
@@ -144,13 +160,16 @@ pub async fn run_automated(config: &RuntimeConfig) -> Result<(), String> {
     let fixed_dt = config.fixed_dt.unwrap_or(DEFAULT_FIXED_DT_SECONDS);
     let render_size = headless_render_size();
     let mut renderer = HeadlessRenderer::new(render_size).await?;
+    renderer.set_bloom_params(config.bloom_intensity, config.bloom_threshold);
     eprintln!(
-        "headless render: {}x{}, phosphor={:?}, scenario={}, seed={}",
+        "headless render: {}x{}, phosphor={:?}, scenario={}, seed={}, bloom_intensity={:.3}, bloom_threshold={:.3}",
         renderer.size().width,
         renderer.size().height,
         renderer.phosphor_format(),
         config.scenario.name(),
-        config.seed.unwrap_or(0)
+        config.seed.unwrap_or(0),
+        config.bloom_intensity,
+        config.bloom_threshold,
     );
 
     let mut frame_time_log = optional_writer(config.frame_time_log.as_deref())?;
@@ -245,7 +264,7 @@ pub async fn run_automated(config: &RuntimeConfig) -> Result<(), String> {
 }
 
 pub fn runtime_usage() -> String {
-    "Usage: asteroids [--headless] [--screenshot <path>] [--capture-frames <N> --frames-out <dir>] [--audio-capture <secs> --wav-out <path>] [--seed <u64>] [--fixed-dt <secs>] [--simulate-secs <secs>] [--scenario <name>] [--xrun-log <path>] [--frame-time-log <path>] [--state-log <path>]\n\nScenarios: demo, idle, horizontal-sweep, static-bright-line, static-bright-line-low-dwell, static-bright-line-high-dwell, gamma-ramp".to_string()
+    "Usage: asteroids [--headless] [--screenshot <path>] [--capture-frames <N> --frames-out <dir>] [--audio-capture <secs> --wav-out <path>] [--seed <u64>] [--fixed-dt <secs>] [--simulate-secs <secs>] [--scenario <name>] [--xrun-log <path>] [--frame-time-log <path>] [--state-log <path>] [--bloom-intensity <value>] [--bloom-threshold <value>]\n\nScenarios: demo, idle, horizontal-sweep, static-bright-line, static-bright-line-low-dwell, static-bright-line-high-dwell, gamma-ramp".to_string()
 }
 
 fn render_tick(
@@ -415,6 +434,10 @@ mod tests {
                 "idle",
                 "--screenshot",
                 "/tmp/idle.png",
+                "--bloom-intensity",
+                "0.5",
+                "--bloom-threshold",
+                "0.25",
             ]
             .into_iter()
             .map(str::to_string),
@@ -425,6 +448,8 @@ mod tests {
         assert_eq!(config.seed, Some(1));
         assert_eq!(config.fixed_dt, Some(0.00694));
         assert_eq!(config.scenario, Scenario::Idle);
+        assert_eq!(config.bloom_intensity, 0.5);
+        assert_eq!(config.bloom_threshold, 0.25);
         assert!(!config.should_run_interactive());
     }
 

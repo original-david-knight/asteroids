@@ -244,7 +244,7 @@ tasks:
         Add the bloom output to the phosphor output before the composite tone-map step.
         Expose bloom intensity and threshold as debug-tunable values (so the polish-pass step can dial them in).
         Bloom strength must be subtle enough that vector lines still read as lines, not as smeared blobs - tune by feel and record the default values chosen.
-      status: todo
+      status: done
       workflow: implement
       deps:
         - checkpoint-phosphor-trail

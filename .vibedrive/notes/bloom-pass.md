@@ -1,0 +1,1 @@
+Implemented 4-level Gaussian bloom downsample/upsample chain before tone map. Review fixes restored the finite static line, fixed clippy, and made banding sample the halo rather than the beam core. Defaults: bloom_intensity=1.90, bloom_threshold=0.20. Required line-glow-width and banding checks pass; curvature remains optional/deferred.
