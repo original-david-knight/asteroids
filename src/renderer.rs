@@ -1485,6 +1485,8 @@ fn wrap_attract_coordinate(value: f32) -> f32 {
     (value + 1.0).rem_euclid(2.0) - 1.0
 }
 
+const BLOCK_TEXT_STROKE_OFFSET_NDC: f32 = 0.0032;
+
 fn emit_block_text(
     emitter: &mut BeamEmitter,
     text: &str,
@@ -1608,7 +1610,18 @@ fn emit_block_glyph(emitter: &mut BeamEmitter, ch: char, origin: Vec2, size: Vec
         _ => Vec::new(),
     };
     for (start, end) in segments {
-        emitter.emit_ship_outline_segment_with_endpoint_bonus(start, end, intensity);
+        emit_block_text_segment(emitter, start, end, intensity);
+    }
+}
+
+fn emit_block_text_segment(emitter: &mut BeamEmitter, start: Vec2, end: Vec2, intensity: f32) {
+    let normal = beam::segment_left_perpendicular(start, end) * BLOCK_TEXT_STROKE_OFFSET_NDC;
+    for offset in [Vec2::ZERO, normal, -normal] {
+        emitter.emit_ship_outline_segment_with_endpoint_bonus(
+            start + offset,
+            end + offset,
+            intensity,
+        );
     }
 }
 
@@ -1734,7 +1747,12 @@ impl BeamUniforms {
                 tuning::BEAM_SIGMA_PIXELS,
                 tuning::SHIP_OUTLINE_SEGMENT_DWELL_US,
             ],
-            growth_max_luma_pad: [tuning::BEAM_SIGMA_DWELL_GROWTH, max_luma, 0.0, 0.0],
+            growth_max_luma_pad: [
+                tuning::BEAM_SIGMA_DWELL_GROWTH,
+                max_luma,
+                tuning::BEAM_CORE_RADIUS_PIXELS,
+                0.0,
+            ],
             default_color_pad: [red, green, blue, 0.0],
         }
     }
@@ -3003,7 +3021,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let sigma_growth = beam.growth_max_luma_pad.x;
     let sigma = base_sigma * (1.0 + sigma_growth * max(dwell_factor - 1.0, 0.0));
     let sigma_sq = max(sigma * sigma, 0.0001);
-    let brightness = input.intensity * dwell_factor * exp(-(distance * distance) / sigma_sq);
+    let core_radius = max(beam.growth_max_luma_pad.z, 0.0);
+    let falloff_distance = max(distance - core_radius, 0.0);
+    let brightness = input.intensity * dwell_factor * exp(-(falloff_distance * falloff_distance) / sigma_sq);
     let luma = clamp(brightness, 0.0, beam.growth_max_luma_pad.y);
     let beam_color = max(beam.default_color_pad.rgb, vec3<f32>(0.0));
 

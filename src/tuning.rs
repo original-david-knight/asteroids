@@ -42,10 +42,12 @@ pub const ASTEROID_MEDIUM_RADIUS_UNITS: f32 = 15.0;
 pub const ASTEROID_SMALL_RADIUS_UNITS: f32 = 7.0;
 
 pub const BEAM_QUAD_HALF_WIDTH_PIXELS: f32 = 6.0;
-/// Final v1 beam spot radius in physical pixels.
-pub const BEAM_SIGMA_PIXELS: f32 = 1.0;
+/// Flat center of the vector beam in physical pixels.
+pub const BEAM_CORE_RADIUS_PIXELS: f32 = 1.35;
+/// Soft edge falloff around the solid beam core in physical pixels.
+pub const BEAM_SIGMA_PIXELS: f32 = 0.85;
 /// Extra spot growth when dwell rises above the ship-line reference dwell.
-pub const BEAM_SIGMA_DWELL_GROWTH: f32 = 0.50;
+pub const BEAM_SIGMA_DWELL_GROWTH: f32 = 0.15;
 
 pub const PHOSPHOR_TRAIL_LOW_DWELL_US: f32 = 10.0;
 pub const PHOSPHOR_TRAIL_MID_DWELL_US: f32 = SHIP_OUTLINE_SEGMENT_DWELL_US;
@@ -61,11 +63,12 @@ pub const PHOSPHOR_MAX_LUMA: f32 = 8.0;
 pub const PHOSPHOR_FALLBACK_MAX_LUMA: f32 = 1.0;
 
 /// Number of half-resolution bloom levels below the phosphor target.
-pub const BLOOM_MIP_LEVELS: usize = 4;
-/// Default bloom is intentionally restrained: enough to widen the glow, not the line core.
-pub const BLOOM_INTENSITY_DEFAULT: f32 = 1.90;
+pub const BLOOM_MIP_LEVELS: usize = 2;
+/// Default bloom is intentionally subtle: a readable CRT halo without burying
+/// vector lines and title text under the glow.
+pub const BLOOM_INTENSITY_DEFAULT: f32 = 0.02;
 /// HDR phosphor luma threshold used by the first Gaussian downsample prefilter.
-pub const BLOOM_THRESHOLD_DEFAULT: f32 = 0.20;
+pub const BLOOM_THRESHOLD_DEFAULT: f32 = 1.00;
 pub const BLOOM_INTENSITY_MIN: f32 = 0.0;
 pub const BLOOM_INTENSITY_MAX: f32 = 3.0;
 pub const BLOOM_INTENSITY_STEP: f32 = 0.05;
