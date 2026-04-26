@@ -389,7 +389,7 @@ tasks:
         At this step a silent (0.0 sample) graph is acceptable - the next task brings the first audible voice. Verify zero xruns under idle on the user's machine.
         Constraint reminder: synthesis only, no sample WAVs (DESIGN.md Constraints). The cpal stream feeds samples computed by fundsp, never decoded from disk.
         Input-latency target: the audio block is ~5.3ms @ 256/48kHz, contributing to the DESIGN.md "low input latency" constraint. Do not increase the block size beyond what the backend chooses.
-      status: todo
+      status: done
       workflow: implement
       deps:
         - final-composite

@@ -3,6 +3,7 @@ use std::{
     fs::{self, File},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
+    sync::atomic::Ordering,
     time::Instant,
 };
 
@@ -144,18 +145,32 @@ impl RuntimeConfig {
 }
 
 pub async fn run_automated(config: &RuntimeConfig) -> Result<(), String> {
-    if let Some(path) = &config.xrun_log {
-        create_empty_file(path)?;
-    }
-    let audio_writer =
-        if let (Some(secs), Some(path)) = (config.audio_capture_secs, &config.wav_out) {
-            Some((
+    let audio_writer = if let (Some(secs), Some(path)) =
+        (config.audio_capture_secs, &config.wav_out)
+    {
+        let (capture_producer, capture_consumer, capture_xruns) = audio::audio_capture_channel();
+        let scaffold = audio::AudioScaffold::new();
+        let (audio_sender, receiver, voices) = scaffold.into_parts();
+        let runtime = audio::AudioRuntime::start(receiver, voices, Some(capture_producer))?;
+        eprintln!("{}", runtime.info().startup_summary());
+        Some((
+            path.clone(),
+            audio::spawn_captured_wav_writer(
                 path.clone(),
-                audio::spawn_silent_wav_writer(path.clone(), secs),
-            ))
-        } else {
-            None
-        };
+                secs,
+                runtime.sample_rate(),
+                capture_consumer,
+            ),
+            runtime,
+            audio_sender,
+            capture_xruns,
+        ))
+    } else {
+        if let Some(path) = &config.xrun_log {
+            create_empty_file(path)?;
+        }
+        None
+    };
 
     let fixed_dt = config.fixed_dt.unwrap_or(DEFAULT_FIXED_DT_SECONDS);
     let render_size = headless_render_size();
@@ -254,11 +269,21 @@ pub async fn run_automated(config: &RuntimeConfig) -> Result<(), String> {
             .flush()
             .map_err(|error| format!("failed to flush state log: {error}"))?;
     }
-    if let Some((path, handle)) = audio_writer {
+    if let Some((path, handle, runtime, _audio_sender, capture_xruns)) = audio_writer {
         handle
             .join()
-            .map_err(|_| format!("silent WAV writer panicked for {}", path.display()))?
-            .map_err(|error| format!("failed to write silent WAV {}: {error}", path.display()))?;
+            .map_err(|_| format!("captured WAV writer panicked for {}", path.display()))?
+            .map_err(|error| format!("failed to write captured WAV {}: {error}", path.display()))?;
+        let xrun_count = runtime.stream_error_count() + capture_xruns.load(Ordering::Relaxed);
+        if xrun_count > 0
+            && let Some(error) = runtime.first_stream_error()
+        {
+            eprintln!("audio stream first error: {error}");
+        }
+        if let Some(path) = &config.xrun_log {
+            audio::write_xrun_log(path, xrun_count)
+                .map_err(|error| format!("failed to write xrun log {}: {error}", path.display()))?;
+        }
     }
     Ok(())
 }

@@ -1,7 +1,7 @@
 use std::{error::Error, sync::Arc};
 
 use asteroids::{
-    audio::{self, AudioScaffold},
+    audio::{AudioMsgSender, AudioRuntime, AudioScaffold},
     renderer::{self, Renderer},
     runtime::{self, RuntimeConfig},
     tuning,
@@ -45,7 +45,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 struct AsteroidsApp {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
-    audio: AudioScaffold,
+    audio: Option<AudioScaffold>,
+    audio_sender: Option<AudioMsgSender>,
+    audio_runtime: Option<AudioRuntime>,
     startup_error: Option<String>,
 }
 
@@ -54,7 +56,9 @@ impl AsteroidsApp {
         Self {
             window: None,
             renderer: None,
-            audio: AudioScaffold::new(),
+            audio: Some(AudioScaffold::new()),
+            audio_sender: None,
+            audio_runtime: None,
             startup_error: None,
         }
     }
@@ -96,6 +100,19 @@ impl ApplicationHandler for AsteroidsApp {
 
         match pollster::block_on(Renderer::new(Arc::clone(&window), target_size)) {
             Ok(renderer) => {
+                let Some(audio_scaffold) = self.audio.take() else {
+                    self.fail(event_loop, "audio scaffold was already consumed");
+                    return;
+                };
+                let voice_count = audio_scaffold.voices().len();
+                let (audio_sender, receiver, voices) = audio_scaffold.into_parts();
+                let audio_runtime = match AudioRuntime::start(receiver, voices, None) {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        self.fail(event_loop, error);
+                        return;
+                    }
+                };
                 let bloom = renderer.bloom_params();
                 println!(
                     "display: {}; surface={}x{}, scale={:.3}, format={:?}, present_mode={:?}, phosphor={:?}, tau={:.0}ms, bloom_intensity={:.3}, bloom_threshold={:.3}",
@@ -110,11 +127,13 @@ impl ApplicationHandler for AsteroidsApp {
                     bloom.intensity,
                     bloom.threshold,
                 );
+                println!("{}", audio_runtime.info().startup_summary());
                 println!(
-                    "audio scaffold: {} voices, channel capacity {} messages, cpal stream not spawned",
-                    self.audio.voices().len(),
-                    audio::AUDIO_MSG_CAPACITY
+                    "audio messages: {voice_count} voices, channel capacity {} messages",
+                    asteroids::audio::AUDIO_MSG_CAPACITY
                 );
+                self.audio_sender = Some(audio_sender);
+                self.audio_runtime = Some(audio_runtime);
                 self.renderer = Some(renderer);
                 self.window = Some(window);
             }
