@@ -539,6 +539,7 @@ pub struct GameState {
     pub bullets: Vec<Bullet>,
     pub ufo: Option<Ufo>,
     pub ufo_bullets: Vec<Bullet>,
+    advance_rounds_on_clear: bool,
     next_asteroid_id: u32,
     next_bullet_id: u32,
     next_ufo_id: u32,
@@ -673,6 +674,7 @@ impl GameState {
             bullets: Vec::new(),
             ufo: None,
             ufo_bullets: Vec::new(),
+            advance_rounds_on_clear: false,
             next_asteroid_id: 1,
             next_bullet_id: 1,
             next_ufo_id: 1,
@@ -694,6 +696,7 @@ impl GameState {
 
     fn step(&mut self, input: &ControlState, dt: f32) {
         self.events.clear();
+        self.start_next_round_if_cleared();
         self.update_scripted_scenario();
         self.update_respawn(dt);
         self.update_hyperspace_cooldown(dt);
@@ -775,9 +778,6 @@ impl GameState {
                 self.script_tick = self.script_tick.saturating_add(1);
             }
             ScriptedScenario::AutonomousPlay10Min => {
-                if self.asteroids.is_empty() {
-                    self.start_round(self.round.saturating_add(1));
-                }
                 if self.script_tick.is_multiple_of(20)
                     && let Some(id) = self.asteroids.first().map(|asteroid| asteroid.id)
                 {
@@ -805,6 +805,7 @@ impl GameState {
     }
 
     pub fn start_round(&mut self, round: u32) {
+        self.advance_rounds_on_clear = true;
         self.round = round.max(1);
         self.asteroids.clear();
         let count = asteroid_spawn_count_for_round(self.round);
@@ -814,6 +815,16 @@ impl GameState {
             self.asteroids.push(asteroid);
         }
         self.sync_asteroid_count();
+    }
+
+    fn start_next_round_if_cleared(&mut self) {
+        if self.advance_rounds_on_clear
+            && !self.game_over
+            && self.asteroids.is_empty()
+            && self.ufo.is_none()
+        {
+            self.start_round(self.round.saturating_add(1));
+        }
     }
 
     pub fn hit_asteroid_by_id(&mut self, id: u32) -> bool {
@@ -2208,6 +2219,47 @@ mod tests {
     fn asteroid_spawn_count_progression_matches_original_wave_counter() {
         let counts: Vec<u32> = (1..=7).map(asteroid_spawn_count_for_round).collect();
         assert_eq!(counts, vec![4, 6, 8, 10, 11, 11, 11]);
+    }
+
+    #[test]
+    fn cleared_normal_round_starts_next_tick_with_more_asteroids() {
+        let mut state = GameState::new_seeded(Some(1));
+        assert_eq!(state.round, 1);
+        assert_eq!(state.asteroid_count, 4);
+
+        state.asteroids.clear();
+        state.sync_asteroid_count();
+        state.step(&ControlState::default(), FIXED_TIMESTEP_SECONDS);
+
+        assert_eq!(state.round, 2);
+        assert_eq!(state.asteroid_count, 6);
+        assert_eq!(state.asteroid_size_counts().large, 6);
+    }
+
+    #[test]
+    fn cleared_round_waits_for_ufo_before_next_wave() {
+        let mut state = GameState::new_seeded(Some(1));
+        state.asteroids.clear();
+        state.sync_asteroid_count();
+        state.ufo = Some(Ufo::new(
+            1,
+            UfoVariant::Large,
+            Vec2::new(0.4, 0.0),
+            Vec2::new(-0.1, 0.0),
+        ));
+
+        state.step(&ControlState::default(), FIXED_TIMESTEP_SECONDS);
+
+        assert_eq!(state.round, 1);
+        assert_eq!(state.asteroid_count, 0);
+        assert!(state.ufo.is_some());
+
+        state.clear_ufo(GameEventKind::UfoDestroyed, false);
+        state.step(&ControlState::default(), FIXED_TIMESTEP_SECONDS);
+
+        assert_eq!(state.round, 2);
+        assert_eq!(state.asteroid_count, 6);
+        assert!(state.ufo.is_none());
     }
 
     #[test]
