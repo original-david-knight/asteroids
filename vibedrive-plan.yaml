@@ -798,7 +798,7 @@ tasks:
         Final acceptance gate against DESIGN.md Success Criteria.
         Sit down with the binary and run through every success criterion in DESIGN.md as a checklist. The "real test" criterion - the user can sit down and play it for 10 minutes straight without the museum-piece illusion breaking - is the gate that closes v1.
         If any criterion fails, document the failure and loop back to the relevant earlier task instead of declaring done.
-      status: todo
+      status: done
       workflow: checkpoint
       deps:
         - polish-pass

@@ -42,6 +42,8 @@ pub enum Scenario {
     UfoLarge,
     UfoSmall,
     LongPlay5Min,
+    LongPlay10Min,
+    AutonomousPlay10Min,
     ScoreProgression,
     EightExtraLives,
     HyperspaceSpam,
@@ -75,6 +77,8 @@ impl Scenario {
             "ufo-large" => Some(Self::UfoLarge),
             "ufo-small" => Some(Self::UfoSmall),
             "long-play-5min" => Some(Self::LongPlay5Min),
+            "long-play-10min" => Some(Self::LongPlay10Min),
+            "autonomous-play-10min" => Some(Self::AutonomousPlay10Min),
             "score-progression" => Some(Self::ScoreProgression),
             "eight-extra-lives" => Some(Self::EightExtraLives),
             "hyperspace-spam" => Some(Self::HyperspaceSpam),
@@ -109,6 +113,8 @@ impl Scenario {
             Self::UfoLarge => "ufo-large",
             Self::UfoSmall => "ufo-small",
             Self::LongPlay5Min => "long-play-5min",
+            Self::LongPlay10Min => "long-play-10min",
+            Self::AutonomousPlay10Min => "autonomous-play-10min",
             Self::ScoreProgression => "score-progression",
             Self::EightExtraLives => "eight-extra-lives",
             Self::HyperspaceSpam => "hyperspace-spam",
@@ -130,6 +136,8 @@ impl Scenario {
                 | Self::UfoLarge
                 | Self::UfoSmall
                 | Self::LongPlay5Min
+                | Self::LongPlay10Min
+                | Self::AutonomousPlay10Min
                 | Self::ScoreProgression
                 | Self::EightExtraLives
                 | Self::HyperspaceSpam
@@ -1211,6 +1219,8 @@ fn emit_scenario_beams(emitter: &mut BeamEmitter, scenario: Scenario, time_s: f3
         | Scenario::UfoLarge
         | Scenario::UfoSmall
         | Scenario::LongPlay5Min
+        | Scenario::LongPlay10Min
+        | Scenario::AutonomousPlay10Min
         | Scenario::ScoreProgression
         | Scenario::EightExtraLives
         | Scenario::HyperspaceSpam

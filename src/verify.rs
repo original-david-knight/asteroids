@@ -409,13 +409,136 @@ pub fn load_state_trace(path: &Path) -> Result<Vec<StateTraceEvent>, String> {
 pub fn state_trace_contains(events: &[StateTraceEvent], expected: &[String]) -> Vec<String> {
     expected
         .iter()
-        .filter(|name| {
-            !events
-                .iter()
-                .any(|event| event.event.as_deref() == Some(name.as_str()))
-        })
+        .filter(|name| !state_trace_has_expectation(events, name))
         .cloned()
         .collect()
+}
+
+fn state_trace_has_expectation(events: &[StateTraceEvent], name: &str) -> bool {
+    let scenario = state_trace_scenario(events);
+    match name {
+        "no-panics" => {
+            !events.is_empty()
+                && !events.iter().any(|event| {
+                    matches!(
+                        event.event.as_deref(),
+                        Some("panic" | "panicked" | "runtime-error")
+                    )
+                })
+        }
+        "asteroids-cleared" => state_trace_has_asteroids_cleared(events),
+        "asteroid-split" if scenario == Some("bullet-hit-asteroid") => {
+            state_trace_has_event(events, name) && state_trace_has_three_tier_split(events)
+        }
+        "heartbeat-active" if scenario == Some("autonomous-play-10min") => {
+            state_trace_has_sustained_heartbeat_activity(events)
+        }
+        "heartbeat-active" => events.iter().any(state_trace_tick_has_active_heartbeat),
+        _ => state_trace_has_event(events, name),
+    }
+}
+
+fn state_trace_has_event(events: &[StateTraceEvent], name: &str) -> bool {
+    events
+        .iter()
+        .any(|event| event.event.as_deref() == Some(name))
+}
+
+fn state_trace_scenario(events: &[StateTraceEvent]) -> Option<&str> {
+    events
+        .iter()
+        .find_map(|event| event.value.get("scenario").and_then(Value::as_str))
+}
+
+fn state_trace_has_asteroids_cleared(events: &[StateTraceEvent]) -> bool {
+    let mut saw_asteroids = false;
+    for event in events
+        .iter()
+        .filter(|event| event.event.as_deref() == Some("tick"))
+    {
+        let Some(count) = event.value.get("asteroid_count").and_then(Value::as_u64) else {
+            continue;
+        };
+        if count > 0 {
+            saw_asteroids = true;
+        } else if saw_asteroids {
+            return true;
+        }
+    }
+    false
+}
+
+fn state_trace_has_sustained_heartbeat_activity(events: &[StateTraceEvent]) -> bool {
+    let mut buckets = [false; 10];
+    let mut latest_active_time = None;
+    for event in events
+        .iter()
+        .filter(|event| event.event.as_deref() == Some("tick"))
+    {
+        if !state_trace_tick_has_active_heartbeat(event) {
+            continue;
+        }
+        let Some(time) = event.value.get("time").and_then(Value::as_f64) else {
+            continue;
+        };
+        let bucket = (time / 60.0).floor() as usize;
+        if let Some(slot) = buckets.get_mut(bucket) {
+            *slot = true;
+        }
+        latest_active_time = Some(time);
+    }
+
+    buckets.into_iter().all(|active| active) && latest_active_time.is_some_and(|time| time >= 590.0)
+}
+
+fn state_trace_tick_has_active_heartbeat(event: &StateTraceEvent) -> bool {
+    event.event.as_deref() == Some("tick")
+        && event
+            .value
+            .get("asteroid_count")
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count > 0)
+        && !event
+            .value
+            .get("game_over")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
+fn state_trace_has_three_tier_split(events: &[StateTraceEvent]) -> bool {
+    let mut large_to_medium = false;
+    let mut medium_to_small = false;
+    let mut small_destroyed = false;
+
+    for event in events
+        .iter()
+        .filter(|event| event.event.as_deref() == Some("tick"))
+    {
+        let large = state_trace_u64(event, "asteroids_large").unwrap_or(0);
+        let medium = state_trace_u64(event, "asteroids_medium").unwrap_or(0);
+        let small = state_trace_u64(event, "asteroids_small").unwrap_or(0);
+
+        if large == 0 && medium >= 2 {
+            large_to_medium = true;
+        }
+        if large_to_medium && medium >= 1 && small >= 2 {
+            medium_to_small = true;
+        }
+        if medium_to_small && medium >= 1 && small == 1 {
+            small_destroyed = true;
+        }
+    }
+
+    large_to_medium
+        && medium_to_small
+        && small_destroyed
+        && events
+            .iter()
+            .any(|event| event.event.as_deref() == Some("asteroid-destroyed"))
+}
+
+fn state_trace_u64(event: &StateTraceEvent, key: &str) -> Option<u64> {
+    event.value.get(key).and_then(Value::as_u64)
 }
 
 fn sample_luminance(image: &PngImage, x: f32, y: f32) -> f32 {

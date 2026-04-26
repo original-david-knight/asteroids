@@ -403,22 +403,66 @@ impl AutomatedAudioCapture {
         let tick_interval = Duration::from_secs_f64(1.0 / 60.0);
         let mut tick = 0_u64;
         let mut next_tick = start;
+        let mut emitted_death_one = false;
+        let mut emitted_respawn_one = false;
+        let mut emitted_death_two = false;
+        let mut emitted_respawn_two = false;
+        let mut emitted_game_over = false;
         while next_tick < start + duration {
             sleep_until(next_tick);
             let elapsed = next_tick.duration_since(start).as_secs_f32();
-            let asteroid_count = heartbeat_curve_asteroid_count(elapsed);
+            let game_over = elapsed >= 29.0;
+            let alive =
+                !(game_over || (8.0..9.25).contains(&elapsed) || (17.0..18.25).contains(&elapsed));
+            let asteroid_count = if game_over {
+                0
+            } else {
+                heartbeat_curve_asteroid_count(elapsed)
+            };
             enqueue_audio_msg(
                 &mut self.sender,
                 audio::AudioMsg::GameState(audio::GameSnapshot::with_game_over(
                     asteroid_count,
-                    true,
+                    alive,
                     0,
-                    false,
+                    game_over,
                 )),
                 "heartbeat game state",
             )?;
             if let Some(writer) = state_log.as_deref_mut() {
-                write_audio_state_tick_event(writer, config, tick, elapsed, asteroid_count)?;
+                if !emitted_death_one && elapsed >= 8.0 {
+                    write_audio_state_event(writer, config, tick, elapsed, "ship-died")?;
+                    write_audio_state_event(writer, config, tick, elapsed, "lives-decremented")?;
+                    emitted_death_one = true;
+                }
+                if !emitted_respawn_one && elapsed >= 9.25 {
+                    write_audio_state_event(writer, config, tick, elapsed, "respawn")?;
+                    emitted_respawn_one = true;
+                }
+                if !emitted_death_two && elapsed >= 17.0 {
+                    write_audio_state_event(writer, config, tick, elapsed, "ship-died")?;
+                    write_audio_state_event(writer, config, tick, elapsed, "lives-decremented")?;
+                    emitted_death_two = true;
+                }
+                if !emitted_respawn_two && elapsed >= 18.25 {
+                    write_audio_state_event(writer, config, tick, elapsed, "respawn")?;
+                    emitted_respawn_two = true;
+                }
+                if !emitted_game_over && game_over {
+                    write_audio_state_event(writer, config, tick, elapsed, "ship-died")?;
+                    write_audio_state_event(writer, config, tick, elapsed, "lives-decremented")?;
+                    write_audio_state_event(writer, config, tick, elapsed, "game-over")?;
+                    emitted_game_over = true;
+                }
+                write_audio_state_tick_event(
+                    writer,
+                    config,
+                    tick,
+                    elapsed,
+                    asteroid_count,
+                    alive,
+                    game_over,
+                )?;
             }
             tick += 1;
             next_tick += tick_interval;
@@ -575,10 +619,28 @@ fn write_audio_state_tick_event(
     tick: u64,
     elapsed: f32,
     asteroid_count: u32,
+    alive: bool,
+    game_over: bool,
 ) -> Result<(), String> {
     writeln!(
         writer,
-        "{{\"tick\":{tick},\"time\":{elapsed:.6},\"event\":\"tick\",\"scenario\":\"{}\",\"seed\":{},\"asteroid_count\":{asteroid_count}}}",
+        "{{\"tick\":{tick},\"time\":{elapsed:.6},\"event\":\"tick\",\"scenario\":\"{}\",\"seed\":{},\"asteroid_count\":{asteroid_count},\"alive\":{alive},\"game_over\":{game_over}}}",
+        config.scenario.name(),
+        config.seed.unwrap_or(0),
+    )
+    .map_err(|error| format!("failed to write state log: {error}"))
+}
+
+fn write_audio_state_event(
+    writer: &mut BufWriter<File>,
+    config: &RuntimeConfig,
+    tick: u64,
+    elapsed: f32,
+    event: &str,
+) -> Result<(), String> {
+    writeln!(
+        writer,
+        "{{\"tick\":{tick},\"time\":{elapsed:.6},\"event\":\"{event}\",\"scenario\":\"{}\",\"seed\":{}}}",
         config.scenario.name(),
         config.seed.unwrap_or(0),
     )
@@ -593,7 +655,7 @@ fn sleep_until(deadline: Instant) {
 }
 
 pub fn runtime_usage() -> String {
-    "Usage: asteroids [--headless] [--screenshot <path>] [--capture-frames <N> --frames-out <dir>] [--audio-capture <secs> --wav-out <path>] [--seed <u64>] [--fixed-dt <secs>] [--simulate-secs <secs>] [--scenario <name>] [--xrun-log <path>] [--frame-time-log <path>] [--state-log <path>] [--bloom-intensity <value>] [--bloom-threshold <value>]\n\nScenarios: demo, idle, ship-spinning, horizontal-sweep, static-bright-line, static-bright-line-low-dwell, static-bright-line-high-dwell, gamma-ramp, thrust-1s, ship-spinning-with-thrust, heavy-input, asteroids-round-1, bullet-hit-asteroid, ship-collides-with-asteroid, lose-all-lives, explosion-storm, heartbeat-curve, fire-3, ufo-large, ufo-small, long-play-5min, score-progression, eight-extra-lives, hyperspace-spam, title-idle, attract-then-input, set-highscore-12345, read-highscore".to_string()
+    "Usage: asteroids [--headless] [--screenshot <path>] [--capture-frames <N> --frames-out <dir>] [--audio-capture <secs> --wav-out <path>] [--seed <u64>] [--fixed-dt <secs>] [--simulate-secs <secs>] [--scenario <name>] [--xrun-log <path>] [--frame-time-log <path>] [--state-log <path>] [--bloom-intensity <value>] [--bloom-threshold <value>]\n\nScenarios: demo, idle, ship-spinning, horizontal-sweep, static-bright-line, static-bright-line-low-dwell, static-bright-line-high-dwell, gamma-ramp, thrust-1s, ship-spinning-with-thrust, heavy-input, asteroids-round-1, bullet-hit-asteroid, ship-collides-with-asteroid, lose-all-lives, explosion-storm, heartbeat-curve, fire-3, ufo-large, ufo-small, long-play-5min, long-play-10min, autonomous-play-10min, score-progression, eight-extra-lives, hyperspace-spam, title-idle, attract-then-input, set-highscore-12345, read-highscore".to_string()
 }
 
 fn load_persisted_high_score() -> u32 {
@@ -657,6 +719,10 @@ fn game_loop_for_scenario(
         ),
         Scenario::HyperspaceSpam => GameLoop::from_state_with_high_score(
             game::GameState::hyperspace_spam_scenario(seed),
+            high_score,
+        ),
+        Scenario::AutonomousPlay10Min => GameLoop::from_state_with_high_score(
+            game::GameState::autonomous_play_10min_scenario(seed),
             high_score,
         ),
         Scenario::SetHighScore12345 => GameLoop::from_state_with_high_score(
@@ -755,7 +821,13 @@ struct TickIo<'a> {
 fn scripted_controls(scenario: Scenario, time_seconds: f32) -> ControlState {
     match scenario {
         Scenario::HeavyInput => game::heavy_input_controls(time_seconds),
-        Scenario::LongPlay5Min => long_play_controls(time_seconds),
+        Scenario::LongPlay5Min | Scenario::LongPlay10Min | Scenario::AutonomousPlay10Min => {
+            let mut controls = long_play_controls(time_seconds);
+            if scenario == Scenario::AutonomousPlay10Min {
+                controls.hyperspace = false;
+            }
+            controls
+        }
         Scenario::BulletHitAsteroid => ControlState {
             fire: time_seconds < 0.02,
             ..ControlState::default()
@@ -1240,6 +1312,8 @@ mod tests {
             "ship-collides-with-asteroid",
             "lose-all-lives",
             "long-play-5min",
+            "long-play-10min",
+            "autonomous-play-10min",
             "score-progression",
             "eight-extra-lives",
             "hyperspace-spam",

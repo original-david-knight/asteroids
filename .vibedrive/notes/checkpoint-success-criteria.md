@@ -1,0 +1,1 @@
+Peer-review changes addressed: autonomous play now sustains/reseeds through 600s, three-tier split is event-driven, and previously unused expectations are folded into existing verifier gates. Final full autonomous run passed xrun-count=0, frame p99=0.675148ms, and strengthened state trace over 113255 events; no loop-back criteria remain.

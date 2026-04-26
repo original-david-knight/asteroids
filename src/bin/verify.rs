@@ -569,7 +569,8 @@ fn cmd_heartbeat_tempo(args: &mut CliArgs) -> Result<(), String> {
         ));
     }
 
-    let state_points = heartbeat_state_points(&state_log)?;
+    let state_events = verify::load_state_trace(&state_log)?;
+    let state_points = heartbeat_state_points_from_events(&state_events);
     let max_count = state_points
         .iter()
         .map(|point| point.1)
@@ -616,6 +617,7 @@ fn cmd_heartbeat_tempo(args: &mut CliArgs) -> Result<(), String> {
             "heartbeat-tempo failed: only {checked} beat intervals matched stable state-log counts"
         ));
     }
+    verify_heartbeat_death_continuity(&state_events, &beats)?;
     println!(
         "heartbeat-tempo ok: beats={} checked={} max_count={} worst_error={worst_error:.3}s",
         beats.len(),
@@ -638,8 +640,7 @@ fn cmd_frame_time_p99(args: &mut CliArgs) -> Result<(), String> {
     Ok(())
 }
 
-fn heartbeat_state_points(path: &Path) -> Result<Vec<(f32, u32)>, String> {
-    let events = verify::load_state_trace(path)?;
+fn heartbeat_state_points_from_events(events: &[verify::StateTraceEvent]) -> Vec<(f32, u32)> {
     let mut points = Vec::new();
     for event in events {
         if event.event.as_deref() != Some("tick") {
@@ -654,7 +655,51 @@ fn heartbeat_state_points(path: &Path) -> Result<Vec<(f32, u32)>, String> {
         points.push((time as f32, count as u32));
     }
     points.sort_by(|a, b| a.0.total_cmp(&b.0));
-    Ok(points)
+    points
+}
+
+fn verify_heartbeat_death_continuity(
+    events: &[verify::StateTraceEvent],
+    beats: &[f32],
+) -> Result<(), String> {
+    let death_times = events
+        .iter()
+        .filter(|event| event.event.as_deref() == Some("ship-died"))
+        .filter_map(|event| event.value.get("time").and_then(Value::as_f64))
+        .map(|time| time as f32)
+        .collect::<Vec<_>>();
+    if death_times.len() < 2 {
+        return Err(format!(
+            "heartbeat-tempo failed: state log has only {} ship deaths; expected multiple deaths for continuity gate",
+            death_times.len()
+        ));
+    }
+
+    for death_time in death_times.iter().take(2).copied() {
+        let has_followup_beat = beats
+            .iter()
+            .any(|beat| *beat >= death_time && *beat <= death_time + 1.5);
+        if !has_followup_beat {
+            return Err(format!(
+                "heartbeat-tempo failed: no heartbeat detected within 1.5s after ship death at {death_time:.3}s"
+            ));
+        }
+    }
+
+    let Some(game_over_time) = events
+        .iter()
+        .find(|event| event.event.as_deref() == Some("game-over"))
+        .and_then(|event| event.value.get("time").and_then(Value::as_f64))
+        .map(|time| time as f32)
+    else {
+        return Ok(());
+    };
+    if beats.iter().any(|beat| *beat > game_over_time + 0.4) {
+        return Err(format!(
+            "heartbeat-tempo failed: heartbeat continued more than 0.4s after game-over at {game_over_time:.3}s"
+        ));
+    }
+    Ok(())
 }
 
 fn asteroid_count_at_time(points: &[(f32, u32)], time: f32) -> Option<u32> {
@@ -1046,11 +1091,10 @@ fn decay_fit_from_frames(dir: &Path, fixed_dt: f64) -> Result<verify::DecayFit, 
 
     let mut coords = Vec::with_capacity(playfield.width() as usize * 5 + 5);
     for y_offset in -2_i32..=2 {
-        let y = (peak_y as i32 + y_offset)
-            .clamp(
-                playfield.top as i32,
-                playfield.bottom.saturating_sub(1) as i32,
-            ) as u32;
+        let y = (peak_y as i32 + y_offset).clamp(
+            playfield.top as i32,
+            playfield.bottom.saturating_sub(1) as i32,
+        ) as u32;
         for x in playfield.left..playfield.right {
             coords.push((x, y));
         }
@@ -1421,14 +1465,13 @@ fn fit_angle_rate(detections: &[ShipDetection], fixed_dt: f32) -> AngleRateFit {
 }
 
 fn estimated_fwhm_width(image: &verify::PngImage) -> f32 {
-    let playfield = centered_aspect_rect(image.width, image.height, PLAYFIELD_ASPECT_RATIO).unwrap_or(
-        PixelRect {
+    let playfield = centered_aspect_rect(image.width, image.height, PLAYFIELD_ASPECT_RATIO)
+        .unwrap_or(PixelRect {
             left: 0,
             right: image.width,
             top: 0,
             bottom: image.height,
-        },
-    );
+        });
     let best = brightest_pixel_in_rect(image, playfield);
     let row_values = (playfield.left..playfield.right)
         .map(|x| image.luminance(x, best.1))

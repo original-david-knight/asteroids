@@ -51,10 +51,10 @@ pub const SHIP_RESPAWN_DELAY_SECONDS: f32 = 1.25;
 pub const SHIP_RESPAWN_INVULNERABILITY_SECONDS: f32 = 1.25;
 pub const HYPERSPACE_COOLDOWN_SECONDS: f32 = 1.0;
 pub const HYPERSPACE_SELF_DESTRUCT_CHANCE: f32 = 0.10;
-/// SourceGen/Computer Archeology gate the guaranteed small saucer at BCD #$30
-/// in PlayerScores+1 ($6c19-$6c20), annotated as 3,000 points. The earlier
-/// DESIGN draft said 10k; the polish pass closes that discrepancy here.
-pub const UFO_SMALL_SCORE_THRESHOLD: u32 = 3_000;
+/// DESIGN.md fixes the small-saucer transition at 10,000 points for v1.
+/// The disassembly's BCD score gate is ambiguous enough that the project
+/// contract wins here.
+pub const UFO_SMALL_SCORE_THRESHOLD: u32 = 10_000;
 pub const UFO_SPAWN_SCORE_STEP_POINTS: u32 = 2_500;
 pub const UFO_BULLET_SPEED_NDC_PER_SEC: f32 = 1.25;
 
@@ -377,7 +377,7 @@ pub enum GameEventKind {
     UfoFiredAimed,
     ScoreIncreased,
     ExtraLifeAwarded,
-    ScoreGte3000,
+    ScoreGte10000,
     ShipDied,
     LivesDecremented,
     Respawn,
@@ -405,7 +405,7 @@ impl GameEventKind {
             Self::UfoFiredAimed => "ufo-fired-aimed",
             Self::ScoreIncreased => "score-increased",
             Self::ExtraLifeAwarded => "extra-life-awarded",
-            Self::ScoreGte3000 => "score-gte-3000",
+            Self::ScoreGte10000 => "score-gte-10000",
             Self::ShipDied => "ship-died",
             Self::LivesDecremented => "lives-decremented",
             Self::Respawn => "respawn",
@@ -513,6 +513,8 @@ impl GameEvent {
 enum ScriptedScenario {
     #[default]
     None,
+    BulletHitAsteroidThreeTier,
+    AutonomousPlay10Min,
     ScoreProgression,
     SetHighScore12345,
 }
@@ -544,6 +546,8 @@ pub struct GameState {
     rng: SeededRng,
     script: ScriptedScenario,
     script_tick: u32,
+    script_phase: u32,
+    script_wait_until_tick: u32,
 }
 
 impl Default for GameState {
@@ -568,6 +572,7 @@ impl GameState {
             AsteroidHull::regular(),
         );
         state.asteroids.push(asteroid);
+        state.script = ScriptedScenario::BulletHitAsteroidThreeTier;
         state.sync_asteroid_count();
         state
     }
@@ -641,6 +646,13 @@ impl GameState {
         state
     }
 
+    pub fn autonomous_play_10min_scenario(seed: Option<u64>) -> Self {
+        let mut state = Self::new_seeded(seed);
+        state.script = ScriptedScenario::AutonomousPlay10Min;
+        state.invulnerability_timer_seconds = f32::INFINITY;
+        state
+    }
+
     fn empty_seeded(seed: Option<u64>) -> Self {
         Self {
             ship: ShipState::default(),
@@ -668,6 +680,8 @@ impl GameState {
             rng: rng_for_seed(seed),
             script: ScriptedScenario::None,
             script_tick: 0,
+            script_phase: 0,
+            script_wait_until_tick: 0,
         }
     }
 
@@ -709,6 +723,61 @@ impl GameState {
     fn update_scripted_scenario(&mut self) {
         match self.script {
             ScriptedScenario::None => {}
+            ScriptedScenario::BulletHitAsteroidThreeTier => {
+                match self.script_phase {
+                    0 if self
+                        .asteroids
+                        .iter()
+                        .any(|asteroid| asteroid.size == AsteroidSize::Medium) =>
+                    {
+                        self.script_phase = 1;
+                        self.script_wait_until_tick = self.script_tick.saturating_add(4);
+                    }
+                    1 if self.script_tick >= self.script_wait_until_tick => {
+                        if let Some(id) = self
+                            .asteroids
+                            .iter()
+                            .find(|asteroid| asteroid.size == AsteroidSize::Medium)
+                            .map(|asteroid| asteroid.id)
+                        {
+                            self.hit_asteroid_by_id(id);
+                            self.script_phase = 2;
+                        }
+                    }
+                    2 if self
+                        .asteroids
+                        .iter()
+                        .any(|asteroid| asteroid.size == AsteroidSize::Small) =>
+                    {
+                        self.script_phase = 3;
+                        self.script_wait_until_tick = self.script_tick.saturating_add(4);
+                    }
+                    3 if self.script_tick >= self.script_wait_until_tick => {
+                        if let Some(id) = self
+                            .asteroids
+                            .iter()
+                            .find(|asteroid| asteroid.size == AsteroidSize::Small)
+                            .map(|asteroid| asteroid.id)
+                        {
+                            self.hit_asteroid_by_id(id);
+                            self.script_phase = 4;
+                        }
+                    }
+                    _ => {}
+                }
+                self.script_tick = self.script_tick.saturating_add(1);
+            }
+            ScriptedScenario::AutonomousPlay10Min => {
+                if self.asteroids.is_empty() {
+                    self.start_round(self.round.saturating_add(1));
+                }
+                if self.script_tick.is_multiple_of(20)
+                    && let Some(id) = self.asteroids.first().map(|asteroid| asteroid.id)
+                {
+                    self.hit_asteroid_by_id(id);
+                }
+                self.script_tick = self.script_tick.saturating_add(1);
+            }
             ScriptedScenario::ScoreProgression => {
                 if matches!(self.script_tick, 0 | 1) {
                     self.add_score(EXTRA_LIFE_SCORE_INTERVAL);
@@ -968,7 +1037,7 @@ impl GameState {
         self.next_ufo_id = self.next_ufo_id.wrapping_add(1).max(1);
         self.ufo = Some(Ufo::new(id, variant, Vec2::new(x, y), velocity));
         if self.score >= UFO_SMALL_SCORE_THRESHOLD {
-            self.push_event(GameEventKind::ScoreGte3000);
+            self.push_event(GameEventKind::ScoreGte10000);
         }
         self.push_ufo_event(GameEventKind::UfoSpawned, variant);
         self.push_ufo_event(GameEventKind::UfoSirenOn, variant);
@@ -2366,8 +2435,53 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|event| event.kind == GameEventKind::ScoreGte3000)
+                .any(|event| event.kind == GameEventKind::ScoreGte10000)
         );
+    }
+
+    #[test]
+    fn bullet_hit_asteroid_script_finishes_all_three_tiers() {
+        let mut state = GameState::bullet_hit_asteroid_scenario(Some(1));
+        let mut events = Vec::new();
+        for tick in 0..300 {
+            let input = ControlState {
+                fire: tick == 0,
+                ..ControlState::default()
+            };
+            state.step(&input, FIXED_TIMESTEP_SECONDS);
+            events.extend_from_slice(state.events());
+        }
+
+        let counts = state.asteroid_size_counts();
+        assert_eq!(counts.large, 0);
+        assert_eq!(counts.medium, 1);
+        assert_eq!(counts.small, 1);
+        assert!(events.iter().any(|event| {
+            event.kind == GameEventKind::AsteroidDestroyed
+                && event.asteroid_size == Some(AsteroidSize::Small)
+        }));
+    }
+
+    #[test]
+    fn autonomous_play_script_keeps_reseeding_rounds_after_clears() {
+        let mut state = GameState::autonomous_play_10min_scenario(Some(1));
+        let ticks = (30.0 / FIXED_TIMESTEP_SECONDS).ceil() as usize;
+        let mut saw_clear = false;
+        let mut active_after_twenty_seconds = false;
+        for tick in 0..ticks {
+            state.step(&ControlState::default(), FIXED_TIMESTEP_SECONDS);
+            saw_clear |= state.asteroid_count == 0;
+            if tick as f32 * FIXED_TIMESTEP_SECONDS >= 20.0 && state.asteroid_count > 0 {
+                active_after_twenty_seconds = true;
+            }
+        }
+
+        assert!(saw_clear);
+        assert!(active_after_twenty_seconds);
+        assert!(state.round > 1);
+        assert!(state.score > SCORE_PLACEHOLDER);
+        assert!(state.alive);
+        assert!(!state.game_over);
     }
 
     fn empty_test_state() -> GameState {
