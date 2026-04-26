@@ -175,13 +175,14 @@ impl InputState {
         self.thrust_w || self.thrust_up
     }
 
-    fn controls(&self) -> ControlState {
+    fn controls(&self, shot_x_scale: f32) -> ControlState {
         ControlState {
             rotate_left: self.rotate_left_a || self.rotate_left_arrow,
             rotate_right: self.rotate_right_d || self.rotate_right_arrow,
             thrust: self.thrust_active(),
             fire: self.fire_space,
             hyperspace: self.hyperspace_h,
+            shot_x_scale,
         }
     }
 
@@ -546,7 +547,7 @@ impl ApplicationHandler for AsteroidsApp {
                     }
                     return;
                 }
-                let controls = self.input.controls();
+                let controls = self.input.controls(renderer.object_local_x_scale());
                 let audio_sender = &mut self.audio_sender;
                 self.game.advance(frame_dt, &controls, |snapshot| {
                     if let Some(sender) = audio_sender.as_mut() {

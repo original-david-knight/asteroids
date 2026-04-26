@@ -749,7 +749,8 @@ fn render_tick(
     let mut substeps = 0;
     let mut dropped_accumulator_seconds = 0.0;
     if config.scenario.uses_game_simulation() {
-        let input = scripted_controls(config.scenario, tick_state.sim_time);
+        let mut input = scripted_controls(config.scenario, tick_state.sim_time);
+        input.shot_x_scale = renderer.object_local_x_scale();
         let report = game_loop.advance(fixed_dt, &input, |snapshot| {
             if let Some(sender) = audio_sender.as_mut() {
                 let _ = sender.try_push(audio::AudioMsg::GameState(snapshot));
@@ -857,6 +858,7 @@ fn long_play_controls(time_seconds: f32) -> ControlState {
         thrust: (time_seconds * 0.75).sin() > -0.25,
         fire: fire_phase.rem_euclid(4) == 0,
         hyperspace: (12.0..12.04).contains(&hyperspace_phase),
+        shot_x_scale: 1.0,
     }
 }
 

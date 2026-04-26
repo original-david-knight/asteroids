@@ -572,6 +572,10 @@ impl Renderer {
         self.size
     }
 
+    pub fn object_local_x_scale(&self) -> f32 {
+        object_local_x_scale_for_size(self.size)
+    }
+
     pub fn surface_format(&self) -> wgpu::TextureFormat {
         self.config.format
     }
@@ -792,6 +796,10 @@ impl HeadlessRenderer {
         self.size
     }
 
+    pub fn object_local_x_scale(&self) -> f32 {
+        object_local_x_scale_for_size(self.size)
+    }
+
     pub fn phosphor_format(&self) -> wgpu::TextureFormat {
         self.phosphor.format()
     }
@@ -920,8 +928,6 @@ fn align_to_copy_bytes_per_row(bytes_per_row: u32) -> u32 {
 
 const SCREEN_READOUT_INTENSITY: f32 = 0.56;
 const SCREEN_READOUT_DWELL_US: f32 = 24.0;
-const OBJECT_BASELINE_ASPECT_RATIO: f32 = 4.0 / 3.0;
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PlayfieldRect {
     min: Vec2,
@@ -975,7 +981,7 @@ fn emit_frame_beams(
     size: PhysicalSize<u32>,
 ) {
     let playfield = PlayfieldRect::fullscreen();
-    let local_x_scale = local_x_scale_for_size(size);
+    let local_x_scale = object_local_x_scale_for_size(size);
 
     frame_emitter.clear();
     gameplay_emitter.clear();
@@ -1699,9 +1705,9 @@ fn emit_demo_beams(emitter: &mut BeamEmitter, time_s: f32, local_x_scale: f32) {
     emit_phosphor_trail_verification_beams(emitter, time_s);
 }
 
-fn local_x_scale_for_size(size: PhysicalSize<u32>) -> f32 {
+fn object_local_x_scale_for_size(size: PhysicalSize<u32>) -> f32 {
     let target_aspect = size.width.max(1) as f32 / size.height.max(1) as f32;
-    OBJECT_BASELINE_ASPECT_RATIO / target_aspect
+    tuning::OBJECT_BASELINE_ASPECT_RATIO / target_aspect
 }
 
 fn aspect_correct_local(local: Vec2, local_x_scale: f32) -> Vec2 {

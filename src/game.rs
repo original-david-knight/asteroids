@@ -79,13 +79,27 @@ const UFO_SMALL_RADIUS_NDC: f32 = 0.062;
 const UFO_RAW_HORIZONTAL_SPEED: f32 = 16.0;
 const UFO_RAW_VERTICAL_SPEEDS: [f32; 4] = [-16.0, 0.0, 0.0, 16.0];
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ControlState {
     pub rotate_left: bool,
     pub rotate_right: bool,
     pub thrust: bool,
     pub fire: bool,
     pub hyperspace: bool,
+    pub shot_x_scale: f32,
+}
+
+impl Default for ControlState {
+    fn default() -> Self {
+        Self {
+            rotate_left: false,
+            rotate_right: false,
+            thrust: false,
+            fire: false,
+            hyperspace: false,
+            shot_x_scale: 1.0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -998,7 +1012,7 @@ impl GameState {
         let fire_pressed = input.fire && !self.fire_was_down;
         self.fire_was_down = input.fire;
         if self.alive && !self.game_over && fire_pressed {
-            self.fire_bullet();
+            self.fire_bullet(input.shot_x_scale);
         }
     }
 
@@ -1029,14 +1043,13 @@ impl GameState {
         }
     }
 
-    fn fire_bullet(&mut self) {
-        let (angle_sin, angle_cos) = self.ship.angle.sin_cos();
-        let forward = Vec2::new(angle_cos, angle_sin);
+    fn fire_bullet(&mut self, shot_x_scale: f32) {
+        let forward = shot_forward(self.ship.angle, shot_x_scale);
         let id = self.allocate_bullet_id();
         let position = wrap_position(
             self.ship.position + forward * (SHIP_COLLISION_RADIUS_NDC + BULLET_RADIUS_NDC),
         );
-        let velocity = self.ship.velocity + forward * BULLET_SPEED_NDC_PER_SEC;
+        let velocity = forward * BULLET_SPEED_NDC_PER_SEC;
         self.bullets.push(Bullet::new(id, position, velocity));
         self.push_event(GameEventKind::BulletFired);
     }
@@ -1564,6 +1577,16 @@ fn random_direction(rng: &mut SeededRng) -> Vec2 {
     Vec2::new(cos, sin)
 }
 
+fn shot_forward(angle: f32, shot_x_scale: f32) -> Vec2 {
+    let (angle_sin, angle_cos) = angle.sin_cos();
+    let x_scale = if shot_x_scale.is_finite() && shot_x_scale > 0.0 {
+        shot_x_scale
+    } else {
+        1.0
+    };
+    Vec2::new(angle_cos * x_scale, angle_sin).normalized_or(Vec2::X)
+}
+
 fn random_hyperspace_target(rng: &mut SeededRng) -> Vec2 {
     Vec2::new(
         random_range(rng, PLAYFIELD_MIN.x, PLAYFIELD_MAX.x),
@@ -1963,6 +1986,7 @@ pub fn heavy_input_controls(time_seconds: f32) -> ControlState {
         thrust: true,
         fire: (time_seconds * 12.0).floor() as i32 % 3 == 0,
         hyperspace: false,
+        shot_x_scale: 1.0,
     }
 }
 
@@ -2408,6 +2432,45 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == GameEventKind::BulletExpired)
         );
+    }
+
+    #[test]
+    fn player_bullet_velocity_follows_ship_angle_without_ship_drift() {
+        let mut state = empty_test_state();
+        state.ship = ShipState {
+            position: Vec2::ZERO,
+            velocity: Vec2::new(0.8, -0.4),
+            angle: TAU * 0.25,
+        };
+
+        state.fire_bullet(1.0);
+
+        assert_eq!(state.bullets.len(), 1);
+        let bullet = state.bullets[0];
+        assert!(bullet.velocity.x.abs() < EPSILON);
+        assert!((bullet.velocity.y - BULLET_SPEED_NDC_PER_SEC).abs() < EPSILON);
+        assert!((bullet.velocity.length() - BULLET_SPEED_NDC_PER_SEC).abs() < EPSILON);
+        assert!(bullet.position.x.abs() < EPSILON);
+        assert!(
+            (bullet.position.y - (SHIP_COLLISION_RADIUS_NDC + BULLET_RADIUS_NDC)).abs() < EPSILON
+        );
+    }
+
+    #[test]
+    fn player_bullet_velocity_matches_aspect_corrected_ship_nose() {
+        let mut state = empty_test_state();
+        let shot_x_scale = 0.75;
+        state.ship = ShipState {
+            position: Vec2::ZERO,
+            velocity: Vec2::ZERO,
+            angle: TAU * 0.125,
+        };
+
+        state.fire_bullet(shot_x_scale);
+
+        let bullet = state.bullets[0];
+        assert!((bullet.velocity.length() - BULLET_SPEED_NDC_PER_SEC).abs() < EPSILON);
+        assert!((bullet.velocity.x / bullet.velocity.y - shot_x_scale).abs() < EPSILON);
     }
 
     #[test]

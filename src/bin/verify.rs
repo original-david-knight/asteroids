@@ -1033,7 +1033,7 @@ fn life_icon_scores(image: &verify::PngImage, count: usize) -> Result<Vec<f32>, 
 fn life_icon_score(image: &verify::PngImage, center: asteroids::beam::Vec2, scale: f32) -> f32 {
     let angle = PI * 0.5;
     let image_aspect = image.width.max(1) as f32 / image.height.max(1) as f32;
-    let local_x_scale = OBJECT_BASELINE_ASPECT_RATIO / image_aspect;
+    let local_x_scale = asteroids::tuning::OBJECT_BASELINE_ASPECT_RATIO / image_aspect;
     let mut score = 0.0;
     let mut samples = 0;
     for (start, end) in SHIP_SEGMENTS {
@@ -1214,7 +1214,6 @@ fn brightest_pixel(image: &verify::PngImage) -> (u32, u32, f32) {
 }
 
 const VERIFY_FIXED_DT_SECONDS: f32 = 0.00694;
-const OBJECT_BASELINE_ASPECT_RATIO: f32 = 4.0 / 3.0;
 const SOUL_VISIBLE_MIN_FRAMES: usize = 8;
 const SOUL_VISIBLE_ROTATION_TOLERANCE_RAD_PER_SEC: f32 = 0.1;
 const SOUL_VISIBLE_MIN_TRAIL_LUMINANCE: f32 = 0.0;
@@ -1381,7 +1380,7 @@ fn aspect_correct_local_for_rect(
     playfield: PixelRect,
 ) -> asteroids::beam::Vec2 {
     let playfield_aspect = playfield.width().max(1) as f32 / playfield.height().max(1) as f32;
-    let x_scale = OBJECT_BASELINE_ASPECT_RATIO / playfield_aspect;
+    let x_scale = asteroids::tuning::OBJECT_BASELINE_ASPECT_RATIO / playfield_aspect;
     asteroids::beam::Vec2::new(local.x * x_scale, local.y)
 }
 
