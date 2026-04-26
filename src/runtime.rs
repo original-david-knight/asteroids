@@ -22,6 +22,7 @@ use crate::{
 };
 
 const DEFAULT_FIXED_DT_SECONDS: f32 = 1.0 / 144.0;
+pub const FRAME_METADATA_FILENAME: &str = "frame_metadata.jsonl";
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
@@ -170,7 +171,7 @@ pub async fn run_automated(config: &RuntimeConfig) -> Result<(), String> {
     let mut frame_time_log = optional_writer(config.frame_time_log.as_deref())?;
     let mut state_log = optional_writer(config.state_log.as_deref())?;
     let mut tick_state = TickState::new(config.seed);
-    let mut game_loop = GameLoop::new();
+    let mut game_loop = GameLoop::new_seeded(config.seed);
 
     if let Some(writer) = state_log.as_mut() {
         write_state_event(writer, &mut tick_state, config, "scenario-start")?;
@@ -198,6 +199,9 @@ pub async fn run_automated(config: &RuntimeConfig) -> Result<(), String> {
     if let (Some(frame_count), Some(frames_out)) = (config.capture_frames, &config.frames_out) {
         fs::create_dir_all(frames_out)
             .map_err(|error| format!("failed to create {}: {error}", frames_out.display()))?;
+        let frame_metadata_path = frames_out.join(FRAME_METADATA_FILENAME);
+        let mut frame_metadata = optional_writer(Some(frame_metadata_path.as_path()))?
+            .ok_or_else(|| "failed to open frame metadata writer".to_string())?;
         let frame_digits = capture_frame_digits(frame_count);
         for frame_index in 0..frame_count {
             render_tick(
@@ -215,7 +219,11 @@ pub async fn run_automated(config: &RuntimeConfig) -> Result<(), String> {
             let rgba = renderer.capture_rgba8()?;
             let path = frames_out.join(format!("frame_{frame_index:0frame_digits$}.png"));
             verify::save_png(&path, renderer.size().width, renderer.size().height, &rgba)?;
+            write_frame_metadata(&mut frame_metadata, frame_index, config, &game_loop)?;
         }
+        frame_metadata
+            .flush()
+            .map_err(|error| format!("failed to flush frame metadata: {error}"))?;
     }
 
     if let Some(path) = &config.screenshot {
@@ -374,7 +382,7 @@ fn enqueue_audio_msg(
 }
 
 pub fn runtime_usage() -> String {
-    "Usage: asteroids [--headless] [--screenshot <path>] [--capture-frames <N> --frames-out <dir>] [--audio-capture <secs> --wav-out <path>] [--seed <u64>] [--fixed-dt <secs>] [--simulate-secs <secs>] [--scenario <name>] [--xrun-log <path>] [--frame-time-log <path>] [--state-log <path>] [--bloom-intensity <value>] [--bloom-threshold <value>]\n\nScenarios: demo, idle, ship-spinning, horizontal-sweep, static-bright-line, static-bright-line-low-dwell, static-bright-line-high-dwell, gamma-ramp, thrust-1s, ship-spinning-with-thrust, heavy-input".to_string()
+    "Usage: asteroids [--headless] [--screenshot <path>] [--capture-frames <N> --frames-out <dir>] [--audio-capture <secs> --wav-out <path>] [--seed <u64>] [--fixed-dt <secs>] [--simulate-secs <secs>] [--scenario <name>] [--xrun-log <path>] [--frame-time-log <path>] [--state-log <path>] [--bloom-intensity <value>] [--bloom-threshold <value>]\n\nScenarios: demo, idle, ship-spinning, horizontal-sweep, static-bright-line, static-bright-line-low-dwell, static-bright-line-high-dwell, gamma-ramp, thrust-1s, ship-spinning-with-thrust, heavy-input, asteroids-round-1".to_string()
 }
 
 fn render_tick(
@@ -399,7 +407,9 @@ fn render_tick(
         });
         substeps = report.substeps;
         dropped_accumulator_seconds = report.dropped_accumulator_seconds;
-        params = params.with_ship(game_loop.interpolated_ship());
+        params = params
+            .with_ship(game_loop.interpolated_ship())
+            .with_asteroids(game_loop.interpolated_asteroids());
     }
 
     renderer.render(params)?;
@@ -464,21 +474,80 @@ fn write_state_tick_event(
 ) -> Result<(), String> {
     let rng_outcome = tick_state.rng.next_u64();
     let state = game_loop.current();
-    writeln!(
-        writer,
-        "{{\"tick\":{tick},\"time\":{sim_time:.6},\"event\":\"tick\",\"scenario\":\"{}\",\"seed\":{},\"rng\":{rng_outcome},\"physics_tick\":{},\"substeps\":{substeps},\"dropped_accumulator_seconds\":{dropped_accumulator_seconds:.6},\"ship_x\":{ship_x:.6},\"ship_y\":{ship_y:.6},\"ship_angle\":{ship_angle:.6},\"ship_vx\":{ship_vx:.6},\"ship_vy\":{ship_vy:.6}}}",
-        config.scenario.name(),
-        config.seed.unwrap_or(0),
-        game_loop.tick(),
-        tick = tick_state.tick,
-        sim_time = tick_state.sim_time,
-        ship_x = state.ship.position.x,
-        ship_y = state.ship.position.y,
-        ship_angle = state.ship.angle,
-        ship_vx = state.ship.velocity.x,
-        ship_vy = state.ship.velocity.y,
-    )
+    (|| -> std::io::Result<()> {
+        write!(
+            writer,
+            "{{\"tick\":{tick},\"time\":{sim_time:.6},\"event\":\"tick\",\"scenario\":\"{}\",\"seed\":{},\"rng\":{rng_outcome},\"physics_tick\":{},\"substeps\":{substeps},\"dropped_accumulator_seconds\":{dropped_accumulator_seconds:.6},\"ship_x\":{ship_x:.6},\"ship_y\":{ship_y:.6},\"ship_angle\":{ship_angle:.6},\"ship_vx\":{ship_vx:.6},\"ship_vy\":{ship_vy:.6}",
+            config.scenario.name(),
+            config.seed.unwrap_or(0),
+            game_loop.tick(),
+            tick = tick_state.tick,
+            sim_time = tick_state.sim_time,
+            ship_x = state.ship.position.x,
+            ship_y = state.ship.position.y,
+            ship_angle = state.ship.angle,
+            ship_vx = state.ship.velocity.x,
+            ship_vy = state.ship.velocity.y,
+        )?;
+        write_asteroid_fields(writer, state)?;
+        writeln!(writer, "}}")
+    })()
     .map_err(|error| format!("failed to write state log: {error}"))
+}
+
+fn write_frame_metadata(
+    writer: &mut BufWriter<File>,
+    frame_index: usize,
+    config: &RuntimeConfig,
+    game_loop: &GameLoop,
+) -> Result<(), String> {
+    let state = game_loop.current();
+    (|| -> std::io::Result<()> {
+        write!(
+            writer,
+            "{{\"frame\":{frame_index},\"scenario\":\"{}\",\"seed\":{},\"physics_tick\":{}",
+            config.scenario.name(),
+            config.seed.unwrap_or(0),
+            game_loop.tick(),
+        )?;
+        write_asteroid_fields(writer, state)?;
+        writeln!(writer, "}}")
+    })()
+    .map_err(|error| format!("failed to write frame metadata: {error}"))
+}
+
+fn write_asteroid_fields(
+    writer: &mut BufWriter<File>,
+    state: &game::GameState,
+) -> std::io::Result<()> {
+    let counts = state.asteroid_size_counts();
+    write!(
+        writer,
+        ",\"round\":{},\"asteroid_count\":{},\"asteroids_large\":{},\"asteroids_medium\":{},\"asteroids_small\":{},\"asteroid_wrapped\":{},\"asteroids\":[",
+        state.round,
+        state.asteroid_count,
+        counts.large,
+        counts.medium,
+        counts.small,
+        state.any_asteroid_wrapped_last_tick(),
+    )?;
+    for (index, asteroid) in state.asteroids.iter().enumerate() {
+        if index > 0 {
+            write!(writer, ",")?;
+        }
+        write!(
+            writer,
+            "{{\"id\":{},\"size\":\"{}\",\"x\":{:.6},\"y\":{:.6},\"vx\":{:.6},\"vy\":{:.6},\"wrapped\":{}}}",
+            asteroid.id,
+            asteroid.size.name(),
+            asteroid.position.x,
+            asteroid.position.y,
+            asteroid.velocity.x,
+            asteroid.velocity.y,
+            asteroid.wrapped_last_tick,
+        )?;
+    }
+    write!(writer, "]")
 }
 
 struct TickState {
@@ -682,5 +751,26 @@ mod tests {
         assert_eq!(config.scenario, Scenario::HeavyInput);
         assert!(config.scenario.uses_game_simulation());
         assert_eq!(config.simulate_secs, Some(10.0));
+    }
+
+    #[test]
+    fn parses_asteroids_round_one_scenario() {
+        let config = RuntimeConfig::from_args(
+            [
+                "--headless",
+                "--scenario",
+                "asteroids-round-1",
+                "--capture-frames",
+                "144",
+                "--frames-out",
+                "/tmp/asteroids-round-1",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap();
+
+        assert_eq!(config.scenario, Scenario::AsteroidsRound1);
+        assert!(config.scenario.uses_game_simulation());
     }
 }

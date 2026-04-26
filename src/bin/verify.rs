@@ -7,6 +7,7 @@ use std::{
 };
 
 use asteroids::verify;
+use serde_json::Value;
 
 const SUBCOMMANDS: &[&str] = &[
     "decay-fit",
@@ -69,7 +70,9 @@ fn run() -> Result<(), String> {
         "frame-time-p99" => cmd_frame_time_p99(&mut args),
         "state-trace" => cmd_state_trace(&mut args),
         "soul-visible" => cmd_soul_visible(&mut args),
-        "asteroid-count" | "screen-wrap" | "lives-display" | "heartbeat-tempo" => Err(format!(
+        "asteroid-count" => cmd_asteroid_count(&mut args),
+        "screen-wrap" => cmd_screen_wrap(&mut args),
+        "lives-display" | "heartbeat-tempo" => Err(format!(
             "{command} is reserved for a later gameplay/audio milestone\n\n{}",
             subcommand_help(&command)
         )),
@@ -590,6 +593,138 @@ fn cmd_state_trace(args: &mut CliArgs) -> Result<(), String> {
     }
     println!("state-trace ok: events={}", events.len());
     Ok(())
+}
+
+fn cmd_asteroid_count(args: &mut CliArgs) -> Result<(), String> {
+    let frames = args.path("--frames")?;
+    let expected_large: i64 = args.value("--expected-large")?;
+    let tolerance: i64 = args.value_or("--tolerance", 0_i64)?;
+    args.finish()?;
+
+    let metadata = load_frame_metadata(&frames)?;
+    let sample = metadata
+        .iter()
+        .rev()
+        .find(|value| {
+            value
+                .get("asteroids_large")
+                .and_then(Value::as_i64)
+                .is_some()
+        })
+        .ok_or_else(|| {
+            format!(
+                "asteroid-count failed: {} did not contain asteroid metadata",
+                frames.display()
+            )
+        })?;
+    let actual = sample
+        .get("asteroids_large")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let delta = (actual - expected_large).abs();
+    if delta > tolerance {
+        return Err(format!(
+            "asteroid-count failed: large={actual}, expected {expected_large} +/- {tolerance}"
+        ));
+    }
+    println!("asteroid-count ok: large={actual}");
+    Ok(())
+}
+
+fn cmd_screen_wrap(args: &mut CliArgs) -> Result<(), String> {
+    let state_log = match args.optional_string("--state-log")? {
+        Some(path) => PathBuf::from(path),
+        None => args.path("--log")?,
+    };
+    args.finish()?;
+
+    let events = verify::load_state_trace(&state_log)?;
+    let mut tick_events = 0;
+    let mut saw_asteroids = false;
+    let mut saw_wrap = false;
+    for event in &events {
+        if event.event.as_deref() != Some("tick") {
+            continue;
+        }
+        tick_events += 1;
+        if event
+            .value
+            .get("asteroid_wrapped")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            saw_wrap = true;
+        }
+        let Some(asteroids) = event.value.get("asteroids").and_then(Value::as_array) else {
+            continue;
+        };
+        if !asteroids.is_empty() {
+            saw_asteroids = true;
+        }
+        for asteroid in asteroids {
+            let x = asteroid.get("x").and_then(Value::as_f64).ok_or_else(|| {
+                format!(
+                    "screen-wrap failed: missing asteroid x at line {}",
+                    event.line
+                )
+            })?;
+            let y = asteroid.get("y").and_then(Value::as_f64).ok_or_else(|| {
+                format!(
+                    "screen-wrap failed: missing asteroid y at line {}",
+                    event.line
+                )
+            })?;
+            if !(-1.000001..=1.000001).contains(&x) || !(-1.000001..=1.000001).contains(&y) {
+                return Err(format!(
+                    "screen-wrap failed: asteroid out of playfield at line {}: x={x:.6} y={y:.6}",
+                    event.line
+                ));
+            }
+            if asteroid
+                .get("wrapped")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                saw_wrap = true;
+            }
+        }
+    }
+    if tick_events == 0 {
+        return Err("screen-wrap failed: no tick events in state log".to_string());
+    }
+    if !saw_asteroids {
+        return Err("screen-wrap failed: no asteroid state in tick events".to_string());
+    }
+    if !saw_wrap {
+        return Err("screen-wrap failed: no asteroid wrap event observed".to_string());
+    }
+    println!("screen-wrap ok: tick_events={tick_events}");
+    Ok(())
+}
+
+fn load_frame_metadata(frames: &Path) -> Result<Vec<Value>, String> {
+    let path = frames.join(asteroids::runtime::FRAME_METADATA_FILENAME);
+    let content = fs::read_to_string(&path)
+        .map_err(|error| format!("failed to read frame metadata {}: {error}", path.display()))?;
+    let mut values = Vec::new();
+    for (line_index, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(trimmed).map_err(|error| {
+            format!(
+                "failed to parse frame metadata {} line {}: {error}",
+                path.display(),
+                line_index + 1
+            )
+        })?;
+        values.push(value);
+    }
+    if values.is_empty() {
+        return Err(format!("frame metadata {} had no samples", path.display()));
+    }
+    Ok(values)
 }
 
 fn decay_fit_from_frames(dir: &Path, fixed_dt: f64) -> Result<verify::DecayFit, String> {
@@ -1196,8 +1331,8 @@ fn subcommand_help(command: &str) -> String {
         "ship-outline" => "Usage: verify ship-outline --frames <dir> --vertex-count <n> --rotation-rate-rad-per-sec <rate> --tolerance <value>".to_string(),
         "trail-luminance" => "Usage: verify trail-luminance --frames <dir> --behind-vector --min-luminance <value>".to_string(),
         "soul-visible" => "Usage: verify soul-visible --frames <dir> [--rotation-tolerance <rad/s>] [--min-trail-luminance <luma>]".to_string(),
-        "asteroid-count" => "Usage: verify asteroid-count --frame <png> --count <n>".to_string(),
-        "screen-wrap" => "Usage: verify screen-wrap --log <state-jsonl> --expect <event,...>".to_string(),
+        "asteroid-count" => "Usage: verify asteroid-count --frames <dir> --expected-large <n> [--tolerance <n>]".to_string(),
+        "screen-wrap" => "Usage: verify screen-wrap --state-log <state-jsonl>".to_string(),
         "lives-display" => "Usage: verify lives-display --frame <png> --max-displayed <n> --state-log <state-jsonl>".to_string(),
         "playfield-rect" => "Usage: verify playfield-rect --frame <png> --aspect <w:h> [--centered] [--bezel-min-fraction <value>]".to_string(),
         "audio-rms" => "Usage: verify audio-rms --wav <wav> --min <value> [--max <value>]".to_string(),

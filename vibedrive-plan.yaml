@@ -518,7 +518,7 @@ tasks:
         Asteroids drift with constant velocity, screen wrap, and survive collisions until shot.
         Update GameSnapshot.asteroid_count each tick so the eventual heartbeat voice can read it.
         Add unit tests for: split-into-2-smaller-on-hit rule (large -> 2 medium, medium -> 2 small, small -> destroyed) and per-round spawn count progression.
-      status: todo
+      status: done
       workflow: implement
       deps:
         - game-loop-physics

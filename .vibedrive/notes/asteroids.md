@@ -1,0 +1,1 @@
+Implemented three asteroid size tiers with irregular beam hulls, split-on-hit, constant drift/wrap, round-1 count 4 and +2 per wave capped at 11 per the listings. Tuned radii 30/15/7 and drift from raw velocity clamp +/-6..31. References recorded in .vibedrive/notes/asteroids.md. cargo test and requested headless/verifier commands exit 0.

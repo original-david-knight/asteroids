@@ -433,7 +433,8 @@ impl ApplicationHandler for AsteroidsApp {
                 });
                 let params =
                     FrameParams::new(Scenario::Idle, self.game.render_time_seconds(), frame_dt)
-                        .with_ship(self.game.interpolated_ship());
+                        .with_ship(self.game.interpolated_ship())
+                        .with_asteroids(self.game.interpolated_asteroids());
 
                 if let Some(window) = self.window.as_ref() {
                     window.pre_present_notify();

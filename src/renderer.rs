@@ -11,7 +11,7 @@ use winit::{dpi::PhysicalSize, window::Window};
 
 use crate::{
     beam::{self, BeamCommand, BeamEmitter, BeamVertex, Vec2},
-    game::RenderShip,
+    game::{ASTEROID_HULL_VERTEX_COUNT, RenderAsteroid, RenderShip},
     tuning,
 };
 
@@ -29,6 +29,7 @@ pub enum Scenario {
     Thrust1s,
     ShipSpinningWithThrust,
     HeavyInput,
+    AsteroidsRound1,
 }
 
 impl Scenario {
@@ -45,6 +46,7 @@ impl Scenario {
             "thrust-1s" => Some(Self::Thrust1s),
             "ship-spinning-with-thrust" => Some(Self::ShipSpinningWithThrust),
             "heavy-input" => Some(Self::HeavyInput),
+            "asteroids-round-1" => Some(Self::AsteroidsRound1),
             _ => None,
         }
     }
@@ -62,20 +64,22 @@ impl Scenario {
             Self::Thrust1s => "thrust-1s",
             Self::ShipSpinningWithThrust => "ship-spinning-with-thrust",
             Self::HeavyInput => "heavy-input",
+            Self::AsteroidsRound1 => "asteroids-round-1",
         }
     }
 
     pub fn uses_game_simulation(self) -> bool {
-        matches!(self, Self::HeavyInput)
+        matches!(self, Self::HeavyInput | Self::AsteroidsRound1)
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct FrameParams {
     pub scenario: Scenario,
     pub time_seconds: f32,
     pub frame_dt_seconds: f32,
     pub ship: Option<RenderShip>,
+    pub asteroids: Vec<RenderAsteroid>,
 }
 
 impl FrameParams {
@@ -85,11 +89,17 @@ impl FrameParams {
             time_seconds,
             frame_dt_seconds,
             ship: None,
+            asteroids: Vec::new(),
         }
     }
 
     pub fn with_ship(mut self, ship: RenderShip) -> Self {
         self.ship = Some(ship);
+        self
+    }
+
+    pub fn with_asteroids(mut self, asteroids: Vec<RenderAsteroid>) -> Self {
+        self.asteroids = asteroids;
         self
     }
 }
@@ -323,6 +333,7 @@ impl Renderer {
             params.scenario,
             params.time_seconds,
             params.ship,
+            &params.asteroids,
             self.size,
         );
 
@@ -524,6 +535,7 @@ impl HeadlessRenderer {
             params.scenario,
             params.time_seconds,
             params.ship,
+            &params.asteroids,
             self.size,
         );
 
@@ -846,6 +858,7 @@ fn emit_frame_beams(
     scenario: Scenario,
     time_s: f32,
     ship: Option<RenderShip>,
+    asteroids: &[RenderAsteroid],
     size: PhysicalSize<u32>,
 ) {
     let playfield = PlayfieldRect::centered_4_3(size);
@@ -855,7 +868,14 @@ fn emit_frame_beams(
 
     emit_bezel_readouts(frame_emitter, playfield, size);
     if let Some(ship) = ship {
+        for asteroid in asteroids {
+            emit_asteroid_outline(gameplay_emitter, *asteroid);
+        }
         emit_ship_outline(gameplay_emitter, ship.position, ship.angle, ship.scale, 1.0);
+    } else if !asteroids.is_empty() {
+        for asteroid in asteroids {
+            emit_asteroid_outline(gameplay_emitter, *asteroid);
+        }
     } else {
         emit_scenario_beams(gameplay_emitter, scenario, time_s);
     }
@@ -994,7 +1014,9 @@ fn emit_scenario_beams(emitter: &mut BeamEmitter, scenario: Scenario, time_s: f3
             emit_static_bright_line(emitter, tuning::PHOSPHOR_TRAIL_HIGH_DWELL_US)
         }
         Scenario::GammaRamp => emit_gamma_ramp_beams(emitter),
-        Scenario::Thrust1s | Scenario::HeavyInput => emit_idle_beams(emitter),
+        Scenario::Thrust1s | Scenario::HeavyInput | Scenario::AsteroidsRound1 => {
+            emit_idle_beams(emitter)
+        }
     }
 }
 
@@ -1069,6 +1091,17 @@ fn emit_ship_outline(
             vertices[end],
             intensity,
         );
+    }
+}
+
+fn emit_asteroid_outline(emitter: &mut BeamEmitter, asteroid: RenderAsteroid) {
+    let hull_vertices = asteroid.hull.vertices();
+    let vertices: [Vec2; ASTEROID_HULL_VERTEX_COUNT] =
+        std::array::from_fn(|index| asteroid.position + hull_vertices[index] * asteroid.radius);
+    for index in 0..vertices.len() {
+        let start = vertices[index];
+        let end = vertices[(index + 1) % vertices.len()];
+        emitter.emit_asteroid_hull_segment(start, end, 1.0);
     }
 }
 

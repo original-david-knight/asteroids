@@ -11,6 +11,32 @@ pub const DEFAULT_BEAM_RGB: [f32; 3] = [1.0, 1.0, 1.0];
 pub const SHIP_ROTATION_RATE_RAD_PER_SEC: f32 = 3.0;
 pub const SHIP_SPINNING_SCALE: f32 = 0.55;
 
+/// Step-11 asteroid constants tuned against the original 6502 listings:
+/// - Norbert Kehrer static binary translation / disassembly-derived exact port:
+///   https://norbertkehrer.github.io/ast_js/AsteroidsJS.html
+/// - https://computerarcheology.com/Arcade/Asteroids/Code.html
+/// - https://6502disassembly.com/va-asteroids/Asteroids.html
+///
+/// The listings store object coordinates at 8 raw position units per visible
+/// game unit and clamp asteroid velocity bytes to +/-6..31 at $7233-$724e.
+pub const ASTEROID_ORIGINAL_PLAYFIELD_HEIGHT_UNITS: f32 = 768.0;
+pub const ASTEROID_ORIGINAL_VISIBLE_UNITS_TO_NDC: f32 =
+    2.0 / ASTEROID_ORIGINAL_PLAYFIELD_HEIGHT_UNITS;
+pub const ASTEROID_ORIGINAL_RAW_UNITS_PER_VISIBLE_UNIT: f32 = 8.0;
+pub const ASTEROID_ORIGINAL_FPS: f32 = 60.0;
+pub const ASTEROID_RAW_VELOCITY_TO_NDC_PER_SEC: f32 = ASTEROID_ORIGINAL_FPS
+    * ASTEROID_ORIGINAL_VISIBLE_UNITS_TO_NDC
+    / ASTEROID_ORIGINAL_RAW_UNITS_PER_VISIBLE_UNIT;
+pub const ASTEROID_RAW_VELOCITY_MIN: f32 = 6.0;
+pub const ASTEROID_RAW_VELOCITY_MAX: f32 = 31.0;
+pub const ASTEROID_DRIFT_SPEED_MIN_NDC_PER_SEC: f32 =
+    ASTEROID_RAW_VELOCITY_MIN * ASTEROID_RAW_VELOCITY_TO_NDC_PER_SEC;
+pub const ASTEROID_DRIFT_SPEED_MAX_NDC_PER_SEC: f32 =
+    ASTEROID_RAW_VELOCITY_MAX * ASTEROID_RAW_VELOCITY_TO_NDC_PER_SEC;
+pub const ASTEROID_LARGE_RADIUS_UNITS: f32 = 30.0;
+pub const ASTEROID_MEDIUM_RADIUS_UNITS: f32 = 15.0;
+pub const ASTEROID_SMALL_RADIUS_UNITS: f32 = 7.0;
+
 pub const BEAM_QUAD_HALF_WIDTH_PIXELS: f32 = 6.0;
 pub const BEAM_SIGMA_PIXELS: f32 = 1.0;
 pub const BEAM_SIGMA_DWELL_GROWTH: f32 = 0.50;
