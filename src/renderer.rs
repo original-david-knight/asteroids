@@ -43,6 +43,7 @@ pub enum Scenario {
     UfoSmall,
     ScoreProgression,
     EightExtraLives,
+    HyperspaceSpam,
 }
 
 impl Scenario {
@@ -70,6 +71,7 @@ impl Scenario {
             "ufo-small" => Some(Self::UfoSmall),
             "score-progression" => Some(Self::ScoreProgression),
             "eight-extra-lives" => Some(Self::EightExtraLives),
+            "hyperspace-spam" => Some(Self::HyperspaceSpam),
             _ => None,
         }
     }
@@ -98,6 +100,7 @@ impl Scenario {
             Self::UfoSmall => "ufo-small",
             Self::ScoreProgression => "score-progression",
             Self::EightExtraLives => "eight-extra-lives",
+            Self::HyperspaceSpam => "hyperspace-spam",
         }
     }
 
@@ -113,6 +116,7 @@ impl Scenario {
                 | Self::UfoSmall
                 | Self::ScoreProgression
                 | Self::EightExtraLives
+                | Self::HyperspaceSpam
         )
     }
 
@@ -1153,7 +1157,8 @@ fn emit_scenario_beams(emitter: &mut BeamEmitter, scenario: Scenario, time_s: f3
         | Scenario::UfoLarge
         | Scenario::UfoSmall
         | Scenario::ScoreProgression
-        | Scenario::EightExtraLives => emit_idle_beams(emitter),
+        | Scenario::EightExtraLives
+        | Scenario::HyperspaceSpam => emit_idle_beams(emitter),
     }
 }
 

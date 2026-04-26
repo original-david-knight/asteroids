@@ -1,0 +1,1 @@
+Implemented H-only hyperspace in GameState with a 1s cooldown, seeded RNG target placement, and a seeded 10% exit self-destruct roll that calls the normal ship death flow. Added hyperspace-spam state-trace coverage and unit tests for cooldown, probability, target bounds, and death flow.

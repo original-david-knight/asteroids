@@ -697,7 +697,7 @@ tasks:
         Self-destruct chance: ~10% on hyperspace exit per Open Question 6 (faithful, kept). Use a seedable RNG for deterministic testing.
         Self-destruct triggers the same death flow as ship-asteroid collision (lives decrement, respawn or game-over).
         Add unit tests for: cooldown timer (second invocation within cooldown is rejected), self-destruct probability (under a fixed seed the rate matches ~10% over many rolls), and teleport target placement (random within playfield bounds).
-      status: todo
+      status: done
       workflow: implement
       deps:
         - scoring-and-lives

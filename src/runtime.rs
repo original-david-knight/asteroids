@@ -581,7 +581,7 @@ fn sleep_until(deadline: Instant) {
 }
 
 pub fn runtime_usage() -> String {
-    "Usage: asteroids [--headless] [--screenshot <path>] [--capture-frames <N> --frames-out <dir>] [--audio-capture <secs> --wav-out <path>] [--seed <u64>] [--fixed-dt <secs>] [--simulate-secs <secs>] [--scenario <name>] [--xrun-log <path>] [--frame-time-log <path>] [--state-log <path>] [--bloom-intensity <value>] [--bloom-threshold <value>]\n\nScenarios: demo, idle, ship-spinning, horizontal-sweep, static-bright-line, static-bright-line-low-dwell, static-bright-line-high-dwell, gamma-ramp, thrust-1s, ship-spinning-with-thrust, heavy-input, asteroids-round-1, bullet-hit-asteroid, ship-collides-with-asteroid, lose-all-lives, explosion-storm, heartbeat-curve, fire-3, ufo-large, ufo-small, score-progression, eight-extra-lives".to_string()
+    "Usage: asteroids [--headless] [--screenshot <path>] [--capture-frames <N> --frames-out <dir>] [--audio-capture <secs> --wav-out <path>] [--seed <u64>] [--fixed-dt <secs>] [--simulate-secs <secs>] [--scenario <name>] [--xrun-log <path>] [--frame-time-log <path>] [--state-log <path>] [--bloom-intensity <value>] [--bloom-threshold <value>]\n\nScenarios: demo, idle, ship-spinning, horizontal-sweep, static-bright-line, static-bright-line-low-dwell, static-bright-line-high-dwell, gamma-ramp, thrust-1s, ship-spinning-with-thrust, heavy-input, asteroids-round-1, bullet-hit-asteroid, ship-collides-with-asteroid, lose-all-lives, explosion-storm, heartbeat-curve, fire-3, ufo-large, ufo-small, score-progression, eight-extra-lives, hyperspace-spam".to_string()
 }
 
 fn game_loop_for_scenario(scenario: Scenario, seed: Option<u64>) -> GameLoop {
@@ -602,6 +602,9 @@ fn game_loop_for_scenario(scenario: Scenario, seed: Option<u64>) -> GameLoop {
         }
         Scenario::EightExtraLives => {
             GameLoop::from_state(game::GameState::eight_extra_lives_scenario(seed))
+        }
+        Scenario::HyperspaceSpam => {
+            GameLoop::from_state(game::GameState::hyperspace_spam_scenario(seed))
         }
         _ => GameLoop::new_seeded(seed),
     }
@@ -687,8 +690,19 @@ fn scripted_controls(scenario: Scenario, time_seconds: f32) -> ControlState {
             fire: time_seconds < 0.02,
             ..ControlState::default()
         },
+        Scenario::HyperspaceSpam => ControlState {
+            hyperspace: hyperspace_spam_pressed(time_seconds),
+            ..ControlState::default()
+        },
         _ => ControlState::default(),
     }
+}
+
+fn hyperspace_spam_pressed(time_seconds: f32) -> bool {
+    const PULSE_SECONDS: f32 = 0.02;
+    [0.0, 0.25, 1.10, 1.25, 2.20]
+        .into_iter()
+        .any(|start| time_seconds >= start && time_seconds < start + PULSE_SECONDS)
 }
 
 fn write_state_event(
@@ -1095,6 +1109,7 @@ mod tests {
             "lose-all-lives",
             "score-progression",
             "eight-extra-lives",
+            "hyperspace-spam",
         ] {
             let config = RuntimeConfig::from_args(
                 ["--headless", "--scenario", name]

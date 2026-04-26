@@ -41,6 +41,8 @@ pub const BULLET_RADIUS_NDC: f32 = 0.012;
 pub const SHIP_COLLISION_RADIUS_NDC: f32 = 0.44 * tuning::SHIP_SPINNING_SCALE;
 pub const SHIP_RESPAWN_DELAY_SECONDS: f32 = 1.25;
 pub const SHIP_RESPAWN_INVULNERABILITY_SECONDS: f32 = 1.25;
+pub const HYPERSPACE_COOLDOWN_SECONDS: f32 = 1.0;
+pub const HYPERSPACE_SELF_DESTRUCT_CHANCE: f32 = 0.10;
 pub const UFO_SMALL_SCORE_THRESHOLD: u32 = 10_000;
 pub const UFO_SPAWN_SCORE_STEP_POINTS: u32 = 2_500;
 pub const UFO_BULLET_SPEED_NDC_PER_SEC: f32 = 1.25;
@@ -369,6 +371,9 @@ pub enum GameEventKind {
     LivesDecremented,
     Respawn,
     GameOver,
+    HyperspaceTriggered,
+    HyperspaceCooldownRejected,
+    HyperspaceSelfDestruct,
 }
 
 impl GameEventKind {
@@ -393,6 +398,9 @@ impl GameEventKind {
             Self::LivesDecremented => "lives-decremented",
             Self::Respawn => "respawn",
             Self::GameOver => "game-over",
+            Self::HyperspaceTriggered => "hyperspace-triggered",
+            Self::HyperspaceCooldownRejected => "cooldown-rejected",
+            Self::HyperspaceSelfDestruct => "hyperspace-self-destruct",
         }
     }
 }
@@ -497,6 +505,8 @@ pub struct GameState {
     next_extra_life_score: u32,
     respawn_timer_seconds: f32,
     invulnerability_timer_seconds: f32,
+    hyperspace_cooldown_timer_seconds: f32,
+    hyperspace_was_down: bool,
     ufo_spawn_timer_seconds: f32,
     fire_was_down: bool,
     events: Vec<GameEvent>,
@@ -587,6 +597,12 @@ impl GameState {
         state
     }
 
+    pub fn hyperspace_spam_scenario(seed: Option<u64>) -> Self {
+        let mut state = Self::empty_seeded(seed);
+        state.ufo_spawn_timer_seconds = f32::INFINITY;
+        state
+    }
+
     fn empty_seeded(seed: Option<u64>) -> Self {
         Self {
             ship: ShipState::default(),
@@ -606,6 +622,8 @@ impl GameState {
             next_extra_life_score: EXTRA_LIFE_SCORE_INTERVAL,
             respawn_timer_seconds: 0.0,
             invulnerability_timer_seconds: 0.0,
+            hyperspace_cooldown_timer_seconds: 0.0,
+            hyperspace_was_down: false,
             ufo_spawn_timer_seconds: ufo_spawn_interval_seconds_for_score(SCORE_PLACEHOLDER),
             fire_was_down: false,
             events: Vec::new(),
@@ -619,9 +637,11 @@ impl GameState {
         self.events.clear();
         self.update_scripted_scenario();
         self.update_respawn(dt);
+        self.update_hyperspace_cooldown(dt);
         if self.alive {
             self.ship.integrate(input, dt);
         }
+        self.update_hyperspace(input);
         for asteroid in &mut self.asteroids {
             asteroid.integrate(dt);
         }
@@ -798,6 +818,33 @@ impl GameState {
         self.fire_was_down = input.fire;
         if self.alive && !self.game_over && fire_pressed {
             self.fire_bullet();
+        }
+    }
+
+    fn update_hyperspace_cooldown(&mut self, dt: f32) {
+        if self.hyperspace_cooldown_timer_seconds > 0.0 {
+            self.hyperspace_cooldown_timer_seconds =
+                (self.hyperspace_cooldown_timer_seconds - dt).max(0.0);
+        }
+    }
+
+    fn update_hyperspace(&mut self, input: &ControlState) {
+        let hyperspace_pressed = input.hyperspace && !self.hyperspace_was_down;
+        self.hyperspace_was_down = input.hyperspace;
+        if !hyperspace_pressed || !self.alive || self.game_over {
+            return;
+        }
+        if self.hyperspace_cooldown_timer_seconds > 0.0 {
+            self.push_event(GameEventKind::HyperspaceCooldownRejected);
+            return;
+        }
+
+        self.hyperspace_cooldown_timer_seconds = HYPERSPACE_COOLDOWN_SECONDS;
+        self.ship.position = random_hyperspace_target(&mut self.rng);
+        self.push_event(GameEventKind::HyperspaceTriggered);
+        if hyperspace_self_destructs(&mut self.rng) {
+            self.push_event(GameEventKind::HyperspaceSelfDestruct);
+            self.kill_ship();
         }
     }
 
@@ -1332,6 +1379,21 @@ fn random_direction(rng: &mut SeededRng) -> Vec2 {
     Vec2::new(cos, sin)
 }
 
+fn random_hyperspace_target(rng: &mut SeededRng) -> Vec2 {
+    Vec2::new(
+        random_range(rng, PLAYFIELD_MIN.x, PLAYFIELD_MAX.x),
+        random_range(rng, PLAYFIELD_MIN.y, PLAYFIELD_MAX.y),
+    )
+}
+
+fn random_range(rng: &mut SeededRng, min: f32, max: f32) -> f32 {
+    min + rng.next_f32() * (max - min)
+}
+
+fn hyperspace_self_destructs(rng: &mut SeededRng) -> bool {
+    rng.next_f32() < HYPERSPACE_SELF_DESTRUCT_CHANCE
+}
+
 impl ShipState {
     fn integrate(&mut self, input: &ControlState, dt: f32) {
         let rotation_direction = bool_axis(input.rotate_left) - bool_axis(input.rotate_right);
@@ -1449,7 +1511,15 @@ impl GameLoop {
         {
             self.previous = self.current.clone();
             self.current.step(input, FIXED_TIMESTEP_SECONDS);
+            let instant_ship_reposition = self
+                .current
+                .events()
+                .iter()
+                .any(|event| event.kind == GameEventKind::HyperspaceTriggered);
             self.pending_events.extend_from_slice(self.current.events());
+            if instant_ship_reposition {
+                self.previous = self.current.clone();
+            }
             self.tick += 1;
             substeps += 1;
             self.accumulator_seconds -= FIXED_TIMESTEP_SECONDS;
@@ -2027,6 +2097,116 @@ mod tests {
 
         assert!(state.alive);
         assert!(state.snapshot().is_alive());
+    }
+
+    #[test]
+    fn hyperspace_rejects_second_invocation_during_cooldown() {
+        let mut state = GameState::hyperspace_spam_scenario(Some(1));
+        let hyperspace = ControlState {
+            hyperspace: true,
+            ..ControlState::default()
+        };
+
+        state.step(&hyperspace, FIXED_TIMESTEP_SECONDS);
+        assert!(
+            state
+                .events()
+                .iter()
+                .any(|event| event.kind == GameEventKind::HyperspaceTriggered)
+        );
+        let position_after_first_jump = state.ship.position;
+        let lives_after_first_jump = state.lives;
+
+        state.step(&ControlState::default(), FIXED_TIMESTEP_SECONDS);
+        state.step(&hyperspace, FIXED_TIMESTEP_SECONDS);
+
+        assert_eq!(state.ship.position, position_after_first_jump);
+        assert_eq!(state.lives, lives_after_first_jump);
+        assert!(
+            state
+                .events()
+                .iter()
+                .any(|event| event.kind == GameEventKind::HyperspaceCooldownRejected)
+        );
+        assert!(!state.events().iter().any(|event| {
+            matches!(
+                event.kind,
+                GameEventKind::HyperspaceTriggered
+                    | GameEventKind::HyperspaceSelfDestruct
+                    | GameEventKind::ShipDied
+            )
+        }));
+    }
+
+    #[test]
+    fn hyperspace_self_destruct_roll_is_about_ten_percent_for_seeded_rng() {
+        let mut rng = rng_for_seed(Some(7));
+        let self_destructs = (0..1000)
+            .filter(|_| hyperspace_self_destructs(&mut rng))
+            .count();
+        let rate = self_destructs as f32 / 1000.0;
+
+        assert!(
+            (0.08..=0.12).contains(&rate),
+            "self_destructs={self_destructs}, rate={rate:.3}"
+        );
+    }
+
+    #[test]
+    fn hyperspace_targets_stay_inside_playfield_bounds() {
+        let mut rng = rng_for_seed(Some(11));
+
+        for _ in 0..1000 {
+            let target = random_hyperspace_target(&mut rng);
+            assert!(
+                (PLAYFIELD_MIN.x..=PLAYFIELD_MAX.x).contains(&target.x),
+                "x={}",
+                target.x
+            );
+            assert!(
+                (PLAYFIELD_MIN.y..=PLAYFIELD_MAX.y).contains(&target.y),
+                "y={}",
+                target.y
+            );
+        }
+    }
+
+    #[test]
+    fn hyperspace_self_destruct_uses_standard_ship_death_flow() {
+        let mut state = GameState::hyperspace_spam_scenario(Some(4));
+        let hyperspace = ControlState {
+            hyperspace: true,
+            ..ControlState::default()
+        };
+
+        state.step(&hyperspace, FIXED_TIMESTEP_SECONDS);
+
+        assert!(!state.alive);
+        assert_eq!(state.lives, INITIAL_LIVES - 1);
+        assert!(
+            state
+                .events()
+                .iter()
+                .any(|event| event.kind == GameEventKind::HyperspaceTriggered)
+        );
+        assert!(
+            state
+                .events()
+                .iter()
+                .any(|event| event.kind == GameEventKind::HyperspaceSelfDestruct)
+        );
+        assert!(
+            state
+                .events()
+                .iter()
+                .any(|event| event.kind == GameEventKind::ShipDied)
+        );
+        assert!(
+            state
+                .events()
+                .iter()
+                .any(|event| event.kind == GameEventKind::LivesDecremented)
+        );
     }
 
     #[test]
