@@ -97,7 +97,7 @@ Tradeoffs accepted: ~3-4x the code volume of Approach A (~3000 LOC vs ~800), lon
 - Hyperspace cooldown: ~1 second between uses (prevents spam); self-destruct chance ~10% on exit
 - Lives: 3 starting, +1 every 10,000 points, max display 6 lives onscreen
 - Asteroid sizes: large (radius ~30), medium (~15), small (~7); each splits into 2 of the next size down
-- Saucer: large UFO at score < 10k (random fire), small UFO at score ≥ 10k (aimed fire); spawn rate increases with score
+- Saucer: starts with large UFOs; each saucer spawn reduces the original reload timer, and once the reload byte's high bit clears later spawns can be small UFOs. After that point, small UFOs are guaranteed once score reaches 30,000; large UFOs fire randomly, small UFOs aim toward the ship.
 - Attract mode: rolling demo of asteroids drifting + score table after 30s idle on title screen
 - Tune all values against Norbert Kehrer's disassembly during step 11
 

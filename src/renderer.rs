@@ -1377,10 +1377,12 @@ fn emit_game_over_text(emitter: &mut BeamEmitter, local_x_scale: f32) {
         emitter,
         "GAME OVER",
         Vec2::new(0.0, 0.0),
-        0.105,
-        0.16,
-        0.028,
-        0.9,
+        BlockTextStyle {
+            glyph_width: 0.105,
+            glyph_height: 0.16,
+            gap: 0.028,
+            intensity: 0.9,
+        },
         local_x_scale,
     );
 }
@@ -1390,10 +1392,12 @@ fn emit_title_screen_beams(emitter: &mut BeamEmitter, high_score: u32, local_x_s
         emitter,
         "ASTEROIDS",
         Vec2::new(0.0, 0.42),
-        0.115,
-        0.18,
-        0.03,
-        0.92,
+        BlockTextStyle {
+            glyph_width: 0.115,
+            glyph_height: 0.18,
+            gap: 0.03,
+            intensity: 0.92,
+        },
         local_x_scale,
     );
     emit_high_score_table(emitter, high_score, 0.02, local_x_scale);
@@ -1419,10 +1423,12 @@ fn emit_high_score_table(
         emitter,
         "HIGH SCORE",
         Vec2::new(0.0, center_y + 0.14),
-        0.055,
-        0.09,
-        0.016,
-        0.72,
+        BlockTextStyle {
+            glyph_width: 0.055,
+            glyph_height: 0.09,
+            gap: 0.016,
+            intensity: 0.72,
+        },
         local_x_scale,
     );
 
@@ -1501,18 +1507,24 @@ fn wrap_attract_coordinate(value: f32) -> f32 {
 
 const BLOCK_TEXT_STROKE_OFFSET_NDC: f32 = 0.0032;
 
-fn emit_block_text(
-    emitter: &mut BeamEmitter,
-    text: &str,
-    center: Vec2,
+#[derive(Clone, Copy)]
+struct BlockTextStyle {
     glyph_width: f32,
     glyph_height: f32,
     gap: f32,
     intensity: f32,
+}
+
+fn emit_block_text(
+    emitter: &mut BeamEmitter,
+    text: &str,
+    center: Vec2,
+    style: BlockTextStyle,
     local_x_scale: f32,
 ) {
-    let glyph_width = glyph_width * local_x_scale;
-    let gap = gap * local_x_scale;
+    let glyph_width = style.glyph_width * local_x_scale;
+    let glyph_height = style.glyph_height;
+    let gap = style.gap * local_x_scale;
     let total_width = text.chars().fold(0.0, |width, ch| {
         width
             + if ch == ' ' {
@@ -1533,7 +1545,7 @@ fn emit_block_text(
             ch,
             Vec2::new(x, center.y - glyph_height * 0.5),
             Vec2::new(glyph_width, glyph_height),
-            intensity,
+            style.intensity,
         );
         x += glyph_width + gap;
     }

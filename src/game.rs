@@ -65,11 +65,13 @@ pub const SHIP_RESPAWN_INVULNERABILITY_SECONDS: f32 = 1.25;
 pub const LEVEL_START_ASTEROID_DELAY_SECONDS: f32 = 1.0;
 pub const HYPERSPACE_COOLDOWN_SECONDS: f32 = 1.0;
 pub const HYPERSPACE_SELF_DESTRUCT_CHANCE: f32 = 0.10;
-/// DESIGN.md fixes the small-saucer transition at 10,000 points for v1.
-/// The disassembly's BCD score gate is ambiguous enough that the project
-/// contract wins here.
+/// Logging marker retained from the original v1 saucer slice. The arcade
+/// saucer selector is timer-driven before the high-score guarantee, but this
+/// event remains useful in verification traces.
 pub const UFO_SMALL_SCORE_THRESHOLD: u32 = 10_000;
-pub const UFO_SPAWN_SCORE_STEP_POINTS: u32 = 2_500;
+/// The original saucer logic forces small saucers once the score's upper BCD
+/// digits reach `$30`, i.e. 30,000 points.
+pub const UFO_SMALL_GUARANTEED_SCORE_THRESHOLD: u32 = 30_000;
 pub const UFO_BULLET_SPEED_NDC_PER_SEC: f32 = 1.25;
 
 const UFO_ORIGINAL_TIMER_TICK_SECONDS: f32 = 4.0 / tuning::ASTEROID_ORIGINAL_FPS;
@@ -78,6 +80,7 @@ const PLAYER_SHOT_COMPONENT_SPEED_MAX_NDC_PER_SEC: f32 =
 const UFO_SPAWN_RELOAD_INITIAL_TICKS: u32 = 0x92;
 const UFO_SPAWN_RELOAD_DECREMENT_TICKS: u32 = 0x06;
 const UFO_SPAWN_RELOAD_MIN_TICKS: u32 = 0x20;
+const UFO_SMALL_VARIANT_CHECK_RELOAD_TICKS: u32 = 0x80;
 const UFO_SHOT_RELOAD_TICKS: u32 = 0x0A;
 const UFO_DIRECTION_CHANGE_SECONDS: f32 = 128.0 / tuning::ASTEROID_ORIGINAL_FPS;
 const UFO_EDGE_MARGIN_NDC: f32 = 0.12;
@@ -642,6 +645,7 @@ pub struct GameState {
     invulnerability_timer_seconds: f32,
     hyperspace_cooldown_timer_seconds: f32,
     hyperspace_was_down: bool,
+    ufo_spawn_reload_ticks: u32,
     ufo_spawn_timer_seconds: f32,
     photon_limiter: u8,
     events: Vec<GameEvent>,
@@ -714,8 +718,9 @@ impl GameState {
 
     pub fn ufo_small_scenario(seed: Option<u64>) -> Self {
         let mut state = Self::empty_seeded(seed);
-        state.set_score_without_bonus(UFO_SMALL_SCORE_THRESHOLD);
+        state.set_score_without_bonus(UFO_SMALL_GUARANTEED_SCORE_THRESHOLD);
         state.ship.position = Vec2::new(0.18, -0.12);
+        state.ufo_spawn_reload_ticks = UFO_SMALL_VARIANT_CHECK_RELOAD_TICKS;
         state.reset_ufo_spawn_timer();
         state
     }
@@ -779,7 +784,10 @@ impl GameState {
             invulnerability_timer_seconds: 0.0,
             hyperspace_cooldown_timer_seconds: 0.0,
             hyperspace_was_down: false,
-            ufo_spawn_timer_seconds: ufo_spawn_interval_seconds_for_score(SCORE_PLACEHOLDER),
+            ufo_spawn_reload_ticks: UFO_SPAWN_RELOAD_INITIAL_TICKS,
+            ufo_spawn_timer_seconds: ufo_spawn_interval_seconds_from_ticks(
+                UFO_SPAWN_RELOAD_INITIAL_TICKS,
+            ),
             photon_limiter: 0,
             events: Vec::new(),
             rng: rng_for_seed(seed),
@@ -1199,7 +1207,8 @@ impl GameState {
     }
 
     fn spawn_ufo(&mut self) {
-        let variant = ufo_variant_for_score(self.score);
+        self.ufo_spawn_reload_ticks = next_ufo_spawn_reload_ticks(self.ufo_spawn_reload_ticks);
+        let variant = self.select_ufo_variant();
         let from_left = self.rng.next_f32() < 0.5;
         let x = if from_left {
             PLAYFIELD_MIN.x - UFO_EDGE_MARGIN_NDC
@@ -1222,6 +1231,17 @@ impl GameState {
         }
         self.push_ufo_event(GameEventKind::UfoSpawned, variant);
         self.push_ufo_event(GameEventKind::UfoSirenOn, variant);
+    }
+
+    fn select_ufo_variant(&mut self) -> UfoVariant {
+        if self.ufo_spawn_reload_ticks >= UFO_SMALL_VARIANT_CHECK_RELOAD_TICKS {
+            return UfoVariant::Large;
+        }
+        if self.score >= UFO_SMALL_GUARANTEED_SCORE_THRESHOLD {
+            return UfoVariant::Small;
+        }
+
+        ufo_variant_for_spawn(self.score, self.ufo_spawn_reload_ticks, self.rng.next_f32())
     }
 
     fn fire_ufo_bullet(&mut self, variant: UfoVariant, ufo_position: Vec2, ufo_radius: f32) {
@@ -1414,7 +1434,8 @@ impl GameState {
     }
 
     fn reset_ufo_spawn_timer(&mut self) {
-        self.ufo_spawn_timer_seconds = ufo_spawn_interval_seconds_for_score(self.score);
+        self.ufo_spawn_timer_seconds =
+            ufo_spawn_interval_seconds_from_ticks(self.ufo_spawn_reload_ticks);
     }
 
     fn set_score_without_bonus(&mut self, score: u32) {
@@ -1528,15 +1549,23 @@ pub fn asteroid_spawn_count_for_round(round: u32) -> u32 {
         .min(ASTEROIDS_PER_WAVE_MAX)
 }
 
-pub fn ufo_variant_for_score(score: u32) -> UfoVariant {
-    if score >= UFO_SMALL_SCORE_THRESHOLD {
-        UfoVariant::Small
-    } else {
+pub fn ufo_variant_for_spawn(score: u32, reload_ticks: u32, random_sample: f32) -> UfoVariant {
+    if reload_ticks >= UFO_SMALL_VARIANT_CHECK_RELOAD_TICKS {
+        return UfoVariant::Large;
+    }
+    if score >= UFO_SMALL_GUARANTEED_SCORE_THRESHOLD {
+        return UfoVariant::Small;
+    }
+
+    let small_cutoff = ((reload_ticks >> 1) as f32 / 256.0).clamp(0.0, 1.0);
+    if random_sample <= small_cutoff {
         UfoVariant::Large
+    } else {
+        UfoVariant::Small
     }
 }
 
-/// UFO spawn-rate curve for this score-driven step-14 slice.
+/// UFO spawn-rate curve.
 ///
 /// The original saucer code is documented in Norbert Kehrer's Asteroids
 /// disassembly and the Computer Archeology annotated listing:
@@ -1549,18 +1578,24 @@ pub fn ufo_variant_for_score(score: u32) -> UfoVariant {
 /// - each saucer appearance subtracts `#$06` at $6bd0-$6bda,
 /// - reload bottoms out at `#$20`, so the interval is 146..32 saucer ticks.
 ///
-/// This build keeps those exact reload values and the 15 Hz saucer tick cadence,
-/// but indexes the curve by score in 2,500-point steps so the task's
-/// score-driven spawn-rate requirement is deterministic and testable.
-pub fn ufo_spawn_reload_ticks_for_score(score: u32) -> u32 {
-    let speedup_steps = score / UFO_SPAWN_SCORE_STEP_POINTS;
+/// The same reload byte also gates saucer size: while bit 7 is set, saucers
+/// stay large; once it clears, a score of 30,000 or more guarantees small
+/// saucers. Below that score, the original compares half the reload value to a
+/// random byte to decide whether this spawn is large or small.
+pub fn ufo_spawn_reload_ticks_after_spawn_count(spawn_count: u32) -> u32 {
     UFO_SPAWN_RELOAD_INITIAL_TICKS
-        .saturating_sub(UFO_SPAWN_RELOAD_DECREMENT_TICKS.saturating_mul(speedup_steps))
+        .saturating_sub(UFO_SPAWN_RELOAD_DECREMENT_TICKS.saturating_mul(spawn_count))
         .max(UFO_SPAWN_RELOAD_MIN_TICKS)
 }
 
-pub fn ufo_spawn_interval_seconds_for_score(score: u32) -> f32 {
-    ufo_spawn_reload_ticks_for_score(score) as f32 * UFO_ORIGINAL_TIMER_TICK_SECONDS
+fn next_ufo_spawn_reload_ticks(current_ticks: u32) -> u32 {
+    current_ticks
+        .saturating_sub(UFO_SPAWN_RELOAD_DECREMENT_TICKS)
+        .max(UFO_SPAWN_RELOAD_MIN_TICKS)
+}
+
+fn ufo_spawn_interval_seconds_from_ticks(ticks: u32) -> f32 {
+    ticks as f32 * UFO_ORIGINAL_TIMER_TICK_SECONDS
 }
 
 pub fn displayed_lives(lives: u32) -> u32 {
@@ -2842,7 +2877,8 @@ mod tests {
 
         assert!((player_bullets[0].radius - BULLET_RENDER_RADIUS_NDC).abs() < EPSILON);
         assert!((ufo_bullets[0].radius - BULLET_RENDER_RADIUS_NDC).abs() < EPSILON);
-        assert!(BULLET_RENDER_RADIUS_NDC < BULLET_RADIUS_NDC);
+        assert!(player_bullets[0].radius < BULLET_RADIUS_NDC);
+        assert!(ufo_bullets[0].radius < BULLET_RADIUS_NDC);
     }
 
     #[test]
@@ -3047,27 +3083,68 @@ mod tests {
     #[test]
     fn ufo_spawn_rate_uses_original_reload_curve_values() {
         assert_eq!(
-            ufo_spawn_reload_ticks_for_score(0),
+            ufo_spawn_reload_ticks_after_spawn_count(0),
             UFO_SPAWN_RELOAD_INITIAL_TICKS
         );
         assert_eq!(
-            ufo_spawn_reload_ticks_for_score(UFO_SPAWN_SCORE_STEP_POINTS),
+            ufo_spawn_reload_ticks_after_spawn_count(1),
             UFO_SPAWN_RELOAD_INITIAL_TICKS - UFO_SPAWN_RELOAD_DECREMENT_TICKS
         );
         assert_eq!(
-            ufo_spawn_reload_ticks_for_score(1_000_000),
+            ufo_spawn_reload_ticks_after_spawn_count(100),
             UFO_SPAWN_RELOAD_MIN_TICKS
         );
     }
 
     #[test]
-    fn ufo_variant_switches_at_disassembly_score_threshold() {
+    fn ufo_spawn_decrements_reload_before_resetting_timer() {
+        let mut state = empty_test_state();
+
+        state.spawn_ufo();
+
         assert_eq!(
-            ufo_variant_for_score(UFO_SMALL_SCORE_THRESHOLD - 1),
+            state.ufo_spawn_reload_ticks,
+            UFO_SPAWN_RELOAD_INITIAL_TICKS - UFO_SPAWN_RELOAD_DECREMENT_TICKS
+        );
+
+        state.clear_ufo(GameEventKind::UfoDespawned, false);
+
+        assert!(
+            (state.ufo_spawn_timer_seconds
+                - ufo_spawn_interval_seconds_from_ticks(state.ufo_spawn_reload_ticks))
+            .abs()
+                < EPSILON
+        );
+    }
+
+    #[test]
+    fn ufo_variant_uses_reload_gate_and_high_score_guarantee() {
+        assert_eq!(
+            ufo_variant_for_spawn(0, UFO_SMALL_VARIANT_CHECK_RELOAD_TICKS, 1.0),
             UfoVariant::Large
         );
         assert_eq!(
-            ufo_variant_for_score(UFO_SMALL_SCORE_THRESHOLD),
+            ufo_variant_for_spawn(0, UFO_SMALL_VARIANT_CHECK_RELOAD_TICKS - 1, 1.0),
+            UfoVariant::Small
+        );
+        assert_eq!(
+            ufo_variant_for_spawn(0, UFO_SMALL_VARIANT_CHECK_RELOAD_TICKS - 1, 0.0),
+            UfoVariant::Large
+        );
+        assert_eq!(
+            ufo_variant_for_spawn(
+                UFO_SMALL_GUARANTEED_SCORE_THRESHOLD,
+                UFO_SPAWN_RELOAD_INITIAL_TICKS,
+                0.0,
+            ),
+            UfoVariant::Large
+        );
+        assert_eq!(
+            ufo_variant_for_spawn(
+                UFO_SMALL_GUARANTEED_SCORE_THRESHOLD,
+                UFO_SMALL_VARIANT_CHECK_RELOAD_TICKS - 1,
+                0.0,
+            ),
             UfoVariant::Small
         );
     }
@@ -3075,7 +3152,10 @@ mod tests {
     #[test]
     fn ufo_large_scenario_spawns_and_fires_randomly() {
         let mut state = GameState::ufo_large_scenario(Some(1));
-        let events = step_for_seconds(&mut state, ufo_spawn_interval_seconds_for_score(0) + 0.8);
+        let events = step_for_seconds(
+            &mut state,
+            ufo_spawn_interval_seconds_from_ticks(UFO_SPAWN_RELOAD_INITIAL_TICKS) + 0.8,
+        );
 
         assert!(events.iter().any(|event| {
             event.kind == GameEventKind::UfoFiredRandom
@@ -3088,7 +3168,7 @@ mod tests {
         let mut state = GameState::ufo_small_scenario(Some(1));
         let events = step_for_seconds(
             &mut state,
-            ufo_spawn_interval_seconds_for_score(UFO_SMALL_SCORE_THRESHOLD) + 0.8,
+            ufo_spawn_interval_seconds_from_ticks(UFO_SMALL_VARIANT_CHECK_RELOAD_TICKS) + 0.8,
         );
 
         assert!(events.iter().any(|event| {
