@@ -1,9 +1,12 @@
 use std::{env, sync::Arc};
 
-use bytemuck::{Pod, Zeroable};
 use wgpu::CurrentSurfaceTexture;
-use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
+
+use crate::{
+    beam::{self, BeamCommand, BeamEmitter, BeamVertex, Vec2},
+    tuning,
+};
 
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -12,7 +15,8 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     size: PhysicalSize<u32>,
     fullscreen_size: Option<PhysicalSize<u32>>,
-    hello_triangle: HelloTriangle,
+    beam_pipeline: BeamLinePipeline,
+    beam_emitter: BeamEmitter,
 }
 
 impl Renderer {
@@ -70,7 +74,7 @@ impl Renderer {
             view_formats: vec![],
         };
         surface.configure(&device, &config);
-        let hello_triangle = HelloTriangle::new(&device, format);
+        let beam_pipeline = BeamLinePipeline::new(&device, format);
 
         Ok(Self {
             surface,
@@ -79,7 +83,8 @@ impl Renderer {
             config,
             size,
             fullscreen_size,
-            hello_triangle,
+            beam_pipeline,
+            beam_emitter: BeamEmitter::new(),
         })
     }
 
@@ -96,6 +101,15 @@ impl Renderer {
     }
 
     pub fn render(&mut self) -> Result<(), String> {
+        self.beam_emitter.clear();
+        emit_demo_beams(&mut self.beam_emitter);
+        self.beam_pipeline.upload(
+            &self.device,
+            &self.queue,
+            self.beam_emitter.commands(),
+            tuning::BEAM_QUAD_HALF_WIDTH_NDC,
+        );
+
         let frame = match self.surface.get_current_texture() {
             CurrentSurfaceTexture::Success(frame) | CurrentSurfaceTexture::Suboptimal(frame) => {
                 frame
@@ -121,7 +135,7 @@ impl Renderer {
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Asteroids Black Clear"),
+                label: Some("Asteroids Beam Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
@@ -136,7 +150,7 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            self.hello_triangle.draw(&mut pass);
+            self.beam_pipeline.draw(&mut pass);
         }
 
         self.queue.submit([encoder.finish()]);
@@ -155,6 +169,26 @@ impl Renderer {
     pub fn present_mode(&self) -> wgpu::PresentMode {
         self.config.present_mode
     }
+}
+
+fn emit_demo_beams(emitter: &mut BeamEmitter) {
+    emitter
+        .emit(
+            BeamCommand::builder(Vec2::new(-0.82, -0.82), Vec2::new(0.82, 0.82))
+                .intensity(1.0)
+                .dwell_us(tuning::SHIP_OUTLINE_SEGMENT_DWELL_US)
+                .endpoint_dwell_bonus()
+                .build(),
+        )
+        .emit_segment_with_endpoint_bonus(
+            Vec2::new(-0.82, 0.82),
+            Vec2::new(0.82, -0.82),
+            1.0,
+            tuning::SHIP_OUTLINE_SEGMENT_DWELL_US,
+        )
+        .emit_ship_outline_segment(Vec2::new(-0.35, 0.36), Vec2::new(0.35, 0.36), 0.75)
+        .emit_asteroid_hull_segment(Vec2::new(-0.58, 0.0), Vec2::new(0.58, 0.0), 0.9)
+        .emit_bullet_dot(Vec2::ZERO, 0.018, 1.0);
 }
 
 pub fn target_surface_size(
@@ -201,31 +235,33 @@ fn choose_surface_format(formats: &[wgpu::TextureFormat]) -> Option<wgpu::Textur
     .find(|format| formats.contains(format))
 }
 
-struct HelloTriangle {
+struct BeamLinePipeline {
     pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
+    vertex_capacity: usize,
     vertex_count: u32,
+    vertices: Vec<BeamVertex>,
 }
 
-impl HelloTriangle {
+impl BeamLinePipeline {
     fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Hello Triangle Shader"),
-            source: wgpu::ShaderSource::Wgsl(HELLO_TRIANGLE_SHADER.into()),
+            label: Some("Beam Line Shader"),
+            source: wgpu::ShaderSource::Wgsl(BEAM_LINE_SHADER.into()),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Hello Triangle Pipeline Layout"),
+            label: Some("Beam Line Pipeline Layout"),
             bind_group_layouts: &[],
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Hello Triangle Pipeline"),
+            label: Some("Beam Line Pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[TriangleVertex::LAYOUT],
+                buffers: &[BeamLineVertexLayout::LAYOUT],
             },
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
@@ -251,82 +287,106 @@ impl HelloTriangle {
             multiview_mask: None,
             cache: None,
         });
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Hello Triangle Vertex Buffer"),
-            contents: bytemuck::cast_slice(HELLO_TRIANGLE_VERTICES),
-            usage: wgpu::BufferUsages::VERTEX,
+        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Beam Line Vertex Buffer"),
+            size: 1,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         Self {
             pipeline,
             vertex_buffer,
-            vertex_count: HELLO_TRIANGLE_VERTICES.len() as u32,
+            vertex_capacity: 0,
+            vertex_count: 0,
+            vertices: Vec::new(),
         }
     }
 
+    fn upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        commands: &[BeamCommand],
+        half_width: f32,
+    ) {
+        beam::expand_beam_commands(commands, half_width, &mut self.vertices);
+        self.vertex_count = self.vertices.len() as u32;
+
+        if self.vertices.is_empty() {
+            return;
+        }
+
+        self.ensure_vertex_capacity(device, self.vertices.len());
+        queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&self.vertices));
+    }
+
+    fn ensure_vertex_capacity(&mut self, device: &wgpu::Device, required_vertices: usize) {
+        if required_vertices <= self.vertex_capacity {
+            return;
+        }
+
+        let new_capacity = required_vertices.next_power_of_two().max(64);
+        self.vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Beam Line Vertex Buffer"),
+            size: (new_capacity * size_of::<BeamVertex>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.vertex_capacity = new_capacity;
+    }
+
     fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+        if self.vertex_count == 0 {
+            return;
+        }
+
         pass.set_pipeline(&self.pipeline);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.draw(0..self.vertex_count, 0..1);
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct TriangleVertex {
-    position: [f32; 2],
-    color: [f32; 3],
-}
+struct BeamLineVertexLayout;
 
-impl TriangleVertex {
+impl BeamLineVertexLayout {
     const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
-        array_stride: size_of::<Self>() as wgpu::BufferAddress,
+        array_stride: size_of::<BeamVertex>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Vertex,
-        attributes: &TRIANGLE_VERTEX_ATTRIBUTES,
+        attributes: &BEAM_VERTEX_ATTRIBUTES,
     };
 }
 
-const TRIANGLE_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![
+const BEAM_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
     0 => Float32x2,
-    1 => Float32x3,
+    1 => Float32x2,
+    2 => Float32x2,
+    3 => Float32,
+    4 => Float32,
 ];
 
-const HELLO_TRIANGLE_VERTICES: &[TriangleVertex] = &[
-    TriangleVertex {
-        position: [0.0, 0.72],
-        color: [1.0, 0.95, 0.72],
-    },
-    TriangleVertex {
-        position: [-0.72, -0.62],
-        color: [0.1, 0.9, 1.0],
-    },
-    TriangleVertex {
-        position: [0.72, -0.62],
-        color: [1.0, 0.2, 0.45],
-    },
-];
-
-const HELLO_TRIANGLE_SHADER: &str = r#"
+const BEAM_LINE_SHADER: &str = r#"
 struct VertexInput {
     @location(0) position: vec2<f32>,
-    @location(1) color: vec3<f32>,
+    @location(1) segment_start: vec2<f32>,
+    @location(2) segment_end: vec2<f32>,
+    @location(3) intensity: f32,
+    @location(4) dwell_us: f32,
 };
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
-    @location(0) color: vec3<f32>,
 };
 
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
     output.clip_position = vec4<f32>(input.position, 0.0, 1.0);
-    output.color = input.color;
     return output;
 }
 
 @fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(input.color, 1.0);
+fn fs_main() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0, 1.0, 1.0, 1.0);
 }
 "#;

@@ -106,7 +106,7 @@ tasks:
         Each frame: collect a Vec<BeamCommand>, expand each command into a small quad (two triangles) bounding the segment, and upload to a wgpu vertex buffer (re-used across frames; resize as needed).
         Replace the hello triangle pipeline with this beam-line pipeline. At this step the fragment shader can be a simple solid-white pass; the next task introduces the analytic line SDF and dwell coupling.
         Add a minimal unit test for the quad-expansion math (perpendicular vector direction, half-width offset) so the geometry is locked in before adding shader complexity on top.
-      status: todo
+      status: done
       workflow: implement
       deps:
         - hello-triangle

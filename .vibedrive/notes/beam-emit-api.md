@@ -1,0 +1,1 @@
+Implemented BeamCommand, builder/emitter API, dwell tunables, per-frame quad expansion/upload, and a placeholder white beam pipeline. Tests lock axis-aligned and diagonal half-width offsets. Buffer reuse grows to next power of two with 64-vertex floor; v1 dwell remains emitter-assigned per segment.

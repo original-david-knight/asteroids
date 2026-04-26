@@ -1,5 +1,7 @@
 mod audio;
+mod beam;
 mod renderer;
+mod tuning;
 
 use std::{error::Error, sync::Arc};
 
