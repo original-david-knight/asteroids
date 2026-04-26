@@ -374,6 +374,7 @@ pub enum GameEventKind {
     HyperspaceTriggered,
     HyperspaceCooldownRejected,
     HyperspaceSelfDestruct,
+    HighScoreIncreased,
 }
 
 impl GameEventKind {
@@ -401,6 +402,7 @@ impl GameEventKind {
             Self::HyperspaceTriggered => "hyperspace-triggered",
             Self::HyperspaceCooldownRejected => "cooldown-rejected",
             Self::HyperspaceSelfDestruct => "hyperspace-self-destruct",
+            Self::HighScoreIncreased => "highscore-increased",
         }
     }
 }
@@ -412,6 +414,7 @@ pub struct GameEvent {
     pub ufo_variant: Option<UfoVariant>,
     pub score_delta: Option<u32>,
     pub extra_life_threshold: Option<u32>,
+    pub high_score: Option<u32>,
 }
 
 impl GameEvent {
@@ -422,6 +425,7 @@ impl GameEvent {
             ufo_variant: None,
             score_delta: None,
             extra_life_threshold: None,
+            high_score: None,
         }
     }
 
@@ -432,6 +436,7 @@ impl GameEvent {
             ufo_variant: None,
             score_delta: None,
             extra_life_threshold: None,
+            high_score: None,
         }
     }
 
@@ -442,6 +447,7 @@ impl GameEvent {
             ufo_variant: Some(ufo_variant),
             score_delta: None,
             extra_life_threshold: None,
+            high_score: None,
         }
     }
 
@@ -452,6 +458,7 @@ impl GameEvent {
             ufo_variant: None,
             score_delta: Some(delta),
             extra_life_threshold: None,
+            high_score: None,
         }
     }
 
@@ -462,6 +469,18 @@ impl GameEvent {
             ufo_variant: None,
             score_delta: None,
             extra_life_threshold: Some(threshold),
+            high_score: None,
+        }
+    }
+
+    fn high_score(score: u32) -> Self {
+        Self {
+            kind: GameEventKind::HighScoreIncreased,
+            asteroid_size: None,
+            ufo_variant: None,
+            score_delta: None,
+            extra_life_threshold: None,
+            high_score: Some(score),
         }
     }
 
@@ -484,6 +503,7 @@ enum ScriptedScenario {
     #[default]
     None,
     ScoreProgression,
+    SetHighScore12345,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -589,6 +609,13 @@ impl GameState {
         state
     }
 
+    pub fn set_highscore_12345_scenario(seed: Option<u64>) -> Self {
+        let mut state = Self::empty_seeded(seed);
+        state.script = ScriptedScenario::SetHighScore12345;
+        state.ufo_spawn_timer_seconds = f32::INFINITY;
+        state
+    }
+
     pub fn eight_extra_lives_scenario(seed: Option<u64>) -> Self {
         let mut state = Self::empty_seeded(seed);
         state.set_score_without_bonus(50_000);
@@ -674,6 +701,12 @@ impl GameState {
             ScriptedScenario::ScoreProgression => {
                 if matches!(self.script_tick, 0 | 1) {
                     self.add_score(EXTRA_LIFE_SCORE_INTERVAL);
+                }
+                self.script_tick = self.script_tick.saturating_add(1);
+            }
+            ScriptedScenario::SetHighScore12345 => {
+                if self.script_tick == 0 {
+                    self.add_score(12_345);
                 }
                 self.script_tick = self.script_tick.saturating_add(1);
             }
@@ -1440,6 +1473,7 @@ pub struct GameLoop {
     accumulator_seconds: f32,
     tick: u64,
     paused: bool,
+    high_score: u32,
 }
 
 impl Default for GameLoop {
@@ -1452,6 +1486,7 @@ impl Default for GameLoop {
             accumulator_seconds: 0.0,
             tick: 0,
             paused: false,
+            high_score: 0,
         }
     }
 }
@@ -1461,7 +1496,15 @@ impl GameLoop {
         Self::default()
     }
 
+    pub fn new_with_high_score(high_score: u32) -> Self {
+        Self::new_seeded_with_high_score(None, high_score)
+    }
+
     pub fn new_seeded(seed: Option<u64>) -> Self {
+        Self::new_seeded_with_high_score(seed, 0)
+    }
+
+    pub fn new_seeded_with_high_score(seed: Option<u64>, high_score: u32) -> Self {
         let state = GameState::new_seeded(seed);
         Self {
             previous: state.clone(),
@@ -1470,10 +1513,15 @@ impl GameLoop {
             accumulator_seconds: 0.0,
             tick: 0,
             paused: false,
+            high_score,
         }
     }
 
     pub fn from_state(state: GameState) -> Self {
+        Self::from_state_with_high_score(state, 0)
+    }
+
+    pub fn from_state_with_high_score(state: GameState, high_score: u32) -> Self {
         Self {
             previous: state.clone(),
             current: state,
@@ -1481,6 +1529,7 @@ impl GameLoop {
             accumulator_seconds: 0.0,
             tick: 0,
             paused: false,
+            high_score,
         }
     }
 
@@ -1511,6 +1560,12 @@ impl GameLoop {
         {
             self.previous = self.current.clone();
             self.current.step(input, FIXED_TIMESTEP_SECONDS);
+            if self.current.score > self.high_score {
+                self.high_score = self.current.score;
+                self.current
+                    .events
+                    .push(GameEvent::high_score(self.high_score));
+            }
             let instant_ship_reposition = self
                 .current
                 .events()
@@ -1722,6 +1777,10 @@ impl GameLoop {
 
     pub fn tick(&self) -> u64 {
         self.tick
+    }
+
+    pub fn high_score(&self) -> u32 {
+        self.high_score
     }
 
     pub fn set_paused(&mut self, paused: bool) {
@@ -2224,6 +2283,22 @@ mod tests {
 
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].asteroid_count, 4);
+    }
+
+    #[test]
+    fn game_loop_raises_highscore_event_when_score_crosses_loaded_value() {
+        let mut game = GameLoop::from_state_with_high_score(
+            GameState::set_highscore_12345_scenario(Some(1)),
+            0,
+        );
+
+        game.advance(FIXED_TIMESTEP_SECONDS, &ControlState::default(), |_| {});
+        let events = game.drain_events();
+
+        assert_eq!(game.high_score(), 12_345);
+        assert!(events.iter().any(|event| {
+            event.kind == GameEventKind::HighScoreIncreased && event.high_score == Some(12_345)
+        }));
     }
 
     #[test]

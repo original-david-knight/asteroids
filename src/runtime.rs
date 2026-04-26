@@ -16,12 +16,15 @@ use winit::dpi::PhysicalSize;
 use crate::{
     audio,
     game::{self, AsteroidSize, ControlState, GameEvent, GameEventKind, GameLoop},
+    highscore,
     renderer::{FrameParams, HeadlessRenderer, Scenario},
     rng::{SeededRng, rng_for_seed},
     tuning, verify,
 };
 
 const DEFAULT_FIXED_DT_SECONDS: f32 = 1.0 / 144.0;
+const ATTRACT_IDLE_SECONDS: f32 = 30.0;
+const ATTRACT_SCRIPTED_INPUT_SECONDS: f32 = 31.0;
 pub const FRAME_METADATA_FILENAME: &str = "frame_metadata.jsonl";
 
 #[derive(Clone, Debug)]
@@ -170,15 +173,24 @@ pub async fn run_automated(config: &RuntimeConfig) -> Result<(), String> {
 
     let mut frame_time_log = optional_writer(config.frame_time_log.as_deref())?;
     let mut state_log = optional_writer(config.state_log.as_deref())?;
+    let loaded_high_score = load_persisted_high_score();
     let mut tick_state = TickState::new(config.seed);
-    let mut game_loop = game_loop_for_scenario(config.scenario, config.seed);
+    let mut game_loop = game_loop_for_scenario(config.scenario, config.seed, loaded_high_score);
 
     if let Some(writer) = state_log.as_mut() {
         write_state_event(writer, &mut tick_state, config, "scenario-start")?;
+        write_state_event(
+            writer,
+            &mut tick_state,
+            config,
+            &format!("highscore-loaded-{loaded_high_score}"),
+        )?;
     }
 
-    let simulate_frames = config
+    let simulate_secs = config
         .simulate_secs
+        .or_else(|| config.scenario.default_simulate_secs());
+    let simulate_frames = simulate_secs
         .map(|secs| frames_for_duration(secs, fixed_dt))
         .unwrap_or(0);
     for _ in 0..simulate_frames {
@@ -581,32 +593,77 @@ fn sleep_until(deadline: Instant) {
 }
 
 pub fn runtime_usage() -> String {
-    "Usage: asteroids [--headless] [--screenshot <path>] [--capture-frames <N> --frames-out <dir>] [--audio-capture <secs> --wav-out <path>] [--seed <u64>] [--fixed-dt <secs>] [--simulate-secs <secs>] [--scenario <name>] [--xrun-log <path>] [--frame-time-log <path>] [--state-log <path>] [--bloom-intensity <value>] [--bloom-threshold <value>]\n\nScenarios: demo, idle, ship-spinning, horizontal-sweep, static-bright-line, static-bright-line-low-dwell, static-bright-line-high-dwell, gamma-ramp, thrust-1s, ship-spinning-with-thrust, heavy-input, asteroids-round-1, bullet-hit-asteroid, ship-collides-with-asteroid, lose-all-lives, explosion-storm, heartbeat-curve, fire-3, ufo-large, ufo-small, score-progression, eight-extra-lives, hyperspace-spam".to_string()
+    "Usage: asteroids [--headless] [--screenshot <path>] [--capture-frames <N> --frames-out <dir>] [--audio-capture <secs> --wav-out <path>] [--seed <u64>] [--fixed-dt <secs>] [--simulate-secs <secs>] [--scenario <name>] [--xrun-log <path>] [--frame-time-log <path>] [--state-log <path>] [--bloom-intensity <value>] [--bloom-threshold <value>]\n\nScenarios: demo, idle, ship-spinning, horizontal-sweep, static-bright-line, static-bright-line-low-dwell, static-bright-line-high-dwell, gamma-ramp, thrust-1s, ship-spinning-with-thrust, heavy-input, asteroids-round-1, bullet-hit-asteroid, ship-collides-with-asteroid, lose-all-lives, explosion-storm, heartbeat-curve, fire-3, ufo-large, ufo-small, score-progression, eight-extra-lives, hyperspace-spam, title-idle, attract-then-input, set-highscore-12345, read-highscore".to_string()
 }
 
-fn game_loop_for_scenario(scenario: Scenario, seed: Option<u64>) -> GameLoop {
+fn load_persisted_high_score() -> u32 {
+    match highscore::read_default() {
+        Ok(score) => score,
+        Err(error) => {
+            eprintln!("high score read failed, using 0: {error}");
+            0
+        }
+    }
+}
+
+fn persist_highscore_events(events: &[GameEvent]) -> Result<(), String> {
+    for event in events {
+        if let Some(score) = event.high_score {
+            highscore::write_default(score)
+                .map_err(|error| format!("failed to write high score {score}: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn game_loop_for_scenario(
+    scenario: Scenario,
+    seed: Option<u64>,
+    loaded_high_score: u32,
+) -> GameLoop {
+    let high_score = if scenario == Scenario::SetHighScore12345 {
+        0
+    } else {
+        loaded_high_score
+    };
     match scenario {
-        Scenario::BulletHitAsteroid => {
-            GameLoop::from_state(game::GameState::bullet_hit_asteroid_scenario(seed))
-        }
-        Scenario::ShipCollidesWithAsteroid => {
-            GameLoop::from_state(game::GameState::ship_collides_with_asteroid_scenario(seed))
-        }
-        Scenario::LoseAllLives => {
-            GameLoop::from_state(game::GameState::lose_all_lives_scenario(seed))
-        }
-        Scenario::UfoLarge => GameLoop::from_state(game::GameState::ufo_large_scenario(seed)),
-        Scenario::UfoSmall => GameLoop::from_state(game::GameState::ufo_small_scenario(seed)),
-        Scenario::ScoreProgression => {
-            GameLoop::from_state(game::GameState::score_progression_scenario(seed))
-        }
-        Scenario::EightExtraLives => {
-            GameLoop::from_state(game::GameState::eight_extra_lives_scenario(seed))
-        }
-        Scenario::HyperspaceSpam => {
-            GameLoop::from_state(game::GameState::hyperspace_spam_scenario(seed))
-        }
-        _ => GameLoop::new_seeded(seed),
+        Scenario::BulletHitAsteroid => GameLoop::from_state_with_high_score(
+            game::GameState::bullet_hit_asteroid_scenario(seed),
+            high_score,
+        ),
+        Scenario::ShipCollidesWithAsteroid => GameLoop::from_state_with_high_score(
+            game::GameState::ship_collides_with_asteroid_scenario(seed),
+            high_score,
+        ),
+        Scenario::LoseAllLives => GameLoop::from_state_with_high_score(
+            game::GameState::lose_all_lives_scenario(seed),
+            high_score,
+        ),
+        Scenario::UfoLarge => GameLoop::from_state_with_high_score(
+            game::GameState::ufo_large_scenario(seed),
+            high_score,
+        ),
+        Scenario::UfoSmall => GameLoop::from_state_with_high_score(
+            game::GameState::ufo_small_scenario(seed),
+            high_score,
+        ),
+        Scenario::ScoreProgression => GameLoop::from_state_with_high_score(
+            game::GameState::score_progression_scenario(seed),
+            high_score,
+        ),
+        Scenario::EightExtraLives => GameLoop::from_state_with_high_score(
+            game::GameState::eight_extra_lives_scenario(seed),
+            high_score,
+        ),
+        Scenario::HyperspaceSpam => GameLoop::from_state_with_high_score(
+            game::GameState::hyperspace_spam_scenario(seed),
+            high_score,
+        ),
+        Scenario::SetHighScore12345 => GameLoop::from_state_with_high_score(
+            game::GameState::set_highscore_12345_scenario(seed),
+            high_score,
+        ),
+        _ => GameLoop::new_seeded_with_high_score(seed, high_score),
     }
 }
 
@@ -619,7 +676,9 @@ fn render_tick(
     io: TickIo<'_>,
 ) -> Result<(), String> {
     let start = Instant::now();
-    let mut params = FrameParams::new(config.scenario, tick_state.sim_time, fixed_dt);
+    let title_events = tick_state.update_title_state(config.scenario, fixed_dt);
+    let mut params = FrameParams::new(config.scenario, tick_state.sim_time, fixed_dt)
+        .with_high_score(game_loop.high_score());
     let mut audio_sender = io.audio_sender;
     let mut substeps = 0;
     let mut dropped_accumulator_seconds = 0.0;
@@ -638,13 +697,20 @@ fn render_tick(
             .with_ufo(game_loop.interpolated_ufo())
             .with_ufo_bullets(game_loop.interpolated_ufo_bullets())
             .with_game_over(game_loop.current().game_over)
-            .with_readouts(game_loop.current().score, game_loop.current().lives);
+            .with_readouts(game_loop.current().score, game_loop.current().lives)
+            .with_high_score(game_loop.high_score());
         if let Some(ship) = game_loop.interpolated_ship_if_alive() {
             params = params.with_ship(ship);
         }
     }
+    if config.scenario.uses_title_screen() {
+        params = FrameParams::new(config.scenario, tick_state.sim_time, fixed_dt)
+            .with_high_score(game_loop.high_score())
+            .with_title_screen(tick_state.attract_mode);
+    }
 
     let events = game_loop.drain_events();
+    persist_highscore_events(&events)?;
     if let Some(sender) = audio_sender.as_mut() {
         for event in events.iter().copied() {
             send_game_event_audio(sender, event);
@@ -668,6 +734,9 @@ fn render_tick(
             substeps,
             dropped_accumulator_seconds,
         )?;
+        for event in title_events {
+            write_state_event(writer, tick_state, config, event)?;
+        }
         for event in events {
             write_state_event(writer, tick_state, config, &event.state_log_name())?;
         }
@@ -748,7 +817,8 @@ fn write_state_tick_event(
             ship_vx = state.ship.velocity.x,
             ship_vy = state.ship.velocity.y,
         )?;
-        write_gameplay_fields(writer, state)?;
+        write_gameplay_fields(writer, state, game_loop.high_score())?;
+        write_title_fields(writer, tick_state)?;
         write_asteroid_fields(writer, state)?;
         writeln!(writer, "}}")
     })()
@@ -770,7 +840,7 @@ fn write_frame_metadata(
             config.seed.unwrap_or(0),
             game_loop.tick(),
         )?;
-        write_gameplay_fields(writer, state)?;
+        write_gameplay_fields(writer, state, game_loop.high_score())?;
         write_asteroid_fields(writer, state)?;
         writeln!(writer, "}}")
     })()
@@ -780,13 +850,15 @@ fn write_frame_metadata(
 fn write_gameplay_fields(
     writer: &mut BufWriter<File>,
     state: &game::GameState,
+    high_score: u32,
 ) -> std::io::Result<()> {
     write!(
         writer,
-        ",\"alive\":{},\"lives\":{},\"score\":{},\"game_over\":{},\"bullet_count\":{},\"bullet_wrapped\":{},\"ufo_bullet_count\":{},\"ufo_bullet_wrapped\":{},\"bullets\":[",
+        ",\"alive\":{},\"lives\":{},\"score\":{},\"high_score\":{},\"game_over\":{},\"bullet_count\":{},\"bullet_wrapped\":{},\"ufo_bullet_count\":{},\"ufo_bullet_wrapped\":{},\"bullets\":[",
         state.alive,
         state.lives,
         state.score,
+        high_score,
         state.game_over,
         state.bullets.len(),
         state.any_bullet_wrapped_last_tick(),
@@ -843,6 +915,14 @@ fn write_gameplay_fields(
     }
 }
 
+fn write_title_fields(writer: &mut BufWriter<File>, tick_state: &TickState) -> std::io::Result<()> {
+    write!(
+        writer,
+        ",\"title_screen\":{},\"attract_mode\":{},\"title_idle_seconds\":{:.6}",
+        tick_state.title_screen, tick_state.attract_mode, tick_state.title_idle_seconds,
+    )
+}
+
 fn write_asteroid_fields(
     writer: &mut BufWriter<File>,
     state: &game::GameState,
@@ -881,6 +961,10 @@ struct TickState {
     tick: u64,
     sim_time: f32,
     rng: SeededRng,
+    title_screen: bool,
+    title_idle_seconds: f32,
+    attract_mode: bool,
+    scripted_input_sent: bool,
 }
 
 impl TickState {
@@ -889,7 +973,41 @@ impl TickState {
             tick: 0,
             sim_time: 0.0,
             rng: rng_for_seed(seed),
+            title_screen: false,
+            title_idle_seconds: 0.0,
+            attract_mode: false,
+            scripted_input_sent: false,
         }
+    }
+
+    fn update_title_state(&mut self, scenario: Scenario, fixed_dt: f32) -> Vec<&'static str> {
+        self.title_screen = scenario.uses_title_screen();
+        if !self.title_screen {
+            self.title_idle_seconds = 0.0;
+            self.attract_mode = false;
+            return Vec::new();
+        }
+
+        let mut events = Vec::new();
+        let scripted_input = scenario == Scenario::AttractThenInput
+            && !self.scripted_input_sent
+            && self.sim_time >= ATTRACT_SCRIPTED_INPUT_SECONDS;
+        if scripted_input {
+            self.scripted_input_sent = true;
+            if self.attract_mode {
+                self.attract_mode = false;
+                events.push("attract-mode-exited-on-input");
+            }
+            self.title_idle_seconds = 0.0;
+            return events;
+        }
+
+        self.title_idle_seconds += fixed_dt;
+        if !self.attract_mode && self.title_idle_seconds >= ATTRACT_IDLE_SECONDS {
+            self.attract_mode = true;
+            events.push("attract-mode-entered");
+        }
+        events
     }
 
     fn advance(&mut self, fixed_dt: f32) {
@@ -1110,6 +1228,7 @@ mod tests {
             "score-progression",
             "eight-extra-lives",
             "hyperspace-spam",
+            "set-highscore-12345",
         ] {
             let config = RuntimeConfig::from_args(
                 ["--headless", "--scenario", name]
@@ -1120,6 +1239,24 @@ mod tests {
 
             assert!(config.scenario.uses_game_simulation());
         }
+    }
+
+    #[test]
+    fn parses_title_and_attract_scenarios() {
+        for name in ["title-idle", "attract-then-input", "read-highscore"] {
+            let config = RuntimeConfig::from_args(
+                ["--headless", "--scenario", name]
+                    .into_iter()
+                    .map(str::to_string),
+            )
+            .unwrap();
+
+            assert!(config.scenario.uses_title_screen());
+        }
+        assert_eq!(
+            Scenario::AttractThenInput.default_simulate_secs(),
+            Some(32.0)
+        );
     }
 
     #[test]

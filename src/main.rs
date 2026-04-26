@@ -6,6 +6,7 @@ use asteroids::{
         VOICE_FIRE, VOICE_THRUST, VOICE_UFO,
     },
     game::{AsteroidSize, ControlState, GameEvent, GameEventKind, GameLoop},
+    highscore,
     renderer::{self, FrameParams, Renderer, Scenario},
     runtime::{self, RuntimeConfig},
     tuning,
@@ -54,11 +55,19 @@ struct AsteroidsApp {
     audio_runtime: Option<AudioRuntime>,
     input: InputState,
     game: GameLoop,
+    mode: AppMode,
     startup_error: Option<String>,
 }
 
 impl AsteroidsApp {
     fn new() -> Self {
+        let high_score = match highscore::read_default() {
+            Ok(score) => score,
+            Err(error) => {
+                eprintln!("high score read failed, using 0: {error}");
+                0
+            }
+        };
         Self {
             window: None,
             renderer: None,
@@ -66,7 +75,11 @@ impl AsteroidsApp {
             audio_sender: None,
             audio_runtime: None,
             input: InputState::default(),
-            game: GameLoop::new(),
+            game: GameLoop::new_with_high_score(high_score),
+            mode: AppMode::Title {
+                idle_seconds: 0.0,
+                attract_mode: false,
+            },
             startup_error: None,
         }
     }
@@ -89,6 +102,48 @@ impl AsteroidsApp {
         };
         let _ = sender.try_push(msg);
     }
+
+    fn persist_highscore_event(event: GameEvent) {
+        let Some(score) = event.high_score else {
+            return;
+        };
+        if let Err(error) = highscore::write_default(score) {
+            eprintln!("failed to write high score {score}: {error}");
+        }
+    }
+
+    fn exit_attract_on_input(&mut self) -> bool {
+        let AppMode::Title {
+            idle_seconds,
+            attract_mode,
+        } = &mut self.mode
+        else {
+            return false;
+        };
+        if !*attract_mode {
+            return false;
+        }
+        *attract_mode = false;
+        *idle_seconds = 0.0;
+        true
+    }
+
+    fn start_game_from_title(&mut self) {
+        if matches!(self.mode, AppMode::Playing) {
+            return;
+        }
+        let high_score = self.game.high_score();
+        self.game = GameLoop::new_with_high_score(high_score);
+        self.mode = AppMode::Playing;
+    }
+}
+
+enum AppMode {
+    Title {
+        idle_seconds: f32,
+        attract_mode: bool,
+    },
+    Playing,
 }
 
 #[derive(Default)]
@@ -177,6 +232,43 @@ fn input_binding_for_event(event: &KeyEvent) -> Option<InputBinding> {
     }
 }
 
+fn is_escape_pressed(event: &WindowEvent) -> bool {
+    matches!(
+        event,
+        WindowEvent::KeyboardInput {
+            event: KeyEvent {
+                logical_key: Key::Named(NamedKey::Escape),
+                state: ElementState::Pressed,
+                ..
+            },
+            ..
+        }
+    )
+}
+
+fn is_input_event(event: &WindowEvent) -> bool {
+    matches!(
+        event,
+        WindowEvent::KeyboardInput { event, .. } if !event.repeat
+    ) || matches!(
+        event,
+        WindowEvent::CursorMoved { .. }
+            | WindowEvent::MouseInput { .. }
+            | WindowEvent::MouseWheel { .. }
+    )
+}
+
+fn is_title_start_event(event: &WindowEvent) -> bool {
+    let WindowEvent::KeyboardInput { event, .. } = event else {
+        return false;
+    };
+    if event.repeat || event.state != ElementState::Pressed {
+        return false;
+    }
+    input_binding_for_event(event).is_some()
+        || matches!(event.logical_key, Key::Named(NamedKey::Enter))
+}
+
 impl ApplicationHandler for AsteroidsApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -260,6 +352,16 @@ impl ApplicationHandler for AsteroidsApp {
             return;
         }
 
+        if is_escape_pressed(&event) {
+            event_loop.exit();
+            return;
+        }
+
+        let input_event = is_input_event(&event);
+        if input_event && self.exit_attract_on_input() {
+            return;
+        }
+
         if let WindowEvent::KeyboardInput { event, .. } = &event
             && !event.repeat
             && let Some(binding) = input_binding_for_event(event)
@@ -270,6 +372,10 @@ impl ApplicationHandler for AsteroidsApp {
             }
         }
 
+        if is_title_start_event(&event) {
+            self.start_game_from_title();
+        }
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Focused(false) => {
@@ -277,15 +383,6 @@ impl ApplicationHandler for AsteroidsApp {
                     self.set_thrust_audio_gate(false);
                 }
             }
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        logical_key: Key::Named(NamedKey::Escape),
-                        state: ElementState::Pressed,
-                        ..
-                    },
-                ..
-            } => event_loop.exit(),
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -427,6 +524,28 @@ impl ApplicationHandler for AsteroidsApp {
                     return;
                 };
                 let frame_dt = renderer.frame_dt_seconds();
+                if let AppMode::Title {
+                    idle_seconds,
+                    attract_mode,
+                } = &mut self.mode
+                {
+                    *idle_seconds += frame_dt;
+                    if *idle_seconds >= 30.0 {
+                        *attract_mode = true;
+                    }
+                    let params = FrameParams::new(Scenario::Idle, *idle_seconds, frame_dt)
+                        .with_high_score(self.game.high_score())
+                        .with_title_screen(*attract_mode);
+                    if let Some(window) = self.window.as_ref() {
+                        window.pre_present_notify();
+                        if let Err(error) = renderer.render_with_params(params) {
+                            self.fail(event_loop, error);
+                            return;
+                        }
+                        window.request_redraw();
+                    }
+                    return;
+                }
                 let controls = self.input.controls();
                 let audio_sender = &mut self.audio_sender;
                 self.game.advance(frame_dt, &controls, |snapshot| {
@@ -436,6 +555,7 @@ impl ApplicationHandler for AsteroidsApp {
                 });
                 let events = self.game.drain_events();
                 for event in events {
+                    Self::persist_highscore_event(event);
                     send_game_event_audio(audio_sender, event);
                 }
                 let mut params =
@@ -445,7 +565,8 @@ impl ApplicationHandler for AsteroidsApp {
                         .with_ufo(self.game.interpolated_ufo())
                         .with_ufo_bullets(self.game.interpolated_ufo_bullets())
                         .with_game_over(self.game.current().game_over)
-                        .with_readouts(self.game.current().score, self.game.current().lives);
+                        .with_readouts(self.game.current().score, self.game.current().lives)
+                        .with_high_score(self.game.high_score());
                 if let Some(ship) = self.game.interpolated_ship_if_alive() {
                     params = params.with_ship(ship);
                 }

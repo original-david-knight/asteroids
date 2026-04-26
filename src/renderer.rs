@@ -12,8 +12,8 @@ use winit::{dpi::PhysicalSize, window::Window};
 use crate::{
     beam::{self, BeamCommand, BeamEmitter, BeamVertex, Vec2},
     game::{
-        ASTEROID_HULL_VERTEX_COUNT, INITIAL_LIVES, RenderAsteroid, RenderBullet, RenderShip,
-        RenderUfo, displayed_lives,
+        ASTEROID_HULL_VERTEX_COUNT, AsteroidSize, INITIAL_LIVES, RenderAsteroid, RenderBullet,
+        RenderShip, RenderUfo, displayed_lives,
     },
     tuning,
 };
@@ -44,6 +44,10 @@ pub enum Scenario {
     ScoreProgression,
     EightExtraLives,
     HyperspaceSpam,
+    TitleIdle,
+    AttractThenInput,
+    SetHighScore12345,
+    ReadHighScore,
 }
 
 impl Scenario {
@@ -72,6 +76,10 @@ impl Scenario {
             "score-progression" => Some(Self::ScoreProgression),
             "eight-extra-lives" => Some(Self::EightExtraLives),
             "hyperspace-spam" => Some(Self::HyperspaceSpam),
+            "title-idle" => Some(Self::TitleIdle),
+            "attract-then-input" => Some(Self::AttractThenInput),
+            "set-highscore-12345" => Some(Self::SetHighScore12345),
+            "read-highscore" => Some(Self::ReadHighScore),
             _ => None,
         }
     }
@@ -101,6 +109,10 @@ impl Scenario {
             Self::ScoreProgression => "score-progression",
             Self::EightExtraLives => "eight-extra-lives",
             Self::HyperspaceSpam => "hyperspace-spam",
+            Self::TitleIdle => "title-idle",
+            Self::AttractThenInput => "attract-then-input",
+            Self::SetHighScore12345 => "set-highscore-12345",
+            Self::ReadHighScore => "read-highscore",
         }
     }
 
@@ -117,6 +129,7 @@ impl Scenario {
                 | Self::ScoreProgression
                 | Self::EightExtraLives
                 | Self::HyperspaceSpam
+                | Self::SetHighScore12345
         )
     }
 
@@ -129,6 +142,20 @@ impl Scenario {
                 | Self::UfoLarge
                 | Self::UfoSmall
         )
+    }
+
+    pub fn uses_title_screen(self) -> bool {
+        matches!(
+            self,
+            Self::TitleIdle | Self::AttractThenInput | Self::ReadHighScore
+        )
+    }
+
+    pub fn default_simulate_secs(self) -> Option<f64> {
+        match self {
+            Self::AttractThenInput => Some(32.0),
+            _ => None,
+        }
     }
 }
 
@@ -145,6 +172,9 @@ pub struct FrameParams {
     pub game_over: bool,
     pub score: u32,
     pub lives: u32,
+    pub high_score: u32,
+    pub title_screen: bool,
+    pub attract_mode: bool,
 }
 
 impl FrameParams {
@@ -161,6 +191,9 @@ impl FrameParams {
             game_over: false,
             score: 0,
             lives: INITIAL_LIVES,
+            high_score: 0,
+            title_screen: false,
+            attract_mode: false,
         }
     }
 
@@ -197,6 +230,17 @@ impl FrameParams {
     pub fn with_readouts(mut self, score: u32, lives: u32) -> Self {
         self.score = score;
         self.lives = lives;
+        self
+    }
+
+    pub fn with_high_score(mut self, high_score: u32) -> Self {
+        self.high_score = high_score;
+        self
+    }
+
+    pub fn with_title_screen(mut self, attract_mode: bool) -> Self {
+        self.title_screen = true;
+        self.attract_mode = attract_mode;
         self
     }
 }
@@ -955,7 +999,13 @@ fn emit_frame_beams(
     gameplay_emitter.clear();
 
     emit_bezel_readouts(frame_emitter, playfield, size, params.score, params.lives);
-    if let Some(ship) = params.ship {
+    if params.title_screen {
+        if params.attract_mode {
+            emit_attract_mode_beams(gameplay_emitter, params.time_seconds, params.high_score);
+        } else {
+            emit_title_screen_beams(gameplay_emitter, params.high_score);
+        }
+    } else if let Some(ship) = params.ship {
         emit_gameplay_objects(gameplay_emitter, params);
         emit_ship_outline(gameplay_emitter, ship.position, ship.angle, ship.scale, 1.0);
     } else if params.has_gameplay_objects() || params.game_over {
@@ -1158,7 +1208,11 @@ fn emit_scenario_beams(emitter: &mut BeamEmitter, scenario: Scenario, time_s: f3
         | Scenario::UfoSmall
         | Scenario::ScoreProgression
         | Scenario::EightExtraLives
-        | Scenario::HyperspaceSpam => emit_idle_beams(emitter),
+        | Scenario::HyperspaceSpam
+        | Scenario::TitleIdle
+        | Scenario::AttractThenInput
+        | Scenario::SetHighScore12345
+        | Scenario::ReadHighScore => emit_idle_beams(emitter),
     }
 }
 
@@ -1303,10 +1357,128 @@ fn emit_bullet_dot(emitter: &mut BeamEmitter, bullet: RenderBullet) {
 }
 
 fn emit_game_over_text(emitter: &mut BeamEmitter) {
-    let text = "GAME OVER";
-    let glyph_width = 0.105;
-    let glyph_height = 0.16;
-    let gap = 0.028;
+    emit_block_text(
+        emitter,
+        "GAME OVER",
+        Vec2::new(0.0, 0.0),
+        0.105,
+        0.16,
+        0.028,
+        0.9,
+    );
+}
+
+fn emit_title_screen_beams(emitter: &mut BeamEmitter, high_score: u32) {
+    emit_block_text(
+        emitter,
+        "ASTEROIDS",
+        Vec2::new(0.0, 0.42),
+        0.115,
+        0.18,
+        0.03,
+        0.92,
+    );
+    emit_high_score_table(emitter, high_score, 0.02);
+}
+
+fn emit_attract_mode_beams(emitter: &mut BeamEmitter, time_s: f32, high_score: u32) {
+    emit_attract_asteroids(emitter, time_s);
+    emit_high_score_table(emitter, high_score, 0.42);
+}
+
+fn emit_high_score_table(emitter: &mut BeamEmitter, high_score: u32, center_y: f32) {
+    emit_block_text(
+        emitter,
+        "HIGH SCORE",
+        Vec2::new(0.0, center_y + 0.14),
+        0.055,
+        0.09,
+        0.016,
+        0.72,
+    );
+
+    let digit_width = 0.062;
+    let digit_height = 0.118;
+    let gap = 0.022;
+    let digits = score_digits(high_score);
+    let total_width = digit_width * digits.len() as f32 + gap * (digits.len() as f32 - 1.0);
+    let start_x = -total_width * 0.5;
+    let bottom_y = center_y - 0.08;
+    for (index, digit) in digits.iter().copied().enumerate() {
+        emit_seven_segment_digit(
+            emitter,
+            digit,
+            Vec2::new(start_x + index as f32 * (digit_width + gap), bottom_y),
+            Vec2::new(digit_width, digit_height),
+            0.86,
+        );
+    }
+}
+
+fn emit_attract_asteroids(emitter: &mut BeamEmitter, time_s: f32) {
+    const ATTRACT_ASTEROIDS: &[(AsteroidSize, Vec2, Vec2, f32)] = &[
+        (
+            AsteroidSize::Large,
+            Vec2::new(-0.72, -0.42),
+            Vec2::new(0.17, 0.08),
+            0.00,
+        ),
+        (
+            AsteroidSize::Medium,
+            Vec2::new(0.54, -0.22),
+            Vec2::new(-0.12, 0.15),
+            1.20,
+        ),
+        (
+            AsteroidSize::Large,
+            Vec2::new(0.10, 0.74),
+            Vec2::new(0.10, -0.09),
+            2.10,
+        ),
+        (
+            AsteroidSize::Small,
+            Vec2::new(-0.30, 0.10),
+            Vec2::new(0.22, -0.13),
+            0.75,
+        ),
+        (
+            AsteroidSize::Medium,
+            Vec2::new(0.78, 0.48),
+            Vec2::new(-0.18, -0.05),
+            1.75,
+        ),
+    ];
+
+    for (index, (size, start, velocity, phase)) in ATTRACT_ASTEROIDS.iter().copied().enumerate() {
+        let drift = Vec2::new(
+            wrap_attract_coordinate(start.x + velocity.x * time_s),
+            wrap_attract_coordinate(start.y + velocity.y * time_s),
+        );
+        let radius = size.radius_ndc() * (0.88 + 0.10 * (time_s * 0.7 + phase).sin());
+        let asteroid = RenderAsteroid {
+            id: index as u32 + 1,
+            size,
+            position: drift,
+            radius,
+            hull: Default::default(),
+        };
+        emit_asteroid_outline(emitter, asteroid);
+    }
+}
+
+fn wrap_attract_coordinate(value: f32) -> f32 {
+    (value + 1.0).rem_euclid(2.0) - 1.0
+}
+
+fn emit_block_text(
+    emitter: &mut BeamEmitter,
+    text: &str,
+    center: Vec2,
+    glyph_width: f32,
+    glyph_height: f32,
+    gap: f32,
+    intensity: f32,
+) {
     let total_width = text.chars().fold(0.0, |width, ch| {
         width
             + if ch == ' ' {
@@ -1316,7 +1488,7 @@ fn emit_game_over_text(emitter: &mut BeamEmitter) {
             }
             + gap
     }) - gap;
-    let mut x = -total_width * 0.5;
+    let mut x = center.x - total_width * 0.5;
     for ch in text.chars() {
         if ch == ' ' {
             x += glyph_width * 0.55 + gap;
@@ -1325,14 +1497,15 @@ fn emit_game_over_text(emitter: &mut BeamEmitter) {
         emit_block_glyph(
             emitter,
             ch,
-            Vec2::new(x, -glyph_height * 0.5),
+            Vec2::new(x, center.y - glyph_height * 0.5),
             Vec2::new(glyph_width, glyph_height),
+            intensity,
         );
         x += glyph_width + gap;
     }
 }
 
-fn emit_block_glyph(emitter: &mut BeamEmitter, ch: char, origin: Vec2, size: Vec2) {
+fn emit_block_glyph(emitter: &mut BeamEmitter, ch: char, origin: Vec2, size: Vec2, intensity: f32) {
     let x0 = origin.x;
     let x1 = origin.x + size.x;
     let y0 = origin.y;
@@ -1346,6 +1519,20 @@ fn emit_block_glyph(emitter: &mut BeamEmitter, ch: char, origin: Vec2, size: Vec
             (Vec2::new(x0, y1), Vec2::new(x1, y1)),
             (Vec2::new(x0, ym), Vec2::new(x1, ym)),
         ],
+        'C' => vec![
+            (Vec2::new(x1, y1), Vec2::new(x0, y1)),
+            (Vec2::new(x0, y1), Vec2::new(x0, y0)),
+            (Vec2::new(x0, y0), Vec2::new(x1, y0)),
+        ],
+        'D' => vec![
+            (Vec2::new(x0, y0), Vec2::new(x0, y1)),
+            (Vec2::new(x0, y1), Vec2::new(x1, y1 - size.y * 0.18)),
+            (
+                Vec2::new(x1, y1 - size.y * 0.18),
+                Vec2::new(x1, y0 + size.y * 0.18),
+            ),
+            (Vec2::new(x1, y0 + size.y * 0.18), Vec2::new(x0, y0)),
+        ],
         'E' => vec![
             (Vec2::new(x0, y0), Vec2::new(x0, y1)),
             (Vec2::new(x0, y1), Vec2::new(x1, y1)),
@@ -1358,6 +1545,16 @@ fn emit_block_glyph(emitter: &mut BeamEmitter, ch: char, origin: Vec2, size: Vec
             (Vec2::new(x0, y0), Vec2::new(x1, y0)),
             (Vec2::new(x1, y0), Vec2::new(x1, ym)),
             (Vec2::new(xm, ym), Vec2::new(x1, ym)),
+        ],
+        'H' => vec![
+            (Vec2::new(x0, y0), Vec2::new(x0, y1)),
+            (Vec2::new(x1, y0), Vec2::new(x1, y1)),
+            (Vec2::new(x0, ym), Vec2::new(x1, ym)),
+        ],
+        'I' => vec![
+            (Vec2::new(x0, y1), Vec2::new(x1, y1)),
+            (Vec2::new(xm, y1), Vec2::new(xm, y0)),
+            (Vec2::new(x0, y0), Vec2::new(x1, y0)),
         ],
         'M' => vec![
             (Vec2::new(x0, y0), Vec2::new(x0, y1)),
@@ -1378,6 +1575,17 @@ fn emit_block_glyph(emitter: &mut BeamEmitter, ch: char, origin: Vec2, size: Vec
             (Vec2::new(x1, ym), Vec2::new(x0, ym)),
             (Vec2::new(x0, ym), Vec2::new(x1, y0)),
         ],
+        'S' => vec![
+            (Vec2::new(x1, y1), Vec2::new(x0, y1)),
+            (Vec2::new(x0, y1), Vec2::new(x0, ym)),
+            (Vec2::new(x0, ym), Vec2::new(x1, ym)),
+            (Vec2::new(x1, ym), Vec2::new(x1, y0)),
+            (Vec2::new(x1, y0), Vec2::new(x0, y0)),
+        ],
+        'T' => vec![
+            (Vec2::new(x0, y1), Vec2::new(x1, y1)),
+            (Vec2::new(xm, y1), Vec2::new(xm, y0)),
+        ],
         'V' => vec![
             (Vec2::new(x0, y1), Vec2::new(xm, y0)),
             (Vec2::new(xm, y0), Vec2::new(x1, y1)),
@@ -1385,7 +1593,7 @@ fn emit_block_glyph(emitter: &mut BeamEmitter, ch: char, origin: Vec2, size: Vec
         _ => Vec::new(),
     };
     for (start, end) in segments {
-        emitter.emit_ship_outline_segment_with_endpoint_bonus(start, end, 0.9);
+        emitter.emit_ship_outline_segment_with_endpoint_bonus(start, end, intensity);
     }
 }
 

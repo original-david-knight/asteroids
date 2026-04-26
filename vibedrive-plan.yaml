@@ -728,7 +728,7 @@ tasks:
         Attract mode: rolling demo of asteroids drifting + score table after 30s idle on the title screen, per DESIGN.md Game Constants. The score table includes the persisted high score from the file above.
         Attract mode exits as soon as any input event arrives.
         Add unit tests for: high-score read of valid file, missing file (returns zero, no error), corrupt file (returns zero, does not crash), and write-then-read round-trip.
-      status: todo
+      status: done
       workflow: implement
       deps:
         - hyperspace

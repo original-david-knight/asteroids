@@ -4,9 +4,10 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-use asteroids::{audio, verify};
+use asteroids::{audio, highscore, verify};
 use serde_json::Value;
 
 const SUBCOMMANDS: &[&str] = &[
@@ -736,7 +737,50 @@ fn cmd_state_trace(args: &mut CliArgs) -> Result<(), String> {
             missing.join(",")
         ));
     }
-    println!("state-trace ok: events={}", events.len());
+    run_highscore_helper_checks()?;
+    println!(
+        "state-trace ok: events={}, highscore_helpers=ok",
+        events.len()
+    );
+    Ok(())
+}
+
+fn run_highscore_helper_checks() -> Result<(), String> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let home = env::temp_dir().join(format!(
+        "asteroids-verify-highscore-{}-{stamp}",
+        process::id()
+    ));
+    let path = highscore::path_for_home(&home);
+
+    let missing = highscore::read(&path)
+        .map_err(|error| format!("highscore helper missing-file read failed: {error}"))?;
+    if missing != 0 {
+        let _ = fs::remove_dir_all(&home);
+        return Err(format!(
+            "highscore helper missing-file check failed: got {missing}, expected 0"
+        ));
+    }
+
+    fs::create_dir_all(
+        path.parent()
+            .ok_or_else(|| "highscore helper path has no parent".to_string())?,
+    )
+    .map_err(|error| format!("highscore helper failed to create temp dir: {error}"))?;
+    fs::write(&path, "not an integer")
+        .map_err(|error| format!("highscore helper failed to write corrupt file: {error}"))?;
+    let corrupt = highscore::read(&path)
+        .map_err(|error| format!("highscore helper corrupt-file read failed: {error}"))?;
+    let _ = fs::remove_dir_all(&home);
+    if corrupt != 0 {
+        return Err(format!(
+            "highscore helper corrupt-file check failed: got {corrupt}, expected 0"
+        ));
+    }
+
     Ok(())
 }
 

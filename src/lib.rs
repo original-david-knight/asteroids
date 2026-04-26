@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod beam;
 pub mod game;
+pub mod highscore;
 pub mod renderer;
 pub mod rng;
 pub mod runtime;
