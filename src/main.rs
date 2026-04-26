@@ -1,7 +1,7 @@
 use std::{error::Error, sync::Arc};
 
 use asteroids::{
-    audio::{AudioMsgSender, AudioRuntime, AudioScaffold},
+    audio::{AudioMsg, AudioMsgSender, AudioRuntime, AudioScaffold, VOICE_THRUST},
     renderer::{self, Renderer},
     runtime::{self, RuntimeConfig},
     tuning,
@@ -48,6 +48,7 @@ struct AsteroidsApp {
     audio: Option<AudioScaffold>,
     audio_sender: Option<AudioMsgSender>,
     audio_runtime: Option<AudioRuntime>,
+    input: InputState,
     startup_error: Option<String>,
 }
 
@@ -59,6 +60,7 @@ impl AsteroidsApp {
             audio: Some(AudioScaffold::new()),
             audio_sender: None,
             audio_runtime: None,
+            input: InputState::default(),
             startup_error: None,
         }
     }
@@ -68,6 +70,61 @@ impl AsteroidsApp {
         eprintln!("{error}");
         self.startup_error = Some(error);
         event_loop.exit();
+    }
+
+    fn set_thrust_audio_gate(&mut self, active: bool) {
+        let Some(sender) = self.audio_sender.as_mut() else {
+            return;
+        };
+        let msg = if active {
+            AudioMsg::Trigger(VOICE_THRUST)
+        } else {
+            AudioMsg::Release(VOICE_THRUST)
+        };
+        let _ = sender.try_push(msg);
+    }
+}
+
+#[derive(Default)]
+struct InputState {
+    thrust_w: bool,
+    thrust_up: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ThrustKey {
+    W,
+    Up,
+}
+
+impl InputState {
+    fn thrust_active(&self) -> bool {
+        self.thrust_w || self.thrust_up
+    }
+
+    fn update_thrust(&mut self, key: ThrustKey, pressed: bool) -> Option<bool> {
+        let was_active = self.thrust_active();
+        match key {
+            ThrustKey::W => self.thrust_w = pressed,
+            ThrustKey::Up => self.thrust_up = pressed,
+        }
+        let is_active = self.thrust_active();
+        (was_active != is_active).then_some(is_active)
+    }
+
+    fn clear_thrust(&mut self) -> bool {
+        let was_active = self.thrust_active();
+        self.thrust_w = false;
+        self.thrust_up = false;
+        was_active
+    }
+}
+
+fn thrust_key_for_event(event: &KeyEvent) -> Option<ThrustKey> {
+    match &event.logical_key {
+        Key::Named(NamedKey::ArrowUp) => Some(ThrustKey::Up),
+        Key::Character(text) if text.eq_ignore_ascii_case("w") => Some(ThrustKey::W),
+        _ => None,
     }
 }
 
@@ -147,15 +204,30 @@ impl ApplicationHandler for AsteroidsApp {
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        let Some(window) = self.window.as_ref() else {
+        let Some(active_window_id) = self.window.as_ref().map(|window| window.id()) else {
             return;
         };
-        if window.id() != window_id {
+        if active_window_id != window_id {
             return;
+        }
+
+        if let WindowEvent::KeyboardInput { event, .. } = &event
+            && !event.repeat
+            && let Some(key) = thrust_key_for_event(event)
+        {
+            let pressed = event.state == ElementState::Pressed;
+            if let Some(active) = self.input.update_thrust(key, pressed) {
+                self.set_thrust_audio_gate(active);
+            }
         }
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Focused(false) => {
+                if self.input.clear_thrust() {
+                    self.set_thrust_audio_gate(false);
+                }
+            }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -281,20 +353,24 @@ impl ApplicationHandler for AsteroidsApp {
                 }
             }
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
-                if let Some(renderer) = self.renderer.as_mut() {
+                if let (Some(renderer), Some(window)) =
+                    (self.renderer.as_mut(), self.window.as_ref())
+                {
                     renderer.resize_for_window(window);
+                    window.request_redraw();
                 }
-                window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
-                if let Some(renderer) = self.renderer.as_mut() {
+                if let (Some(renderer), Some(window)) =
+                    (self.renderer.as_mut(), self.window.as_ref())
+                {
                     window.pre_present_notify();
                     if let Err(error) = renderer.render() {
                         self.fail(event_loop, error);
                         return;
                     }
+                    window.request_redraw();
                 }
-                window.request_redraw();
             }
             _ => {}
         }

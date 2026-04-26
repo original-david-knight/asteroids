@@ -25,6 +25,7 @@ pub enum Scenario {
     StaticBrightLineLowDwell,
     StaticBrightLineHighDwell,
     GammaRamp,
+    Thrust1s,
 }
 
 impl Scenario {
@@ -38,6 +39,7 @@ impl Scenario {
             "static-bright-line-low-dwell" => Some(Self::StaticBrightLineLowDwell),
             "static-bright-line-high-dwell" => Some(Self::StaticBrightLineHighDwell),
             "gamma-ramp" => Some(Self::GammaRamp),
+            "thrust-1s" => Some(Self::Thrust1s),
             _ => None,
         }
     }
@@ -52,6 +54,7 @@ impl Scenario {
             Self::StaticBrightLineLowDwell => "static-bright-line-low-dwell",
             Self::StaticBrightLineHighDwell => "static-bright-line-high-dwell",
             Self::GammaRamp => "gamma-ramp",
+            Self::Thrust1s => "thrust-1s",
         }
     }
 }
@@ -964,6 +967,7 @@ fn emit_scenario_beams(emitter: &mut BeamEmitter, scenario: Scenario, time_s: f3
             emit_static_bright_line(emitter, tuning::PHOSPHOR_TRAIL_HIGH_DWELL_US)
         }
         Scenario::GammaRamp => emit_gamma_ramp_beams(emitter),
+        Scenario::Thrust1s => emit_idle_beams(emitter),
     }
 }
 

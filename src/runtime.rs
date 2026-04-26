@@ -3,8 +3,12 @@ use std::{
     fs::{self, File},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
-    sync::atomic::Ordering,
-    time::Instant,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
 use winit::dpi::PhysicalSize;
@@ -145,33 +149,6 @@ impl RuntimeConfig {
 }
 
 pub async fn run_automated(config: &RuntimeConfig) -> Result<(), String> {
-    let audio_writer = if let (Some(secs), Some(path)) =
-        (config.audio_capture_secs, &config.wav_out)
-    {
-        let (capture_producer, capture_consumer, capture_xruns) = audio::audio_capture_channel();
-        let scaffold = audio::AudioScaffold::new();
-        let (audio_sender, receiver, voices) = scaffold.into_parts();
-        let runtime = audio::AudioRuntime::start(receiver, voices, Some(capture_producer))?;
-        eprintln!("{}", runtime.info().startup_summary());
-        Some((
-            path.clone(),
-            audio::spawn_captured_wav_writer(
-                path.clone(),
-                secs,
-                runtime.sample_rate(),
-                capture_consumer,
-            ),
-            runtime,
-            audio_sender,
-            capture_xruns,
-        ))
-    } else {
-        if let Some(path) = &config.xrun_log {
-            create_empty_file(path)?;
-        }
-        None
-    };
-
     let fixed_dt = config.fixed_dt.unwrap_or(DEFAULT_FIXED_DT_SECONDS);
     let render_size = headless_render_size();
     let mut renderer = HeadlessRenderer::new(render_size).await?;
@@ -186,6 +163,8 @@ pub async fn run_automated(config: &RuntimeConfig) -> Result<(), String> {
         config.bloom_intensity,
         config.bloom_threshold,
     );
+
+    let audio_writer = start_automated_audio_capture(config)?;
 
     let mut frame_time_log = optional_writer(config.frame_time_log.as_deref())?;
     let mut state_log = optional_writer(config.state_log.as_deref())?;
@@ -269,7 +248,15 @@ pub async fn run_automated(config: &RuntimeConfig) -> Result<(), String> {
             .flush()
             .map_err(|error| format!("failed to flush state log: {error}"))?;
     }
-    if let Some((path, handle, runtime, _audio_sender, capture_xruns)) = audio_writer {
+    if let Some(mut audio_writer) = audio_writer {
+        audio_writer.release_due_thrust_gate()?;
+        let AutomatedAudioCapture {
+            path,
+            handle,
+            runtime,
+            capture_xruns,
+            ..
+        } = audio_writer;
         handle
             .join()
             .map_err(|_| format!("captured WAV writer panicked for {}", path.display()))?
@@ -288,8 +275,87 @@ pub async fn run_automated(config: &RuntimeConfig) -> Result<(), String> {
     Ok(())
 }
 
+struct AutomatedAudioCapture {
+    path: PathBuf,
+    handle: thread::JoinHandle<std::io::Result<()>>,
+    runtime: audio::AudioRuntime,
+    sender: audio::AudioMsgSender,
+    capture_xruns: Arc<AtomicU64>,
+    thrust_release_deadline: Option<Instant>,
+}
+
+impl AutomatedAudioCapture {
+    fn release_due_thrust_gate(&mut self) -> Result<(), String> {
+        let Some(deadline) = self.thrust_release_deadline.take() else {
+            return Ok(());
+        };
+        let now = Instant::now();
+        if deadline > now {
+            thread::sleep(deadline - now);
+        }
+        enqueue_audio_msg(
+            &mut self.sender,
+            audio::AudioMsg::Release(audio::VOICE_THRUST),
+            "thrust release",
+        )
+    }
+}
+
+fn start_automated_audio_capture(
+    config: &RuntimeConfig,
+) -> Result<Option<AutomatedAudioCapture>, String> {
+    let (Some(secs), Some(path)) = (config.audio_capture_secs, &config.wav_out) else {
+        if let Some(path) = &config.xrun_log {
+            create_empty_file(path)?;
+        }
+        return Ok(None);
+    };
+
+    let (capture_producer, capture_consumer, capture_xruns) = audio::audio_capture_channel();
+    let scaffold = audio::AudioScaffold::new();
+    let (mut sender, receiver, voices) = scaffold.into_parts();
+    let runtime = audio::AudioRuntime::start(receiver, voices, Some(capture_producer))?;
+    eprintln!("{}", runtime.info().startup_summary());
+
+    let thrust_release_deadline = if config.scenario == Scenario::Thrust1s {
+        enqueue_audio_msg(
+            &mut sender,
+            audio::AudioMsg::Trigger(audio::VOICE_THRUST),
+            "thrust trigger",
+        )?;
+        Some(Instant::now() + Duration::from_secs(1))
+    } else {
+        None
+    };
+
+    Ok(Some(AutomatedAudioCapture {
+        path: path.clone(),
+        handle: audio::spawn_captured_wav_writer(
+            path.clone(),
+            secs,
+            runtime.sample_rate(),
+            capture_consumer,
+        ),
+        runtime,
+        sender,
+        capture_xruns,
+        thrust_release_deadline,
+    }))
+}
+
+fn enqueue_audio_msg(
+    sender: &mut audio::AudioMsgSender,
+    msg: audio::AudioMsg,
+    context: &str,
+) -> Result<(), String> {
+    sender
+        .try_push(msg)
+        .map(|_| ())
+        .map_err(|error| format!("failed to enqueue {context} audio message: {error:?}"))
+}
+
 pub fn runtime_usage() -> String {
-    "Usage: asteroids [--headless] [--screenshot <path>] [--capture-frames <N> --frames-out <dir>] [--audio-capture <secs> --wav-out <path>] [--seed <u64>] [--fixed-dt <secs>] [--simulate-secs <secs>] [--scenario <name>] [--xrun-log <path>] [--frame-time-log <path>] [--state-log <path>] [--bloom-intensity <value>] [--bloom-threshold <value>]\n\nScenarios: demo, idle, ship-spinning, horizontal-sweep, static-bright-line, static-bright-line-low-dwell, static-bright-line-high-dwell, gamma-ramp".to_string()
+    "Usage: asteroids [--headless] [--screenshot <path>] [--capture-frames <N> --frames-out <dir>] [--audio-capture <secs> --wav-out <path>] [--seed <u64>] [--fixed-dt <secs>] [--simulate-secs <secs>] [--scenario <name>] [--xrun-log <path>] [--frame-time-log <path>] [--state-log <path>] [--bloom-intensity <value>] [--bloom-threshold <value>]\n\nScenarios: demo, idle, ship-spinning, horizontal-sweep, static-bright-line, static-bright-line-low-dwell, static-bright-line-high-dwell, gamma-ramp, thrust-1s".to_string()
 }
 
 fn render_tick(

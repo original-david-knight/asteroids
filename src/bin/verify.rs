@@ -457,9 +457,12 @@ fn cmd_playfield_rect(args: &mut CliArgs) -> Result<(), String> {
 
 fn cmd_audio_rms(args: &mut CliArgs) -> Result<(), String> {
     let wav = verify::load_wav(&args.path("--wav")?)?;
+    let window_start_ms = args.value_or("--window-start-ms", 0.0_f32)?;
+    let window_end_ms = args.value_or("--window-end-ms", f32::INFINITY)?;
     let min = args.value_or("--min", f32::NEG_INFINITY)?;
     let max = args.value_or("--max", f32::INFINITY)?;
     args.finish()?;
+    let wav = windowed_wav(wav, window_start_ms, window_end_ms)?;
     let rms = verify::rms(&wav.samples);
     if rms < min || rms > max {
         return Err(format!(
@@ -472,9 +475,12 @@ fn cmd_audio_rms(args: &mut CliArgs) -> Result<(), String> {
 
 fn cmd_audio_dominant_freq(args: &mut CliArgs) -> Result<(), String> {
     let wav = verify::load_wav(&args.path("--wav")?)?;
+    let window_start_ms = args.value_or("--window-start-ms", 0.0_f32)?;
+    let window_end_ms = args.value_or("--window-end-ms", f32::INFINITY)?;
     let min_hz = args.value_or("--min-hz", 0.0_f32)?;
     let max_hz = args.value_or("--max-hz", f32::INFINITY)?;
     args.finish()?;
+    let wav = windowed_wav(wav, window_start_ms, window_end_ms)?;
     let freq = verify::dominant_freq(&wav).unwrap_or(0.0);
     if freq < min_hz || freq > max_hz {
         return Err(format!(
@@ -489,8 +495,11 @@ fn cmd_audio_band_energy(args: &mut CliArgs) -> Result<(), String> {
     let wav = verify::load_wav(&args.path("--wav")?)?;
     let lo_hz = args.value("--lo-hz")?;
     let hi_hz = args.value("--hi-hz")?;
+    let window_start_ms = args.value_or("--window-start-ms", 0.0_f32)?;
+    let window_end_ms = args.value_or("--window-end-ms", f32::INFINITY)?;
     let min_fraction = args.value_or("--min-fraction", 0.0_f32)?;
     args.finish()?;
+    let wav = windowed_wav(wav, window_start_ms, window_end_ms)?;
     let fraction = verify::spectral_band_energy(&wav, lo_hz, hi_hz);
     if fraction < min_fraction {
         return Err(format!(
@@ -499,6 +508,38 @@ fn cmd_audio_band_energy(args: &mut CliArgs) -> Result<(), String> {
     }
     println!("audio-band-energy ok: fraction={fraction:.6}");
     Ok(())
+}
+
+fn windowed_wav(
+    mut wav: verify::WavData,
+    window_start_ms: f32,
+    window_end_ms: f32,
+) -> Result<verify::WavData, String> {
+    if !window_start_ms.is_finite() || window_start_ms < 0.0 {
+        return Err("--window-start-ms must be a finite non-negative number".to_string());
+    }
+    if window_end_ms < window_start_ms {
+        return Err(
+            "--window-end-ms must be greater than or equal to --window-start-ms".to_string(),
+        );
+    }
+
+    let channels = usize::from(wav.channels.max(1));
+    let total_frames = wav.samples.len() / channels;
+    let start_frame = ((window_start_ms / 1000.0) * wav.sample_rate as f32)
+        .floor()
+        .clamp(0.0, total_frames as f32) as usize;
+    let end_frame = if window_end_ms.is_finite() {
+        ((window_end_ms / 1000.0) * wav.sample_rate as f32)
+            .ceil()
+            .clamp(0.0, total_frames as f32) as usize
+    } else {
+        total_frames
+    };
+    let start_sample = start_frame * channels;
+    let end_sample = end_frame * channels;
+    wav.samples = wav.samples[start_sample..end_sample].to_vec();
+    Ok(wav)
 }
 
 fn cmd_xrun_count(args: &mut CliArgs) -> Result<(), String> {

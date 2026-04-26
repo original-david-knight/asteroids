@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -18,7 +18,9 @@ use cpal::{
     FromSample, SizedSample,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
-use fundsp::prelude::{AudioUnit, Net, Shared, U2, multizero, var};
+use fundsp::prelude::{
+    AudioUnit, Net, Shared, U2, adsr_live, lowpass, multizero, pan, pass, product, saw, var,
+};
 use ringbuf::{
     Cons, HeapProd, HeapRb,
     traits::{Consumer, Observer, Producer, Split},
@@ -34,6 +36,14 @@ const TARGET_OUTPUT_SAMPLE_RATE: u32 = 48_000;
 const TARGET_OUTPUT_BLOCK_FRAMES: u32 = 256;
 const AUDIO_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
 const RTKIT_PRIORITY: u32 = 10;
+pub const THRUST_FREQUENCY_HZ: f32 = 118.0;
+pub const THRUST_LOW_PASS_CUTOFF_HZ: f32 = 620.0;
+pub const THRUST_LOW_PASS_Q: f32 = 0.82;
+pub const THRUST_GAIN: f32 = 0.24;
+pub const THRUST_ATTACK_SECONDS: f32 = 0.020;
+pub const THRUST_DECAY_SECONDS: f32 = 0.090;
+pub const THRUST_SUSTAIN_LEVEL: f32 = 0.86;
+pub const THRUST_RELEASE_SECONDS: f32 = 0.120;
 
 type AudioRing = Arc<HeapRb<AudioMsg>>;
 type AudioCaptureRing = Arc<HeapRb<AudioCaptureBatch>>;
@@ -335,7 +345,8 @@ pub struct PreallocatedVoice {
     id: VoiceId,
     params: Vec<AtomicF32>,
     fundsp_controls: Vec<Shared>,
-    gate: AtomicBool,
+    gate: AtomicF32,
+    gate_control: Shared,
 }
 
 impl PreallocatedVoice {
@@ -344,7 +355,8 @@ impl PreallocatedVoice {
             id,
             params: param_defaults.iter().copied().map(AtomicF32::new).collect(),
             fundsp_controls: param_defaults.iter().copied().map(Shared::new).collect(),
-            gate: AtomicBool::new(false),
+            gate: AtomicF32::new(0.0),
+            gate_control: Shared::new(0.0),
         }
     }
 
@@ -353,7 +365,7 @@ impl PreallocatedVoice {
     }
 
     pub fn is_triggered(&self) -> bool {
-        self.gate.load(Ordering::Relaxed)
+        self.gate.load() > 0.5
     }
 }
 
@@ -363,11 +375,11 @@ impl Voice for PreallocatedVoice {
     }
 
     fn trigger(&self) {
-        self.gate.store(true, Ordering::Relaxed);
+        self.gate.store(1.0);
     }
 
     fn release(&self) {
-        self.gate.store(false, Ordering::Relaxed);
+        self.gate.store(0.0);
     }
 
     fn set_param(&self, param: ParamId, value: f32) -> bool {
@@ -382,6 +394,7 @@ impl Voice for PreallocatedVoice {
         for (cell, control) in self.params.iter().zip(self.fundsp_controls.iter()) {
             control.set(cell.load());
         }
+        self.gate_control.set(self.gate.load());
     }
 }
 
@@ -389,11 +402,18 @@ pub struct VoiceBank {
     voices: Vec<PreallocatedVoice>,
 }
 
+const THRUST_PARAM_DEFAULTS: [f32; 4] = [
+    THRUST_FREQUENCY_HZ,
+    THRUST_LOW_PASS_CUTOFF_HZ,
+    THRUST_GAIN,
+    THRUST_LOW_PASS_Q,
+];
+
 impl VoiceBank {
     pub fn single_player_default() -> Self {
         Self {
             voices: vec![
-                PreallocatedVoice::new(VOICE_THRUST, &[0.0, 0.0, 0.0, 0.0]),
+                PreallocatedVoice::new(VOICE_THRUST, &THRUST_PARAM_DEFAULTS),
                 PreallocatedVoice::new(VOICE_FIRE, &[0.0, 0.0, 0.0]),
                 PreallocatedVoice::new(VOICE_EXPLOSION, &[0.0, 0.0, 0.0, 0.0]),
                 PreallocatedVoice::new(VOICE_UFO, &[0.0, 0.0, 0.0]),
@@ -421,7 +441,7 @@ impl VoiceBank {
     pub fn control_count(&self) -> usize {
         self.voices
             .iter()
-            .map(|voice| voice.fundsp_controls.len())
+            .map(|voice| voice.fundsp_controls.len() + 1)
             .sum()
     }
 }
@@ -431,6 +451,10 @@ pub const VOICE_FIRE: VoiceId = VoiceId(1);
 pub const VOICE_EXPLOSION: VoiceId = VoiceId(2);
 pub const VOICE_UFO: VoiceId = VoiceId(3);
 pub const VOICE_HEARTBEAT: VoiceId = VoiceId(4);
+pub const PARAM_THRUST_FREQUENCY: ParamId = ParamId(0);
+pub const PARAM_THRUST_LOW_PASS_CUTOFF: ParamId = ParamId(1);
+pub const PARAM_THRUST_GAIN: ParamId = ParamId(2);
+pub const PARAM_THRUST_LOW_PASS_Q: ParamId = ParamId(3);
 
 pub struct AudioScaffold {
     sender: AudioMsgSender,
@@ -822,7 +846,7 @@ struct AudioEngine {
 
 impl AudioEngine {
     fn new(voices: VoiceBank, sample_rate: u32) -> Self {
-        let mut graph = build_silent_voice_graph(&voices);
+        let mut graph = build_voice_graph(&voices);
         graph.set_sample_rate(f64::from(sample_rate));
         graph.allocate();
         let mut warmup = [0.0_f32; 2];
@@ -864,13 +888,43 @@ impl AudioEngine {
     }
 }
 
-fn build_silent_voice_graph(voices: &VoiceBank) -> Net {
-    let mut graph = Net::new(0, usize::from(CAPTURE_CHANNELS));
-    for voice in voices.iter() {
-        for control in &voice.fundsp_controls {
-            graph.push(Box::new(var(control)));
-        }
+fn build_voice_graph(voices: &VoiceBank) -> Net {
+    if let Some(thrust) = voices.get(VOICE_THRUST) {
+        build_thrust_voice_graph(thrust)
+    } else {
+        build_silent_voice_graph()
     }
+}
+
+fn build_thrust_voice_graph(thrust: &PreallocatedVoice) -> Net {
+    let frequency = &thrust.fundsp_controls[usize::from(PARAM_THRUST_FREQUENCY.0)];
+    let cutoff = &thrust.fundsp_controls[usize::from(PARAM_THRUST_LOW_PASS_CUTOFF.0)];
+    let gain = &thrust.fundsp_controls[usize::from(PARAM_THRUST_GAIN.0)];
+    let q = &thrust.fundsp_controls[usize::from(PARAM_THRUST_LOW_PASS_Q.0)];
+    let gate = &thrust.gate_control;
+
+    let oscillator = var(frequency) >> saw();
+    let filtered = (oscillator | var(cutoff) | var(q)) >> lowpass::<f32>();
+    let envelope = var(gate)
+        >> adsr_live(
+            THRUST_ATTACK_SECONDS,
+            THRUST_DECAY_SECONDS,
+            THRUST_SUSTAIN_LEVEL,
+            THRUST_RELEASE_SECONDS,
+        );
+    let voiced = ((filtered | envelope) >> product(pass(), pass()) | var(gain))
+        >> product(pass(), pass())
+        >> pan(0.0);
+
+    let mut graph = Net::new(0, usize::from(CAPTURE_CHANNELS));
+    let thrust = graph.push(Box::new(voiced));
+    graph.pipe_output(thrust);
+    graph.check();
+    graph
+}
+
+fn build_silent_voice_graph() -> Net {
+    let mut graph = Net::new(0, usize::from(CAPTURE_CHANNELS));
     let silent = graph.push(Box::new(multizero::<U2>()));
     graph.pipe_output(silent);
     graph.check();

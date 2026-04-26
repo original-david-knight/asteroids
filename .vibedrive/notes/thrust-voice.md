@@ -1,0 +1,1 @@
+Thrust voice implemented as prebuilt fundsp saw -> low-pass -> ADSR graph gated by W/Up Trigger/Release messages. Defaults: 118 Hz, 620 Hz cutoff, Q 0.82, gain 0.24, ADSR 20/90/120 ms with 0.86 sustain. Acceptance WAV checks passed; no clipping observed and release window was silent.
