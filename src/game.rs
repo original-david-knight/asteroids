@@ -15,12 +15,18 @@ pub const PLAYFIELD_MAX: Vec2 = Vec2::new(1.0, 1.0);
 /// - ship direction changes by +/-3 direction bytes per input sample at $7086-$7099,
 ///   which this build keeps as the DESIGN-level 3 rad/s feel constant in tuning.rs;
 /// - thrust is applied through the original acceleration registers every other
-///   60 Hz frame at $709b-$70de, represented here as the DESIGN 0.05 units/frame
-///   normalized to the 240 Hz fixed step;
-/// - ship max velocity remains the DESIGN gameplay-unit cap, because the
-///   original byte clamp is hardware-scale specific.
-pub const SHIP_MAX_VELOCITY_UNITS_PER_SEC: f32 = 6.0;
-pub const SHIP_THRUST_ACCEL_UNITS_PER_SEC_SQUARED: f32 = 0.05 * 60.0;
+///   60 Hz frame at $709b-$70de; this build scales the DESIGN 0.05 units/frame
+///   down to the NDC playfield so the ship does not jump across the screen;
+/// - ship max velocity uses the same playable NDC scale, because the original
+///   byte clamp is hardware-scale specific;
+/// - idle drag is a deliberate v1 feel change so releasing thrust lets the ship
+///   slow down instead of coasting forever.
+pub const SHIP_MAX_VELOCITY_UNITS_PER_SEC: f32 = 1.5;
+pub const SHIP_THRUST_ACCEL_PLAYABILITY_SCALE: f32 = 0.30;
+pub const SHIP_THRUST_ACCEL_UNITS_PER_SEC_SQUARED: f32 =
+    0.05 * 60.0 * SHIP_THRUST_ACCEL_PLAYABILITY_SCALE;
+pub const SHIP_IDLE_DRAG_PER_SEC: f32 = 1.6;
+const SHIP_IDLE_STOP_SPEED_UNITS_PER_SEC: f32 = 0.01;
 pub const SCORE_PLACEHOLDER: u32 = 0;
 /// Original score constants from the 6502 disassembly:
 /// - Asteroid table `AstPointsTbl` at $7659 is BCD `$10,$05,$02`, documented
@@ -1519,6 +1525,8 @@ impl ShipState {
             self.velocity = self.velocity
                 + Vec2::new(angle_cos, angle_sin) * (SHIP_THRUST_ACCEL_UNITS_PER_SEC_SQUARED * dt);
             self.velocity = clamp_velocity(self.velocity, SHIP_MAX_VELOCITY_UNITS_PER_SEC);
+        } else {
+            self.velocity = damp_ship_velocity(self.velocity, dt);
         }
 
         self.position = wrap_position(self.position + self.velocity * dt);
@@ -1908,6 +1916,22 @@ fn clamp_velocity(velocity: Vec2, max_speed: f32) -> Vec2 {
     }
 }
 
+fn damp_ship_velocity(velocity: Vec2, dt: f32) -> Vec2 {
+    let stop_speed_squared =
+        SHIP_IDLE_STOP_SPEED_UNITS_PER_SEC * SHIP_IDLE_STOP_SPEED_UNITS_PER_SEC;
+    if velocity.length_squared() <= stop_speed_squared {
+        return Vec2::ZERO;
+    }
+
+    let damping = (-SHIP_IDLE_DRAG_PER_SEC * dt).exp();
+    let velocity = velocity * damping;
+    if velocity.length_squared() <= stop_speed_squared {
+        Vec2::ZERO
+    } else {
+        velocity
+    }
+}
+
 fn wrap_position(position: Vec2) -> Vec2 {
     wrap_position_with_report(position).0
 }
@@ -2041,19 +2065,36 @@ mod tests {
     }
 
     #[test]
-    fn idle_ship_retains_velocity_without_friction() {
+    fn idle_ship_velocity_decays_when_thrust_is_released() {
         let mut ship = ShipState {
             position: Vec2::ZERO,
             velocity: Vec2::new(1.25, -0.75),
             angle: 0.0,
         };
-        let initial_velocity = ship.velocity;
+        let initial_speed = ship.velocity.length();
 
         for _ in 0..240 {
             ship.integrate(&ControlState::default(), FIXED_TIMESTEP_SECONDS);
         }
 
-        assert_eq!(ship.velocity, initial_velocity);
+        let expected_speed = initial_speed * (-SHIP_IDLE_DRAG_PER_SEC).exp();
+        assert!((ship.velocity.length() - expected_speed).abs() < 0.001);
+        assert!(ship.velocity.length() < initial_speed);
+    }
+
+    #[test]
+    fn idle_ship_velocity_snaps_to_stop_after_slowing_down() {
+        let mut ship = ShipState {
+            position: Vec2::ZERO,
+            velocity: Vec2::new(1.25, -0.75),
+            angle: 0.0,
+        };
+
+        for _ in 0..(240 * 5) {
+            ship.integrate(&ControlState::default(), FIXED_TIMESTEP_SECONDS);
+        }
+
+        assert_eq!(ship.velocity, Vec2::ZERO);
     }
 
     #[test]
