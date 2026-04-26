@@ -918,13 +918,9 @@ fn align_to_copy_bytes_per_row(bytes_per_row: u32) -> u32 {
     bytes_per_row.div_ceil(alignment) * alignment
 }
 
-// Closed DESIGN aspect strategy: option (c) is locked for v1:
-// centered 4:3 gameplay with score/lives vector readout bezels in the side margins.
-// This follows DESIGN.md's default lean and keeps the autonomous run from making
-// a subjective taste call between the recorded alternatives.
-const PLAYFIELD_ASPECT_RATIO: f32 = 4.0 / 3.0;
-const BEZEL_READOUT_INTENSITY: f32 = 0.56;
-const BEZEL_READOUT_DWELL_US: f32 = 24.0;
+const SCREEN_READOUT_INTENSITY: f32 = 0.56;
+const SCREEN_READOUT_DWELL_US: f32 = 24.0;
+const OBJECT_BASELINE_ASPECT_RATIO: f32 = 4.0 / 3.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PlayfieldRect {
@@ -933,23 +929,10 @@ struct PlayfieldRect {
 }
 
 impl PlayfieldRect {
-    fn centered_4_3(size: PhysicalSize<u32>) -> Self {
-        let width = size.width.max(1) as f32;
-        let height = size.height.max(1) as f32;
-        let target_aspect = width / height;
-
-        if target_aspect >= PLAYFIELD_ASPECT_RATIO {
-            let half_width = PLAYFIELD_ASPECT_RATIO / target_aspect;
-            Self {
-                min: Vec2::new(-half_width, -1.0),
-                max: Vec2::new(half_width, 1.0),
-            }
-        } else {
-            let half_height = target_aspect / PLAYFIELD_ASPECT_RATIO;
-            Self {
-                min: Vec2::new(-1.0, -half_height),
-                max: Vec2::new(1.0, half_height),
-            }
+    fn fullscreen() -> Self {
+        Self {
+            min: Vec2::new(-1.0, -1.0),
+            max: Vec2::new(1.0, 1.0),
         }
     }
 
@@ -966,20 +949,6 @@ impl PlayfieldRect {
             intensity: command.intensity,
             dwell_us: command.dwell_us,
         }
-    }
-
-    fn left_margin(self) -> Option<NdcRect> {
-        (self.min.x > -1.0).then_some(NdcRect {
-            min: Vec2::new(-1.0, -1.0),
-            max: Vec2::new(self.min.x, 1.0),
-        })
-    }
-
-    fn right_margin(self) -> Option<NdcRect> {
-        (self.max.x < 1.0).then_some(NdcRect {
-            min: Vec2::new(self.max.x, -1.0),
-            max: Vec2::new(1.0, 1.0),
-        })
     }
 }
 
@@ -1005,28 +974,52 @@ fn emit_frame_beams(
     params: &FrameParams,
     size: PhysicalSize<u32>,
 ) {
-    let playfield = PlayfieldRect::centered_4_3(size);
+    let playfield = PlayfieldRect::fullscreen();
+    let local_x_scale = local_x_scale_for_size(size);
 
     frame_emitter.clear();
     gameplay_emitter.clear();
 
-    emit_bezel_readouts(frame_emitter, playfield, size, params.score, params.lives);
+    emit_screen_readouts(
+        frame_emitter,
+        size,
+        params.score,
+        params.lives,
+        local_x_scale,
+    );
     if params.title_screen {
         if params.attract_mode {
-            emit_attract_mode_beams(gameplay_emitter, params.time_seconds, params.high_score);
+            emit_attract_mode_beams(
+                gameplay_emitter,
+                params.time_seconds,
+                params.high_score,
+                local_x_scale,
+            );
         } else {
-            emit_title_screen_beams(gameplay_emitter, params.high_score);
+            emit_title_screen_beams(gameplay_emitter, params.high_score, local_x_scale);
         }
     } else if let Some(ship) = params.ship {
-        emit_gameplay_objects(gameplay_emitter, params);
-        emit_ship_outline(gameplay_emitter, ship.position, ship.angle, ship.scale, 1.0);
+        emit_gameplay_objects(gameplay_emitter, params, local_x_scale);
+        emit_ship_outline(
+            gameplay_emitter,
+            ship.position,
+            ship.angle,
+            ship.scale,
+            1.0,
+            local_x_scale,
+        );
     } else if params.has_gameplay_objects() || params.game_over {
-        emit_gameplay_objects(gameplay_emitter, params);
+        emit_gameplay_objects(gameplay_emitter, params, local_x_scale);
         if params.game_over {
-            emit_game_over_text(gameplay_emitter);
+            emit_game_over_text(gameplay_emitter, local_x_scale);
         }
     } else {
-        emit_scenario_beams(gameplay_emitter, params.scenario, params.time_seconds);
+        emit_scenario_beams(
+            gameplay_emitter,
+            params.scenario,
+            params.time_seconds,
+            local_x_scale,
+        );
     }
 
     for command in gameplay_emitter.commands() {
@@ -1043,34 +1036,46 @@ impl FrameParams {
     }
 }
 
-fn emit_gameplay_objects(emitter: &mut BeamEmitter, params: &FrameParams) {
+fn emit_gameplay_objects(emitter: &mut BeamEmitter, params: &FrameParams, local_x_scale: f32) {
     for asteroid in &params.asteroids {
-        emit_asteroid_outline(emitter, *asteroid);
+        emit_asteroid_outline(emitter, *asteroid, local_x_scale);
     }
     for bullet in &params.bullets {
-        emit_bullet_dot(emitter, *bullet);
+        emit_bullet_dot(emitter, *bullet, local_x_scale);
     }
     for bullet in &params.ufo_bullets {
-        emit_bullet_dot(emitter, *bullet);
+        emit_bullet_dot(emitter, *bullet, local_x_scale);
     }
     if let Some(ufo) = params.ufo {
-        emit_ufo_outline(emitter, ufo);
+        emit_ufo_outline(emitter, ufo, local_x_scale);
     }
 }
 
-fn emit_bezel_readouts(
+fn emit_screen_readouts(
     emitter: &mut BeamEmitter,
-    playfield: PlayfieldRect,
     size: PhysicalSize<u32>,
     score: u32,
     lives: u32,
+    local_x_scale: f32,
 ) {
-    if let Some(left) = playfield.left_margin() {
-        emit_score_readout(emitter, left, size, score);
-    }
-    if let Some(right) = playfield.right_margin() {
-        emit_lives_readout(emitter, right, lives);
-    }
+    emit_score_readout(
+        emitter,
+        NdcRect {
+            min: Vec2::new(-0.96, 0.0),
+            max: Vec2::new(-0.66, 1.0),
+        },
+        size,
+        score,
+    );
+    emit_lives_readout(
+        emitter,
+        NdcRect {
+            min: Vec2::new(0.875, 0.0),
+            max: Vec2::new(0.945, 1.0),
+        },
+        lives,
+        local_x_scale,
+    );
 }
 
 fn emit_score_readout(
@@ -1100,12 +1105,12 @@ fn emit_score_readout(
             digit,
             Vec2::new(start_x + index as f32 * (digit_width + gap), bottom_y),
             Vec2::new(digit_width, digit_height),
-            BEZEL_READOUT_INTENSITY,
+            SCREEN_READOUT_INTENSITY,
         );
     }
 }
 
-fn emit_lives_readout(emitter: &mut BeamEmitter, margin: NdcRect, lives: u32) {
+fn emit_lives_readout(emitter: &mut BeamEmitter, margin: NdcRect, lives: u32, local_x_scale: f32) {
     let icon_scale = (margin.width() * 0.62 / 0.44).clamp(0.055, 0.16);
     let x = margin.center_x();
     let icon_count = displayed_lives(lives);
@@ -1116,7 +1121,8 @@ fn emit_lives_readout(emitter: &mut BeamEmitter, margin: NdcRect, lives: u32) {
             Vec2::new(x, y),
             FRAC_PI_2,
             icon_scale,
-            BEZEL_READOUT_INTENSITY,
+            SCREEN_READOUT_INTENSITY,
+            local_x_scale,
         );
     }
 }
@@ -1184,19 +1190,24 @@ fn emit_seven_segment_digit(
 
     for (enabled, (start, end)) in segments.into_iter().zip(segment_points) {
         if enabled {
-            emitter.emit_segment(start, end, intensity, BEZEL_READOUT_DWELL_US);
+            emitter.emit_segment(start, end, intensity, SCREEN_READOUT_DWELL_US);
         }
     }
 }
 
-fn emit_scenario_beams(emitter: &mut BeamEmitter, scenario: Scenario, time_s: f32) {
+fn emit_scenario_beams(
+    emitter: &mut BeamEmitter,
+    scenario: Scenario,
+    time_s: f32,
+    local_x_scale: f32,
+) {
     match scenario {
-        Scenario::Demo => emit_demo_beams(emitter, time_s),
-        Scenario::Idle => emit_idle_beams(emitter),
+        Scenario::Demo => emit_demo_beams(emitter, time_s, local_x_scale),
+        Scenario::Idle => emit_idle_beams(emitter, local_x_scale),
         Scenario::ShipSpinning | Scenario::ShipSpinningWithThrust => {
-            emit_ship_spinning_beams(emitter, time_s)
+            emit_ship_spinning_beams(emitter, time_s, local_x_scale)
         }
-        Scenario::HorizontalSweep => emit_horizontal_sweep_beams(emitter, time_s),
+        Scenario::HorizontalSweep => emit_horizontal_sweep_beams(emitter, time_s, local_x_scale),
         Scenario::StaticBrightLine => {
             emit_static_bright_line(emitter, tuning::SHIP_OUTLINE_SEGMENT_DWELL_US)
         }
@@ -1227,25 +1238,32 @@ fn emit_scenario_beams(emitter: &mut BeamEmitter, scenario: Scenario, time_s: f3
         | Scenario::TitleIdle
         | Scenario::AttractThenInput
         | Scenario::SetHighScore12345
-        | Scenario::ReadHighScore => emit_idle_beams(emitter),
+        | Scenario::ReadHighScore => emit_idle_beams(emitter, local_x_scale),
     }
 }
 
-fn emit_idle_beams(emitter: &mut BeamEmitter) {
-    emit_ship_outline(emitter, Vec2::ZERO, 0.0, 0.55, 0.85);
-    emitter.emit_bullet_dot(Vec2::new(0.56, -0.34), 0.014, 0.7);
+fn emit_idle_beams(emitter: &mut BeamEmitter, local_x_scale: f32) {
+    emit_ship_outline(emitter, Vec2::ZERO, 0.0, 0.55, 0.85, local_x_scale);
+    emit_dot(emitter, Vec2::new(0.56, -0.34), 0.014, 0.7, local_x_scale);
 }
 
-fn emit_ship_spinning_beams(emitter: &mut BeamEmitter, time_s: f32) {
+fn emit_ship_spinning_beams(emitter: &mut BeamEmitter, time_s: f32, local_x_scale: f32) {
     let angle = time_s * tuning::SHIP_ROTATION_RATE_RAD_PER_SEC;
-    emit_ship_outline(emitter, Vec2::ZERO, angle, tuning::SHIP_SPINNING_SCALE, 1.0);
+    emit_ship_outline(
+        emitter,
+        Vec2::ZERO,
+        angle,
+        tuning::SHIP_SPINNING_SCALE,
+        1.0,
+        local_x_scale,
+    );
 }
 
-fn emit_horizontal_sweep_beams(emitter: &mut BeamEmitter, time_s: f32) {
+fn emit_horizontal_sweep_beams(emitter: &mut BeamEmitter, time_s: f32, local_x_scale: f32) {
     let period_s = 1.8;
     let phase = (time_s / period_s).rem_euclid(1.0);
     let x = -0.92 + phase * 1.84;
-    let half_len = 0.14;
+    let half_len = 0.14 * local_x_scale;
     emitter.emit_segment_with_endpoint_bonus(
         Vec2::new(x - half_len, 0.0),
         Vec2::new(x + half_len, 0.0),
@@ -1286,14 +1304,15 @@ fn emit_ship_outline(
     angle: f32,
     scale: f32,
     intensity: f32,
+    local_x_scale: f32,
 ) {
     let (angle_sin, angle_cos) = angle.sin_cos();
     let vertices = SHIP_OUTLINE_VERTICES.map(|vertex| {
-        center
-            + Vec2::new(
-                vertex.x * angle_cos - vertex.y * angle_sin,
-                vertex.x * angle_sin + vertex.y * angle_cos,
-            ) * scale
+        let local = Vec2::new(
+            vertex.x * angle_cos - vertex.y * angle_sin,
+            vertex.x * angle_sin + vertex.y * angle_cos,
+        ) * scale;
+        center + aspect_correct_local(local, local_x_scale)
     });
 
     for (start, end) in SHIP_OUTLINE_SEGMENTS {
@@ -1305,10 +1324,12 @@ fn emit_ship_outline(
     }
 }
 
-fn emit_asteroid_outline(emitter: &mut BeamEmitter, asteroid: RenderAsteroid) {
+fn emit_asteroid_outline(emitter: &mut BeamEmitter, asteroid: RenderAsteroid, local_x_scale: f32) {
     let hull_vertices = asteroid.hull.vertices();
-    let vertices: [Vec2; ASTEROID_HULL_VERTEX_COUNT] =
-        std::array::from_fn(|index| asteroid.position + hull_vertices[index] * asteroid.radius);
+    let vertices: [Vec2; ASTEROID_HULL_VERTEX_COUNT] = std::array::from_fn(|index| {
+        asteroid.position
+            + aspect_correct_local(hull_vertices[index] * asteroid.radius, local_x_scale)
+    });
     for index in 0..vertices.len() {
         let start = vertices[index];
         let end = vertices[(index + 1) % vertices.len()];
@@ -1316,62 +1337,82 @@ fn emit_asteroid_outline(emitter: &mut BeamEmitter, asteroid: RenderAsteroid) {
     }
 }
 
-fn emit_ufo_outline(emitter: &mut BeamEmitter, ufo: RenderUfo) {
+fn emit_ufo_outline(emitter: &mut BeamEmitter, ufo: RenderUfo, local_x_scale: f32) {
     let width = ufo.radius * 2.2;
     let body_half_width = width * 0.42;
     let body_half_height = ufo.radius * 0.34;
     let dome_half_width = width * 0.20;
     let dome_height = ufo.radius * 0.38;
-    let base_y = ufo.position.y - body_half_height;
-    let mid_y = ufo.position.y;
-    let top_y = ufo.position.y + body_half_height;
+    let base_y = -body_half_height;
+    let mid_y = 0.0;
+    let top_y = body_half_height;
     let dome_top_y = top_y + dome_height;
 
     let segments = [
         (
-            Vec2::new(ufo.position.x - width * 0.5, mid_y),
-            Vec2::new(ufo.position.x - body_half_width, top_y),
+            Vec2::new(-width * 0.5, mid_y),
+            Vec2::new(-body_half_width, top_y),
         ),
         (
-            Vec2::new(ufo.position.x - body_half_width, top_y),
-            Vec2::new(ufo.position.x + body_half_width, top_y),
+            Vec2::new(-body_half_width, top_y),
+            Vec2::new(body_half_width, top_y),
         ),
         (
-            Vec2::new(ufo.position.x + body_half_width, top_y),
-            Vec2::new(ufo.position.x + width * 0.5, mid_y),
+            Vec2::new(body_half_width, top_y),
+            Vec2::new(width * 0.5, mid_y),
         ),
         (
-            Vec2::new(ufo.position.x + width * 0.5, mid_y),
-            Vec2::new(ufo.position.x + body_half_width, base_y),
+            Vec2::new(width * 0.5, mid_y),
+            Vec2::new(body_half_width, base_y),
         ),
         (
-            Vec2::new(ufo.position.x + body_half_width, base_y),
-            Vec2::new(ufo.position.x - body_half_width, base_y),
+            Vec2::new(body_half_width, base_y),
+            Vec2::new(-body_half_width, base_y),
         ),
         (
-            Vec2::new(ufo.position.x - body_half_width, base_y),
-            Vec2::new(ufo.position.x - width * 0.5, mid_y),
+            Vec2::new(-body_half_width, base_y),
+            Vec2::new(-width * 0.5, mid_y),
         ),
         (
-            Vec2::new(ufo.position.x - dome_half_width, top_y),
-            Vec2::new(ufo.position.x, dome_top_y),
+            Vec2::new(-dome_half_width, top_y),
+            Vec2::new(0.0, dome_top_y),
         ),
         (
-            Vec2::new(ufo.position.x, dome_top_y),
-            Vec2::new(ufo.position.x + dome_half_width, top_y),
+            Vec2::new(0.0, dome_top_y),
+            Vec2::new(dome_half_width, top_y),
         ),
     ];
 
     for (start, end) in segments {
-        emitter.emit_ship_outline_segment_with_endpoint_bonus(start, end, 1.0);
+        emitter.emit_ship_outline_segment_with_endpoint_bonus(
+            ufo.position + aspect_correct_local(start, local_x_scale),
+            ufo.position + aspect_correct_local(end, local_x_scale),
+            1.0,
+        );
     }
 }
 
-fn emit_bullet_dot(emitter: &mut BeamEmitter, bullet: RenderBullet) {
-    emitter.emit_bullet_dot(bullet.position, bullet.radius, 1.0);
+fn emit_bullet_dot(emitter: &mut BeamEmitter, bullet: RenderBullet, local_x_scale: f32) {
+    emit_dot(emitter, bullet.position, bullet.radius, 1.0, local_x_scale);
 }
 
-fn emit_game_over_text(emitter: &mut BeamEmitter) {
+fn emit_dot(
+    emitter: &mut BeamEmitter,
+    center: Vec2,
+    half_extent: f32,
+    intensity: f32,
+    local_x_scale: f32,
+) {
+    let half_extent = half_extent.abs().max(f32::EPSILON) * local_x_scale;
+    emitter.emit_segment(
+        center - Vec2::X * half_extent,
+        center + Vec2::X * half_extent,
+        intensity,
+        tuning::BULLET_DOT_DWELL_US,
+    );
+}
+
+fn emit_game_over_text(emitter: &mut BeamEmitter, local_x_scale: f32) {
     emit_block_text(
         emitter,
         "GAME OVER",
@@ -1380,10 +1421,11 @@ fn emit_game_over_text(emitter: &mut BeamEmitter) {
         0.16,
         0.028,
         0.9,
+        local_x_scale,
     );
 }
 
-fn emit_title_screen_beams(emitter: &mut BeamEmitter, high_score: u32) {
+fn emit_title_screen_beams(emitter: &mut BeamEmitter, high_score: u32, local_x_scale: f32) {
     emit_block_text(
         emitter,
         "ASTEROIDS",
@@ -1392,16 +1434,27 @@ fn emit_title_screen_beams(emitter: &mut BeamEmitter, high_score: u32) {
         0.18,
         0.03,
         0.92,
+        local_x_scale,
     );
-    emit_high_score_table(emitter, high_score, 0.02);
+    emit_high_score_table(emitter, high_score, 0.02, local_x_scale);
 }
 
-fn emit_attract_mode_beams(emitter: &mut BeamEmitter, time_s: f32, high_score: u32) {
-    emit_attract_asteroids(emitter, time_s);
-    emit_high_score_table(emitter, high_score, 0.42);
+fn emit_attract_mode_beams(
+    emitter: &mut BeamEmitter,
+    time_s: f32,
+    high_score: u32,
+    local_x_scale: f32,
+) {
+    emit_attract_asteroids(emitter, time_s, local_x_scale);
+    emit_high_score_table(emitter, high_score, 0.42, local_x_scale);
 }
 
-fn emit_high_score_table(emitter: &mut BeamEmitter, high_score: u32, center_y: f32) {
+fn emit_high_score_table(
+    emitter: &mut BeamEmitter,
+    high_score: u32,
+    center_y: f32,
+    local_x_scale: f32,
+) {
     emit_block_text(
         emitter,
         "HIGH SCORE",
@@ -1410,11 +1463,12 @@ fn emit_high_score_table(emitter: &mut BeamEmitter, high_score: u32, center_y: f
         0.09,
         0.016,
         0.72,
+        local_x_scale,
     );
 
-    let digit_width = 0.062;
+    let digit_width = 0.062 * local_x_scale;
     let digit_height = 0.118;
-    let gap = 0.022;
+    let gap = 0.022 * local_x_scale;
     let digits = score_digits(high_score);
     let total_width = digit_width * digits.len() as f32 + gap * (digits.len() as f32 - 1.0);
     let start_x = -total_width * 0.5;
@@ -1430,7 +1484,7 @@ fn emit_high_score_table(emitter: &mut BeamEmitter, high_score: u32, center_y: f
     }
 }
 
-fn emit_attract_asteroids(emitter: &mut BeamEmitter, time_s: f32) {
+fn emit_attract_asteroids(emitter: &mut BeamEmitter, time_s: f32, local_x_scale: f32) {
     const ATTRACT_ASTEROIDS: &[(AsteroidSize, Vec2, Vec2, f32)] = &[
         (
             AsteroidSize::Large,
@@ -1477,7 +1531,7 @@ fn emit_attract_asteroids(emitter: &mut BeamEmitter, time_s: f32) {
             radius,
             hull: Default::default(),
         };
-        emit_asteroid_outline(emitter, asteroid);
+        emit_asteroid_outline(emitter, asteroid, local_x_scale);
     }
 }
 
@@ -1495,7 +1549,10 @@ fn emit_block_text(
     glyph_height: f32,
     gap: f32,
     intensity: f32,
+    local_x_scale: f32,
 ) {
+    let glyph_width = glyph_width * local_x_scale;
+    let gap = gap * local_x_scale;
     let total_width = text.chars().fold(0.0, |width, ch| {
         width
             + if ch == ' ' {
@@ -1625,17 +1682,31 @@ fn emit_block_text_segment(emitter: &mut BeamEmitter, start: Vec2, end: Vec2, in
     }
 }
 
-fn emit_demo_beams(emitter: &mut BeamEmitter, time_s: f32) {
+fn emit_demo_beams(emitter: &mut BeamEmitter, time_s: f32, local_x_scale: f32) {
     let center = Vec2::ZERO + Vec2::new((time_s * 0.47).sin() * 0.24, (time_s * 0.31).cos() * 0.16);
     let angle = time_s * 1.65;
-    emit_ship_outline(emitter, center, angle, 1.0, 1.0);
+    emit_ship_outline(emitter, center, angle, 1.0, 1.0, local_x_scale);
 
     let sweep_x = (time_s * 0.73).sin() * 0.78;
-    emitter
-        .emit_bullet_dot(Vec2::new(sweep_x, -0.54), 0.018, 1.0)
-        .emit_asteroid_hull_segment(Vec2::new(-0.86, 0.62), Vec2::new(-0.58, 0.70), 0.45);
+    emit_dot(
+        emitter,
+        Vec2::new(sweep_x, -0.54),
+        0.018,
+        1.0,
+        local_x_scale,
+    );
+    emitter.emit_asteroid_hull_segment(Vec2::new(-0.86, 0.62), Vec2::new(-0.58, 0.70), 0.45);
 
     emit_phosphor_trail_verification_beams(emitter, time_s);
+}
+
+fn local_x_scale_for_size(size: PhysicalSize<u32>) -> f32 {
+    let target_aspect = size.width.max(1) as f32 / size.height.max(1) as f32;
+    OBJECT_BASELINE_ASPECT_RATIO / target_aspect
+}
+
+fn aspect_correct_local(local: Vec2, local_x_scale: f32) -> Vec2 {
+    Vec2::new(local.x * local_x_scale.max(f32::EPSILON), local.y)
 }
 
 fn emit_phosphor_trail_verification_beams(emitter: &mut BeamEmitter, time_s: f32) {
@@ -3310,20 +3381,18 @@ mod tests {
     }
 
     #[test]
-    fn centered_playfield_uses_side_margins_on_widescreen() {
-        let rect = PlayfieldRect::centered_4_3(PhysicalSize::new(1920, 1080));
+    fn fullscreen_playfield_uses_entire_ndc_range() {
+        let rect = PlayfieldRect::fullscreen();
 
-        assert_close(rect.min.x, -0.75);
-        assert_close(rect.max.x, 0.75);
+        assert_close(rect.min.x, -1.0);
+        assert_close(rect.max.x, 1.0);
         assert_close(rect.min.y, -1.0);
         assert_close(rect.max.y, 1.0);
-        assert!(rect.left_margin().is_some());
-        assert!(rect.right_margin().is_some());
     }
 
     #[test]
-    fn playfield_mapping_preserves_corners_inside_centered_rect() {
-        let rect = PlayfieldRect::centered_4_3(PhysicalSize::new(5120, 2160));
+    fn playfield_mapping_preserves_corners_inside_fullscreen_rect() {
+        let rect = PlayfieldRect::fullscreen();
 
         assert_eq!(rect.map_point(Vec2::new(-1.0, -1.0)), rect.min);
         assert_eq!(rect.map_point(Vec2::new(1.0, 1.0)), rect.max);

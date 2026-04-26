@@ -159,7 +159,7 @@ fn cmd_gamma_ramp(args: &mut CliArgs) -> Result<(), String> {
         return Err("--tolerance must be a finite non-negative number".to_string());
     }
 
-    let playfield = centered_aspect_rect(image.width, image.height, PLAYFIELD_ASPECT_RATIO)?;
+    let playfield = full_frame_rect(image.width, image.height)?;
     let samples = gamma_ramp_samples(&image, playfield, gamma);
     let increasing = samples
         .windows(2)
@@ -364,7 +364,7 @@ fn ship_trail_luminance(frames: &[PathBuf], detections: &[ShipDetection]) -> Res
         .last()
         .ok_or_else(|| "trail-luminance failed: no ship detections".to_string())?
         .angle_rad;
-    let playfield = centered_aspect_rect(image.width, image.height, PLAYFIELD_ASPECT_RATIO)?;
+    let playfield = full_frame_rect(image.width, image.height)?;
     let lag_angle =
         asteroids::tuning::SHIP_ROTATION_RATE_RAD_PER_SEC * VERIFY_FIXED_DT_SECONDS * 6.0;
     let mut best_luminance = 0.0_f32;
@@ -374,8 +374,14 @@ fn ship_trail_luminance(frames: &[PathBuf], detections: &[ShipDetection]) -> Res
         let local_end = SHIP_VERTICES[end] * asteroids::tuning::SHIP_SPINNING_SCALE;
         for sample in [0.25_f32, 0.50, 0.75] {
             let local = local_start + (local_end - local_start) * sample;
-            let current = gameplay_to_pixel(playfield, rotate_vec2(local, angle));
-            let behind = gameplay_to_pixel(playfield, rotate_vec2(local, angle - lag_angle));
+            let current = gameplay_to_pixel(
+                playfield,
+                aspect_correct_local_for_rect(rotate_vec2(local, angle), playfield),
+            );
+            let behind = gameplay_to_pixel(
+                playfield,
+                aspect_correct_local_for_rect(rotate_vec2(local, angle - lag_angle), playfield),
+            );
             let trail_point = (
                 current.0 + (behind.0 - current.0) * 1.15,
                 current.1 + (behind.1 - current.1) * 1.15,
@@ -389,12 +395,15 @@ fn ship_trail_luminance(frames: &[PathBuf], detections: &[ShipDetection]) -> Res
 
 fn cmd_playfield_rect(args: &mut CliArgs) -> Result<(), String> {
     let image = verify::load_png(&args.path("--frame")?)?;
-    let aspect = parse_aspect_ratio(&args.value_or("--aspect", "4:3".to_string())?)?;
+    let aspect = match args.optional_string("--aspect")? {
+        Some(value) => parse_aspect_ratio(&value)?,
+        None => image.width.max(1) as f32 / image.height.max(1) as f32,
+    };
     let centered = args.flag("--centered");
     let bezel_min_fraction = args.value_or("--bezel-min-fraction", 0.0_f32)?;
     args.finish()?;
 
-    let rect = centered_aspect_rect(image.width, image.height, aspect)?;
+    let rect = full_frame_rect(image.width, image.height)?;
     let actual_aspect = rect.width() as f32 / rect.height().max(1) as f32;
     let aspect_error = ((actual_aspect - aspect) / aspect).abs();
     if aspect_error > 0.002 {
@@ -433,7 +442,9 @@ fn cmd_playfield_rect(args: &mut CliArgs) -> Result<(), String> {
         threshold,
     );
 
-    if left_signal < min_signal_pixels || right_signal < min_signal_pixels {
+    if bezel_min_fraction > 0.0
+        && (left_signal < min_signal_pixels || right_signal < min_signal_pixels)
+    {
         return Err(format!(
             "playfield-rect failed: bezel readout signal too low left={left_signal} right={right_signal}, threshold={threshold:.6}"
         ));
@@ -1003,16 +1014,10 @@ fn max_lives_in_state_log(path: &Path) -> Result<usize, String> {
 }
 
 fn life_icon_scores(image: &verify::PngImage, count: usize) -> Result<Vec<f32>, String> {
-    let playfield = centered_aspect_rect(image.width, image.height, PLAYFIELD_ASPECT_RATIO)?;
-    if playfield.right >= image.width {
-        return Err("lives-display failed: image has no right bezel margin".to_string());
-    }
-
-    let margin_width_ndc =
-        image.width.saturating_sub(playfield.right) as f32 / image.width.max(1) as f32 * 2.0;
-    let icon_scale = (margin_width_ndc * 0.62 / 0.44).clamp(0.055, 0.16);
-    let center_x_px = (playfield.right + image.width) as f32 * 0.5;
-    let center_x_ndc = center_x_px / image.width.max(1) as f32 * 2.0 - 1.0;
+    let lives_area_min_x = 0.875_f32;
+    let lives_area_max_x = 0.945_f32;
+    let icon_scale = ((lives_area_max_x - lives_area_min_x) * 0.62 / 0.44).clamp(0.055, 0.16);
+    let center_x_ndc = (lives_area_min_x + lives_area_max_x) * 0.5;
 
     Ok((0..count)
         .map(|index| {
@@ -1027,6 +1032,8 @@ fn life_icon_scores(image: &verify::PngImage, count: usize) -> Result<Vec<f32>, 
 
 fn life_icon_score(image: &verify::PngImage, center: asteroids::beam::Vec2, scale: f32) -> f32 {
     let angle = PI * 0.5;
+    let image_aspect = image.width.max(1) as f32 / image.height.max(1) as f32;
+    let local_x_scale = OBJECT_BASELINE_ASPECT_RATIO / image_aspect;
     let mut score = 0.0;
     let mut samples = 0;
     for (start, end) in SHIP_SEGMENTS {
@@ -1034,7 +1041,9 @@ fn life_icon_score(image: &verify::PngImage, center: asteroids::beam::Vec2, scal
         let local_end = SHIP_VERTICES[end] * scale;
         for sample in [0.25_f32, 0.5, 0.75] {
             let local = local_start + (local_end - local_start) * sample;
-            let point = frame_ndc_to_pixel(image, center + rotate_vec2(local, angle));
+            let rotated = rotate_vec2(local, angle);
+            let corrected = asteroids::beam::Vec2::new(rotated.x * local_x_scale, rotated.y);
+            let point = frame_ndc_to_pixel(image, center + corrected);
             score += max_signal_near(image, point, 4);
             samples += 1;
         }
@@ -1083,7 +1092,7 @@ fn decay_fit_from_frames(dir: &Path, fixed_dt: f64) -> Result<verify::DecayFit, 
         ));
     }
     let first = verify::load_png(&frames[0])?;
-    let playfield = centered_aspect_rect(first.width, first.height, PLAYFIELD_ASPECT_RATIO)?;
+    let playfield = full_frame_rect(first.width, first.height)?;
     let (peak_x, peak_y, peak_luma) = brightest_pixel_in_rect(&first, playfield);
     if peak_luma <= 0.0 {
         return Err(format!("first frame in {} has no luminance", dir.display()));
@@ -1205,7 +1214,7 @@ fn brightest_pixel(image: &verify::PngImage) -> (u32, u32, f32) {
 }
 
 const VERIFY_FIXED_DT_SECONDS: f32 = 0.00694;
-const PLAYFIELD_ASPECT_RATIO: f32 = 4.0 / 3.0;
+const OBJECT_BASELINE_ASPECT_RATIO: f32 = 4.0 / 3.0;
 const SOUL_VISIBLE_MIN_FRAMES: usize = 8;
 const SOUL_VISIBLE_ROTATION_TOLERANCE_RAD_PER_SEC: f32 = 0.1;
 const SOUL_VISIBLE_MIN_TRAIL_LUMINANCE: f32 = 0.0;
@@ -1252,7 +1261,7 @@ fn detect_ship_angles(
 
     for (frame_index, path) in frames.iter().enumerate() {
         let image = verify::load_png(path)?;
-        let playfield = centered_aspect_rect(image.width, image.height, PLAYFIELD_ASPECT_RATIO)?;
+        let playfield = full_frame_rect(image.width, image.height)?;
 
         let angle = if let Some(initial_angle) = initial_angle {
             let predicted_angle = initial_angle + expected_delta * frame_index as f32;
@@ -1352,7 +1361,10 @@ fn ship_pixels(playfield: PixelRect, angle: f32) -> [(f32, f32); SHIP_VERTEX_COU
     SHIP_VERTICES.map(|vertex| {
         gameplay_to_pixel(
             playfield,
-            rotate_vec2(vertex * asteroids::tuning::SHIP_SPINNING_SCALE, angle),
+            aspect_correct_local_for_rect(
+                rotate_vec2(vertex * asteroids::tuning::SHIP_SPINNING_SCALE, angle),
+                playfield,
+            ),
         )
     })
 }
@@ -1362,6 +1374,15 @@ fn gameplay_to_pixel(playfield: PixelRect, point: asteroids::beam::Vec2) -> (f32
         playfield.left as f32 + (point.x * 0.5 + 0.5) * playfield.width() as f32,
         playfield.top as f32 + (0.5 - point.y * 0.5) * playfield.height() as f32,
     )
+}
+
+fn aspect_correct_local_for_rect(
+    local: asteroids::beam::Vec2,
+    playfield: PixelRect,
+) -> asteroids::beam::Vec2 {
+    let playfield_aspect = playfield.width().max(1) as f32 / playfield.height().max(1) as f32;
+    let x_scale = OBJECT_BASELINE_ASPECT_RATIO / playfield_aspect;
+    asteroids::beam::Vec2::new(local.x * x_scale, local.y)
 }
 
 fn gamma_ramp_samples(
@@ -1465,13 +1486,12 @@ fn fit_angle_rate(detections: &[ShipDetection], fixed_dt: f32) -> AngleRateFit {
 }
 
 fn estimated_fwhm_width(image: &verify::PngImage) -> f32 {
-    let playfield = centered_aspect_rect(image.width, image.height, PLAYFIELD_ASPECT_RATIO)
-        .unwrap_or(PixelRect {
-            left: 0,
-            right: image.width,
-            top: 0,
-            bottom: image.height,
-        });
+    let playfield = full_frame_rect(image.width, image.height).unwrap_or(PixelRect {
+        left: 0,
+        right: image.width,
+        top: 0,
+        bottom: image.height,
+    });
     let best = brightest_pixel_in_rect(image, playfield);
     let row_values = (playfield.left..playfield.right)
         .map(|x| image.luminance(x, best.1))
@@ -1492,7 +1512,7 @@ fn estimated_fwhm_width(image: &verify::PngImage) -> f32 {
 
 fn banding_luminance_values(image: &verify::PngImage) -> Vec<f32> {
     let (_, peak_y, peak_luma) = brightest_pixel(image);
-    let x_range = centered_aspect_rect(image.width, image.height, PLAYFIELD_ASPECT_RATIO)
+    let x_range = full_frame_rect(image.width, image.height)
         .map(|rect| (rect.left, rect.right.saturating_sub(1)))
         .unwrap_or((0, image.width.saturating_sub(1)));
     if peak_luma <= 0.0 {
@@ -1624,34 +1644,16 @@ fn parse_aspect_ratio(value: &str) -> Result<f32, String> {
     Ok(width / height)
 }
 
-fn centered_aspect_rect(width: u32, height: u32, aspect: f32) -> Result<PixelRect, String> {
+fn full_frame_rect(width: u32, height: u32) -> Result<PixelRect, String> {
     if width == 0 || height == 0 {
         return Err("playfield-rect failed: image dimensions must be non-zero".to_string());
     }
-    if !aspect.is_finite() || aspect <= 0.0 {
-        return Err(format!("invalid aspect ratio {aspect}"));
-    }
-
-    let image_aspect = width as f32 / height as f32;
-    let (rect_width, rect_height) = if image_aspect >= aspect {
-        (
-            ((height as f32 * aspect).round() as u32).clamp(1, width),
-            height,
-        )
-    } else {
-        (
-            width,
-            ((width as f32 / aspect).round() as u32).clamp(1, height),
-        )
-    };
-    let left = (width - rect_width) / 2;
-    let top = (height - rect_height) / 2;
 
     Ok(PixelRect {
-        left,
-        right: left + rect_width,
-        top,
-        bottom: top + rect_height,
+        left: 0,
+        right: width,
+        top: 0,
+        bottom: height,
     })
 }
 
@@ -1708,7 +1710,7 @@ fn subcommand_help(command: &str) -> String {
         "asteroid-count" => "Usage: verify asteroid-count --frames <dir> --expected-large <n> [--tolerance <n>]".to_string(),
         "screen-wrap" => "Usage: verify screen-wrap --state-log <state-jsonl>".to_string(),
         "lives-display" => "Usage: verify lives-display --frame <png> --max-displayed <n> --state-log <state-jsonl>".to_string(),
-        "playfield-rect" => "Usage: verify playfield-rect --frame <png> --aspect <w:h> [--centered] [--bezel-min-fraction <value>]".to_string(),
+        "playfield-rect" => "Usage: verify playfield-rect --frame <png> [--aspect <w:h>] [--centered] [--bezel-min-fraction <value>]".to_string(),
         "audio-rms" => "Usage: verify audio-rms --wav <wav> --min <value> [--max <value>]".to_string(),
         "audio-dominant-freq" => "Usage: verify audio-dominant-freq --wav <wav> --min-hz <hz> --max-hz <hz>".to_string(),
         "audio-band-energy" => "Usage: verify audio-band-energy --wav <wav> --lo-hz <hz> --hi-hz <hz> --min-fraction <value>".to_string(),
