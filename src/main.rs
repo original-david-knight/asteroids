@@ -152,9 +152,8 @@ struct InputState {
     rotate_left_arrow: bool,
     rotate_right_d: bool,
     rotate_right_arrow: bool,
-    thrust_w: bool,
-    thrust_up: bool,
-    fire_space: bool,
+    thrust_j: bool,
+    fire_l: bool,
     hyperspace_h: bool,
 }
 
@@ -164,15 +163,14 @@ enum InputBinding {
     RotateLeftArrow,
     RotateRightD,
     RotateRightArrow,
-    W,
-    Up,
-    FireSpace,
+    ThrustJ,
+    FireL,
     HyperspaceH,
 }
 
 impl InputState {
     fn thrust_active(&self) -> bool {
-        self.thrust_w || self.thrust_up
+        self.thrust_j
     }
 
     fn controls(&self, shot_x_scale: f32) -> ControlState {
@@ -180,7 +178,7 @@ impl InputState {
             rotate_left: self.rotate_left_a || self.rotate_left_arrow,
             rotate_right: self.rotate_right_d || self.rotate_right_arrow,
             thrust: self.thrust_active(),
-            fire: self.fire_space,
+            fire: self.fire_l,
             hyperspace: self.hyperspace_h,
             shot_x_scale,
         }
@@ -193,9 +191,8 @@ impl InputState {
             InputBinding::RotateLeftArrow => self.rotate_left_arrow = pressed,
             InputBinding::RotateRightD => self.rotate_right_d = pressed,
             InputBinding::RotateRightArrow => self.rotate_right_arrow = pressed,
-            InputBinding::W => self.thrust_w = pressed,
-            InputBinding::Up => self.thrust_up = pressed,
-            InputBinding::FireSpace => self.fire_space = pressed,
+            InputBinding::ThrustJ => self.thrust_j = pressed,
+            InputBinding::FireL => self.fire_l = pressed,
             InputBinding::HyperspaceH => self.hyperspace_h = pressed,
         }
         let is_active = self.thrust_active();
@@ -208,9 +205,8 @@ impl InputState {
         self.rotate_left_arrow = false;
         self.rotate_right_d = false;
         self.rotate_right_arrow = false;
-        self.thrust_w = false;
-        self.thrust_up = false;
-        self.fire_space = false;
+        self.thrust_j = false;
+        self.fire_l = false;
         self.hyperspace_h = false;
         was_active
     }
@@ -220,11 +216,10 @@ fn input_binding_for_event(event: &KeyEvent) -> Option<InputBinding> {
     match &event.logical_key {
         Key::Named(NamedKey::ArrowLeft) => Some(InputBinding::RotateLeftArrow),
         Key::Named(NamedKey::ArrowRight) => Some(InputBinding::RotateRightArrow),
-        Key::Named(NamedKey::ArrowUp) => Some(InputBinding::Up),
-        Key::Named(NamedKey::Space) => Some(InputBinding::FireSpace),
         Key::Character(text) if text.eq_ignore_ascii_case("a") => Some(InputBinding::RotateLeftA),
         Key::Character(text) if text.eq_ignore_ascii_case("d") => Some(InputBinding::RotateRightD),
-        Key::Character(text) if text.eq_ignore_ascii_case("w") => Some(InputBinding::W),
+        Key::Character(text) if text.eq_ignore_ascii_case("j") => Some(InputBinding::ThrustJ),
+        Key::Character(text) if text.eq_ignore_ascii_case("l") => Some(InputBinding::FireL),
         // DESIGN.md Input Mapping listed Shift as a hyperspace alternate. The
         // autonomous run drops that binding and keeps H only so platform/window
         // manager Shift shortcuts cannot collide with gameplay input.

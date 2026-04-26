@@ -80,8 +80,8 @@ Tradeoffs accepted: ~3-4x the code volume of Approach A (~3000 LOC vs ~800), lon
 
 - Rotate left: `A` and Left arrow
 - Rotate right: `D` and Right arrow
-- Thrust: `W` and Up arrow
-- Fire: `Space`
+- Thrust: `J`
+- Fire: `L`
 - Hyperspace: `H` (also `Shift` as alt)
 - Pause: `P`
 - Quit: `Esc`
