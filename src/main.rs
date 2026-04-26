@@ -1,12 +1,11 @@
-mod audio;
-mod beam;
-mod renderer;
-mod tuning;
-
 use std::{error::Error, sync::Arc};
 
-use audio::AudioScaffold;
-use renderer::Renderer;
+use asteroids::{
+    audio::{self, AudioScaffold},
+    renderer::{self, Renderer},
+    runtime::{self, RuntimeConfig},
+    tuning,
+};
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, KeyEvent, WindowEvent},
@@ -17,6 +16,19 @@ use winit::{
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let config = match RuntimeConfig::from_env_args() {
+        Ok(config) => config,
+        Err(message) if message.starts_with("Usage:") => {
+            println!("{message}");
+            return Ok(());
+        }
+        Err(message) => return Err(message.into()),
+    };
+
+    if !config.should_run_interactive() {
+        return pollster::block_on(runtime::run_automated(&config)).map_err(Into::into);
+    }
+
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
 

@@ -2,10 +2,14 @@
 
 use std::{
     fmt,
+    fs::{self, File},
+    io::{self, BufWriter, Write},
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
+    thread::{self, JoinHandle},
 };
 
 use bytemuck::{Pod, Zeroable};
@@ -16,7 +20,14 @@ use ringbuf::{
 };
 
 pub const AUDIO_MSG_CAPACITY: usize = 1024;
+pub const CAPTURE_SAMPLE_RATE: u32 = 48_000;
+pub const CAPTURE_CHANNELS: u16 = 2;
+pub const AUDIO_CAPTURE_BATCH_FRAMES: usize = 256;
+pub const AUDIO_CAPTURE_QUEUE_BATCHES: usize = 256;
+const AUDIO_CAPTURE_BATCH_SAMPLES: usize = AUDIO_CAPTURE_BATCH_FRAMES * CAPTURE_CHANNELS as usize;
+
 type AudioRing = Arc<HeapRb<AudioMsg>>;
+type AudioCaptureRing = Arc<HeapRb<AudioCaptureBatch>>;
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Pod, Zeroable)]
@@ -54,6 +65,93 @@ pub enum AudioMsg {
     Trigger(VoiceId),
     Release(VoiceId),
     GameState(GameSnapshot),
+}
+
+#[derive(Clone, Copy)]
+pub struct AudioCaptureBatch {
+    frames: u16,
+    samples: [f32; AUDIO_CAPTURE_BATCH_SAMPLES],
+}
+
+impl AudioCaptureBatch {
+    fn empty() -> Self {
+        Self {
+            frames: 0,
+            samples: [0.0; AUDIO_CAPTURE_BATCH_SAMPLES],
+        }
+    }
+
+    pub fn frames(self) -> usize {
+        usize::from(self.frames)
+    }
+
+    pub fn samples(&self) -> &[f32] {
+        let len = self.frames() * CAPTURE_CHANNELS as usize;
+        &self.samples[..len]
+    }
+}
+
+pub struct AudioCaptureProducer {
+    producer: HeapProd<AudioCaptureBatch>,
+    current: AudioCaptureBatch,
+    xruns: Arc<AtomicU64>,
+}
+
+pub struct AudioCaptureConsumer {
+    consumer: Cons<AudioCaptureRing>,
+}
+
+impl AudioCaptureProducer {
+    pub fn push_interleaved_from_callback(&mut self, samples: &[f32]) {
+        for frame in samples.chunks_exact(CAPTURE_CHANNELS as usize) {
+            let offset = usize::from(self.current.frames) * CAPTURE_CHANNELS as usize;
+            self.current.samples[offset] = frame[0];
+            self.current.samples[offset + 1] = frame[1];
+            self.current.frames += 1;
+            if self.current.frames() == AUDIO_CAPTURE_BATCH_FRAMES {
+                self.flush_current_from_callback();
+            }
+        }
+    }
+
+    pub fn flush_current_from_callback(&mut self) {
+        if self.current.frames == 0 {
+            return;
+        }
+        let batch = self.current;
+        self.current = AudioCaptureBatch::empty();
+        if self.producer.try_push(batch).is_err() {
+            self.xruns.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn xrun_count(&self) -> u64 {
+        self.xruns.load(Ordering::Relaxed)
+    }
+}
+
+impl AudioCaptureConsumer {
+    pub fn try_pop(&mut self) -> Option<AudioCaptureBatch> {
+        self.consumer.try_pop()
+    }
+}
+
+pub fn audio_capture_channel() -> (AudioCaptureProducer, AudioCaptureConsumer, Arc<AtomicU64>) {
+    let ring = Arc::new(HeapRb::<AudioCaptureBatch>::new(
+        AUDIO_CAPTURE_QUEUE_BATCHES,
+    ));
+    let (producer, _) = ring.clone().split();
+    let consumer = Cons::new(ring);
+    let xruns = Arc::new(AtomicU64::new(0));
+    (
+        AudioCaptureProducer {
+            producer,
+            current: AudioCaptureBatch::empty(),
+            xruns: Arc::clone(&xruns),
+        },
+        AudioCaptureConsumer { consumer },
+        xruns,
+    )
 }
 
 impl AudioMsg {
@@ -291,6 +389,10 @@ impl VoiceBank {
         self.voices.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.voices.is_empty()
+    }
+
     pub fn get(&self, id: VoiceId) -> Option<&PreallocatedVoice> {
         self.voices.iter().find(|voice| voice.id() == id)
     }
@@ -329,6 +431,57 @@ impl AudioScaffold {
     pub fn voices(&self) -> &VoiceBank {
         &self.voices
     }
+}
+
+impl Default for AudioScaffold {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn write_silent_wav(path: &Path, duration_secs: f64) -> io::Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+
+    let frame_count = (duration_secs.max(0.0) * f64::from(CAPTURE_SAMPLE_RATE)).ceil() as u32;
+    let data_bytes = frame_count
+        .saturating_mul(u32::from(CAPTURE_CHANNELS))
+        .saturating_mul(2);
+    let mut writer = BufWriter::new(File::create(path)?);
+    write_wav_header(&mut writer, data_bytes)?;
+
+    let silence_frame = [0_u8; CAPTURE_CHANNELS as usize * 2];
+    for _ in 0..frame_count {
+        writer.write_all(&silence_frame)?;
+    }
+    writer.flush()
+}
+
+pub fn spawn_silent_wav_writer(path: PathBuf, duration_secs: f64) -> JoinHandle<io::Result<()>> {
+    thread::spawn(move || write_silent_wav(&path, duration_secs))
+}
+
+fn write_wav_header(writer: &mut impl Write, data_bytes: u32) -> io::Result<()> {
+    let byte_rate = CAPTURE_SAMPLE_RATE * u32::from(CAPTURE_CHANNELS) * 2;
+    let block_align = CAPTURE_CHANNELS * 2;
+    writer.write_all(b"RIFF")?;
+    writer.write_all(&(36_u32.saturating_add(data_bytes)).to_le_bytes())?;
+    writer.write_all(b"WAVE")?;
+    writer.write_all(b"fmt ")?;
+    writer.write_all(&16_u32.to_le_bytes())?;
+    writer.write_all(&1_u16.to_le_bytes())?;
+    writer.write_all(&CAPTURE_CHANNELS.to_le_bytes())?;
+    writer.write_all(&CAPTURE_SAMPLE_RATE.to_le_bytes())?;
+    writer.write_all(&byte_rate.to_le_bytes())?;
+    writer.write_all(&block_align.to_le_bytes())?;
+    writer.write_all(&16_u16.to_le_bytes())?;
+    writer.write_all(b"data")?;
+    writer.write_all(&data_bytes.to_le_bytes())?;
+    Ok(())
 }
 
 #[cfg(feature = "audio-scaffolding")]

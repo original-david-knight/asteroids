@@ -1,4 +1,8 @@
-use std::{env, sync::Arc, time::Instant};
+use std::{
+    env,
+    sync::{Arc, mpsc},
+    time::Instant,
+};
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::CurrentSurfaceTexture;
@@ -8,6 +12,62 @@ use crate::{
     beam::{self, BeamCommand, BeamEmitter, BeamVertex, Vec2},
     tuning,
 };
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Scenario {
+    #[default]
+    Demo,
+    Idle,
+    HorizontalSweep,
+    StaticBrightLine,
+    StaticBrightLineLowDwell,
+    StaticBrightLineHighDwell,
+    GammaRamp,
+}
+
+impl Scenario {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "demo" => Some(Self::Demo),
+            "idle" => Some(Self::Idle),
+            "horizontal-sweep" => Some(Self::HorizontalSweep),
+            "static-bright-line" => Some(Self::StaticBrightLine),
+            "static-bright-line-low-dwell" => Some(Self::StaticBrightLineLowDwell),
+            "static-bright-line-high-dwell" => Some(Self::StaticBrightLineHighDwell),
+            "gamma-ramp" => Some(Self::GammaRamp),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Demo => "demo",
+            Self::Idle => "idle",
+            Self::HorizontalSweep => "horizontal-sweep",
+            Self::StaticBrightLine => "static-bright-line",
+            Self::StaticBrightLineLowDwell => "static-bright-line-low-dwell",
+            Self::StaticBrightLineHighDwell => "static-bright-line-high-dwell",
+            Self::GammaRamp => "gamma-ramp",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FrameParams {
+    pub scenario: Scenario,
+    pub time_seconds: f32,
+    pub frame_dt_seconds: f32,
+}
+
+impl FrameParams {
+    pub fn new(scenario: Scenario, time_seconds: f32, frame_dt_seconds: f32) -> Self {
+        Self {
+            scenario,
+            time_seconds,
+            frame_dt_seconds,
+        }
+    }
+}
 
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -25,6 +85,20 @@ pub struct Renderer {
     phosphor_tau_ms: f32,
     last_frame: Instant,
     demo_start: Instant,
+}
+
+pub struct HeadlessRenderer {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    size: PhysicalSize<u32>,
+    output: OutputTexture,
+    beam_pipeline: BeamLinePipeline,
+    phosphor_blend_pipeline: PhosphorBlendPipeline,
+    composite_pipeline: CompositePipeline,
+    phosphor: PhosphorTargets,
+    phosphor_bind_groups: PhosphorBindGroups,
+    beam_emitter: BeamEmitter,
+    phosphor_tau_ms: f32,
 }
 
 impl Renderer {
@@ -143,26 +217,17 @@ impl Renderer {
 
     pub fn render(&mut self) -> Result<(), String> {
         let frame_dt_seconds = self.frame_dt_seconds();
-
-        self.beam_emitter.clear();
-        emit_demo_beams(
-            &mut self.beam_emitter,
+        let params = FrameParams::new(
+            Scenario::Demo,
             self.demo_start.elapsed().as_secs_f32(),
-        );
-        self.beam_pipeline.upload(
-            &self.device,
-            &self.queue,
-            self.beam_emitter.commands(),
-            beam_quad_half_width_ndc(self.size),
-            self.size,
-            self.phosphor.max_luma(),
-        );
-        self.phosphor_blend_pipeline.update_uniforms(
-            &self.queue,
             frame_dt_seconds,
-            self.phosphor_tau_ms * 0.001,
-            self.phosphor.max_luma(),
         );
+        self.render_with_params(params)
+    }
+
+    pub fn render_with_params(&mut self, params: FrameParams) -> Result<(), String> {
+        self.beam_emitter.clear();
+        emit_scenario_beams(&mut self.beam_emitter, params.scenario, params.time_seconds);
 
         let frame = match self.surface.get_current_texture() {
             CurrentSurfaceTexture::Success(frame) | CurrentSurfaceTexture::Suboptimal(frame) => {
@@ -187,77 +252,21 @@ impl Renderer {
                 label: Some("Asteroids Phosphor Encoder"),
             });
 
-        if self.phosphor.needs_clear() {
-            self.phosphor.encode_clear(&mut encoder);
-            self.phosphor.mark_clear();
-        }
-
-        let target_index = self.phosphor.target_index();
-
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Asteroids Beam SDF Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: self.phosphor.view(target_index),
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            self.beam_pipeline.draw(&mut pass);
-        }
-
-        self.phosphor
-            .copy_target_to_beam_scratch(&mut encoder, target_index);
-
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Asteroids Phosphor Decay Blend Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: self.phosphor.view(target_index),
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            self.phosphor_blend_pipeline
-                .draw(&mut pass, self.phosphor_bind_groups.blend(target_index));
-        }
-
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Asteroids Composite Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &surface_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            self.composite_pipeline
-                .draw(&mut pass, self.phosphor_bind_groups.composite(target_index));
-        }
+        encode_scene_to_view(SceneRenderContext {
+            device: &self.device,
+            queue: &self.queue,
+            size: self.size,
+            beam_pipeline: &mut self.beam_pipeline,
+            phosphor_blend_pipeline: &mut self.phosphor_blend_pipeline,
+            composite_pipeline: &self.composite_pipeline,
+            phosphor: &mut self.phosphor,
+            phosphor_bind_groups: &self.phosphor_bind_groups,
+            beam_emitter: &self.beam_emitter,
+            phosphor_tau_ms: self.phosphor_tau_ms,
+            frame_dt_seconds: params.frame_dt_seconds,
+            target_view: &surface_view,
+            encoder: &mut encoder,
+        });
 
         self.queue.submit([encoder.finish()]);
         frame.present();
@@ -307,6 +316,381 @@ impl Renderer {
             1.0 / 144.0
         }
     }
+}
+
+impl HeadlessRenderer {
+    pub async fn new(size: PhysicalSize<u32>) -> Result<Self, String> {
+        let size = PhysicalSize::new(size.width.max(1), size.height.max(1));
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+            .map_err(|error| format!("failed to find a headless GPU adapter: {error}"))?;
+
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("Asteroids Headless Device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| format!("failed to create headless wgpu device: {error}"))?;
+
+        let phosphor_config = choose_phosphor_format(&adapter);
+        if phosphor_config.fallback {
+            eprintln!(
+                "headless phosphor accumulator: Rgba16Float unavailable; using {:?} with max_luma={:.1}",
+                phosphor_config.format, phosphor_config.max_luma
+            );
+        }
+
+        let output_format = wgpu::TextureFormat::Rgba8Unorm;
+        let beam_pipeline = BeamLinePipeline::new(&device, phosphor_config.format);
+        let phosphor_blend_pipeline = PhosphorBlendPipeline::new(&device, phosphor_config.format);
+        let composite_pipeline =
+            CompositePipeline::new(&device, output_format, phosphor_config.format);
+        let phosphor = PhosphorTargets::new(&device, size, phosphor_config);
+        let phosphor_bind_groups = PhosphorBindGroups::new(
+            &device,
+            &phosphor,
+            &phosphor_blend_pipeline,
+            &composite_pipeline,
+        );
+        let output = OutputTexture::new(&device, size, output_format);
+
+        Ok(Self {
+            device,
+            queue,
+            size,
+            output,
+            beam_pipeline,
+            phosphor_blend_pipeline,
+            composite_pipeline,
+            phosphor,
+            phosphor_bind_groups,
+            beam_emitter: BeamEmitter::new(),
+            phosphor_tau_ms: tuning::PHOSPHOR_TAU_DEFAULT_MS,
+        })
+    }
+
+    pub fn render(&mut self, params: FrameParams) -> Result<(), String> {
+        self.beam_emitter.clear();
+        emit_scenario_beams(&mut self.beam_emitter, params.scenario, params.time_seconds);
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Asteroids Headless Phosphor Encoder"),
+            });
+
+        encode_scene_to_view(SceneRenderContext {
+            device: &self.device,
+            queue: &self.queue,
+            size: self.size,
+            beam_pipeline: &mut self.beam_pipeline,
+            phosphor_blend_pipeline: &mut self.phosphor_blend_pipeline,
+            composite_pipeline: &self.composite_pipeline,
+            phosphor: &mut self.phosphor,
+            phosphor_bind_groups: &self.phosphor_bind_groups,
+            beam_emitter: &self.beam_emitter,
+            phosphor_tau_ms: self.phosphor_tau_ms,
+            frame_dt_seconds: params.frame_dt_seconds,
+            target_view: &self.output.view,
+            encoder: &mut encoder,
+        });
+
+        self.queue.submit([encoder.finish()]);
+        self.phosphor.advance();
+        Ok(())
+    }
+
+    pub fn capture_rgba8(&self) -> Result<Vec<u8>, String> {
+        let bytes_per_pixel = 4;
+        let unpadded_bytes_per_row = self.size.width * bytes_per_pixel;
+        let padded_bytes_per_row = align_to_copy_bytes_per_row(unpadded_bytes_per_row);
+        let buffer_size = u64::from(padded_bytes_per_row) * u64::from(self.size.height);
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Asteroids Headless Readback Buffer"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Asteroids Headless Readback Encoder"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.output.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(self.size.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: self.size.width,
+                height: self.size.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit([encoder.finish()]);
+
+        let slice = readback.slice(..);
+        let (sender, receiver) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result.map_err(|error| error.to_string()));
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|error| format!("failed while polling readback buffer: {error}"))?;
+        receiver
+            .recv()
+            .map_err(|error| format!("failed to receive readback map result: {error}"))?
+            .map_err(|error| format!("failed to map readback buffer: {error}"))?;
+
+        let mapped = slice.get_mapped_range();
+        let mut rgba = vec![0; (self.size.width * self.size.height * bytes_per_pixel) as usize];
+        for row in 0..self.size.height as usize {
+            let src_start = row * padded_bytes_per_row as usize;
+            let src_end = src_start + unpadded_bytes_per_row as usize;
+            let dst_start = row * unpadded_bytes_per_row as usize;
+            let dst_end = dst_start + unpadded_bytes_per_row as usize;
+            rgba[dst_start..dst_end].copy_from_slice(&mapped[src_start..src_end]);
+        }
+        drop(mapped);
+        readback.unmap();
+        Ok(rgba)
+    }
+
+    pub fn size(&self) -> PhysicalSize<u32> {
+        self.size
+    }
+
+    pub fn phosphor_format(&self) -> wgpu::TextureFormat {
+        self.phosphor.format()
+    }
+}
+
+struct SceneRenderContext<'a> {
+    device: &'a wgpu::Device,
+    queue: &'a wgpu::Queue,
+    size: PhysicalSize<u32>,
+    beam_pipeline: &'a mut BeamLinePipeline,
+    phosphor_blend_pipeline: &'a mut PhosphorBlendPipeline,
+    composite_pipeline: &'a CompositePipeline,
+    phosphor: &'a mut PhosphorTargets,
+    phosphor_bind_groups: &'a PhosphorBindGroups,
+    beam_emitter: &'a BeamEmitter,
+    phosphor_tau_ms: f32,
+    frame_dt_seconds: f32,
+    target_view: &'a wgpu::TextureView,
+    encoder: &'a mut wgpu::CommandEncoder,
+}
+
+fn encode_scene_to_view(ctx: SceneRenderContext<'_>) {
+    ctx.beam_pipeline.upload(
+        ctx.device,
+        ctx.queue,
+        ctx.beam_emitter.commands(),
+        beam_quad_half_width_ndc(ctx.size),
+        ctx.size,
+        ctx.phosphor.max_luma(),
+    );
+    ctx.phosphor_blend_pipeline.update_uniforms(
+        ctx.queue,
+        ctx.frame_dt_seconds,
+        ctx.phosphor_tau_ms * 0.001,
+        ctx.phosphor.max_luma(),
+    );
+
+    if ctx.phosphor.needs_clear() {
+        ctx.phosphor.encode_clear(ctx.encoder);
+        ctx.phosphor.mark_clear();
+    }
+
+    let target_index = ctx.phosphor.target_index();
+
+    {
+        let mut pass = ctx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Asteroids Beam SDF Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: ctx.phosphor.view(target_index),
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        ctx.beam_pipeline.draw(&mut pass);
+    }
+
+    ctx.phosphor
+        .copy_target_to_beam_scratch(ctx.encoder, target_index);
+
+    {
+        let mut pass = ctx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Asteroids Phosphor Decay Blend Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: ctx.phosphor.view(target_index),
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        ctx.phosphor_blend_pipeline
+            .draw(&mut pass, ctx.phosphor_bind_groups.blend(target_index));
+    }
+
+    {
+        let mut pass = ctx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Asteroids Composite Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: ctx.target_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        ctx.composite_pipeline
+            .draw(&mut pass, ctx.phosphor_bind_groups.composite(target_index));
+    }
+}
+
+fn align_to_copy_bytes_per_row(bytes_per_row: u32) -> u32 {
+    let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    bytes_per_row.div_ceil(alignment) * alignment
+}
+
+fn emit_scenario_beams(emitter: &mut BeamEmitter, scenario: Scenario, time_s: f32) {
+    match scenario {
+        Scenario::Demo => emit_demo_beams(emitter, time_s),
+        Scenario::Idle => emit_idle_beams(emitter),
+        Scenario::HorizontalSweep => emit_horizontal_sweep_beams(emitter, time_s),
+        Scenario::StaticBrightLine => {
+            emit_static_bright_line(emitter, tuning::SHIP_OUTLINE_SEGMENT_DWELL_US)
+        }
+        Scenario::StaticBrightLineLowDwell => {
+            emit_static_bright_line(emitter, tuning::PHOSPHOR_TRAIL_LOW_DWELL_US)
+        }
+        Scenario::StaticBrightLineHighDwell => {
+            emit_static_bright_line(emitter, tuning::PHOSPHOR_TRAIL_HIGH_DWELL_US)
+        }
+        Scenario::GammaRamp => emit_gamma_ramp_beams(emitter),
+    }
+}
+
+fn emit_idle_beams(emitter: &mut BeamEmitter) {
+    emit_ship_outline(emitter, Vec2::ZERO, 0.0, 0.55, 0.85);
+    emitter.emit_bullet_dot(Vec2::new(0.56, -0.34), 0.014, 0.7);
+}
+
+fn emit_horizontal_sweep_beams(emitter: &mut BeamEmitter, time_s: f32) {
+    let period_s = 1.8;
+    let phase = (time_s / period_s).rem_euclid(1.0);
+    let x = -0.92 + phase * 1.84;
+    let half_len = 0.14;
+    emitter.emit_segment_with_endpoint_bonus(
+        Vec2::new(x - half_len, 0.0),
+        Vec2::new(x + half_len, 0.0),
+        1.0,
+        tuning::SHIP_OUTLINE_SEGMENT_DWELL_US,
+    );
+}
+
+fn emit_static_bright_line(emitter: &mut BeamEmitter, dwell_us: f32) {
+    emitter.emit_segment_with_endpoint_bonus(
+        Vec2::new(-0.55, 0.0),
+        Vec2::new(0.55, 0.0),
+        1.0,
+        dwell_us,
+    );
+}
+
+fn emit_gamma_ramp_beams(emitter: &mut BeamEmitter) {
+    let bars = 17;
+    for i in 0..bars {
+        let t = i as f32 / (bars - 1) as f32;
+        let x = -0.78 + t * 1.56;
+        emitter.emit_segment(
+            Vec2::new(x, -0.38),
+            Vec2::new(x, 0.38),
+            t,
+            tuning::SHIP_OUTLINE_SEGMENT_DWELL_US,
+        );
+    }
+}
+
+fn emit_ship_outline(
+    emitter: &mut BeamEmitter,
+    center: Vec2,
+    angle: f32,
+    scale: f32,
+    intensity: f32,
+) {
+    let (angle_sin, angle_cos) = angle.sin_cos();
+    let nose_direction = Vec2::new(angle_cos, angle_sin);
+    let side_direction = nose_direction.left_perp();
+
+    let nose = center + nose_direction * (0.44 * scale);
+    let left = center - nose_direction * (0.30 * scale) + side_direction * (0.22 * scale);
+    let right = center - nose_direction * (0.30 * scale) - side_direction * (0.22 * scale);
+    let notch = center - nose_direction * (0.12 * scale);
+
+    emitter
+        .emit(
+            BeamCommand::builder(nose, left)
+                .intensity(intensity)
+                .dwell_us(tuning::SHIP_OUTLINE_SEGMENT_DWELL_US)
+                .endpoint_dwell_bonus()
+                .build(),
+        )
+        .emit_ship_outline_segment(left, notch, intensity)
+        .emit_segment_with_endpoint_bonus(
+            notch,
+            right,
+            intensity,
+            tuning::SHIP_OUTLINE_SEGMENT_DWELL_US,
+        )
+        .emit_segment_with_endpoint_bonus(
+            right,
+            nose,
+            intensity,
+            tuning::SHIP_OUTLINE_SEGMENT_DWELL_US,
+        );
 }
 
 fn emit_demo_beams(emitter: &mut BeamEmitter, time_s: f32) {
@@ -634,6 +1018,32 @@ impl PhosphorTexture {
             dimension: wgpu::TextureDimension::D2,
             format,
             usage,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        Self { texture, view }
+    }
+}
+
+struct OutputTexture {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
+impl OutputTexture {
+    fn new(device: &wgpu::Device, size: PhysicalSize<u32>, format: wgpu::TextureFormat) -> Self {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Asteroids Headless Output"),
+            size: wgpu::Extent3d {
+                width: size.width.max(1),
+                height: size.height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());

@@ -159,30 +159,82 @@ tasks:
         - cargo clippy --all-targets -- -D warnings
         - cargo test --quiet
       commit_message: Add phosphor accumulator with Rgba16Float ping-pong textures
-    - id: checkpoint-phosphor-trail
-      title: Checkpoint - phosphor trail effect is real
+    - id: instrumentation-harness
+      title: Instrumentation harness for autonomous agent verification
       details: |
-        Verification gate before adding bloom on top of phosphor.
-        Sit with the renderer running and confirm the trail effect actually feels like a vector display (not just a frame-blend smear).
-        Tune tau live with the F-key slider and pick a default in the 50-100ms range that looks like persistence-of-vision rather than motion blur.
-        If the effect is wrong (sigma too small, decay misshapen, MAX_LUMA causing clipping), loop back to phosphor-accumulator before continuing. PLAN.md is explicit that this is a "the magic is real" gate, not a "it works" gate.
-      status: blocked
-      workflow: checkpoint
+        The plan runs end-to-end by autonomous agents with no human-in-the-loop verification, so every downstream acceptance criterion must be checkable by an agent. This task installs the instrumentation primitives the rest of the plan relies on - without this, all subsequent checkpoints stall.
+        Add the following CLI flags / runtime modes to the asteroids binary (extending project-skeleton, not a separate crate). Flags compose with each other. Running cargo run with no flags still launches the normal interactive fullscreen game.
+          - --headless skips swap-chain present and renders to an offscreen target. Required for verification on hosts without an active display.
+          - --screenshot <path> captures the final swap-chain image to PNG at <path>, then exits 0.
+          - --capture-frames <N> --frames-out <dir> renders N consecutive frames, writes each to <dir>/frame_<idx>.png, exits 0. Used for trail/decay timelines.
+          - --audio-capture <secs> --wav-out <path> routes the cpal output stream into a WAV writer for <secs> seconds (in addition to speakers), then exits 0. Used after audio-scaffolding lands; until then it captures whatever the graph produces (silence is fine).
+          - --seed <u64> seeds every RNG in the simulation (asteroid spawn, hyperspace dice, attract mode, etc.) so screenshots and gameplay traces are deterministic.
+          - --fixed-dt <secs> replaces the real-time clock with a fixed-delta-per-frame clock so screenshot timelines are reproducible regardless of host load.
+          - --simulate-secs <S> runs the simulation for S simulated seconds (governed by --fixed-dt) without writing frames, then exits. Used for long-form gameplay scenarios where capturing every frame would be wasteful.
+          - --scenario <name> runs a named scripted input/world sequence instead of reading the keyboard. Initial scenarios shipped here are idle, horizontal-sweep, static-bright-line, and gamma-ramp. Downstream tasks add their own scenarios (ship-spinning, thrust-1s, asteroids-round-1, bullet-hit-asteroid, etc.) as their verification requires.
+          - --xrun-log <path> has the audio thread append any underrun/overrun events to <path> so verification can read them after the run.
+          - --frame-time-log <path> has the render thread append per-frame durations to <path>.
+          - --state-log <path> has the game thread append a one-line-per-tick JSON event log (input events, collisions, life changes, score changes, mode changes, RNG-driven outcomes) to <path>. Used by gameplay verification subcommands.
+        Build a verification module and binary alongside the main app.
+          - Rust module asteroids verify with helpers - load_png, line_luminance, decay_fit, peak_count, load_wav, rms, dominant_freq, spectral_band_energy, frame_time_p99, xrun_count, plus state-trace parsing.
+          - Binary verify (add a [[bin]] entry; cargo run --bin verify -- <subcommand>) that wraps each helper as a CLI subcommand and exits 0 when the check passes, non-zero otherwise. Subcommands needed by downstream tasks include decay-fit, line-glow-width, line-peak-luminance, gamma-ramp, banding, peak-count, ship-outline, soul-visible, asteroid-count, screen-wrap, lives-display, playfield-rect, audio-rms, audio-dominant-freq, audio-band-energy, heartbeat-tempo, xrun-count, frame-time-p99, state-trace.
+          - Each subcommand documents required arguments via --help and reports failure measurements on stderr so the agent can record them in notes when a gate fails.
+        Constraint - instrumentation must not allocate inside the audio callback (DESIGN.md Audio Realtime Contract). The WAV capture path buffers samples through a lockfree queue; the actual file write happens on a background thread.
+      status: done
+      workflow: implement
       deps:
         - phosphor-accumulator
       context_files:
         - DESIGN.md
         - PLAN.md
       acceptance:
-        - 'Manual verification: cargo run --release produces a visible phosphor trail behind moving test segments that subjectively reads as vector phosphor (not raster blur).'
-        - tau default chosen in the 50-100ms range and recorded in code as the new default constant.
-        - Lines drawn at varying dwell_us values show clearly different brightness and faint sigma growth at high dwell (verifies the dwell-coupling model).
-        - Reviewer or the user confirms the effect before continuing; if subjective gate fails, document the gap and loop back to phosphor-accumulator instead of moving on.
-        - Record short notes capturing what was learned in this phase, including the tau value chosen, sigma tuning observations, and any Open Question 3 decision impact.
+        - Asteroids binary supports the documented flags - --headless, --screenshot, --capture-frames/--frames-out, --audio-capture/--wav-out, --seed, --fixed-dt, --simulate-secs, --scenario, --xrun-log, --frame-time-log, --state-log. Running cargo run with no flags still opens the interactive fullscreen game.
+        - 'Verification: cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario idle --screenshot /tmp/idle.png exits 0 and produces a non-empty PNG at the native render resolution.'
+        - 'Verification: cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario horizontal-sweep --capture-frames 30 --frames-out /tmp/frames --xrun-log /tmp/xruns.log --frame-time-log /tmp/frametimes.log exits 0 and writes 30 sequential frame_*.png files plus the two log files (xrun log may be empty).'
+        - asteroids verify module exposes load_png, line_luminance, decay_fit, peak_count, load_wav, rms, dominant_freq, spectral_band_energy, frame_time_p99, xrun_count, and state-trace helpers, with unit tests on synthetic inputs (e.g. decay_fit on a generated exp(-t/0.07) trace recovers tau within 5% and r_squared >= 0.99).
+        - 'Verification: cargo run --bin verify -- decay-fit --help and the other documented subcommands all exit 0 and print usage text.'
+        - The --audio-capture flag is wired but may produce a silent WAV until audio-scaffolding lands; the file must still be a valid 48kHz WAV that load_wav accepts.
+        - No allocations occur in the audio callback under capture (verify by code review and reuse of the existing ringbuf pattern).
+        - Record short notes capturing what was learned in this phase, including any platform quirks around offscreen rendering, the WAV format chosen, and which scenarios were stubbed for later tasks.
       verify_commands:
         - cargo build --release
         - cargo clippy --all-targets -- -D warnings
         - cargo test --quiet
+        - cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario idle --screenshot /tmp/idle.png
+        - cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario horizontal-sweep --capture-frames 30 --frames-out /tmp/frames --xrun-log /tmp/xruns.log --frame-time-log /tmp/frametimes.log
+      commit_message: Add instrumentation harness for autonomous agent verification
+    - id: checkpoint-phosphor-trail
+      title: Checkpoint - phosphor trail decay verified numerically
+      details: |
+        Numeric verification gate before adding bloom on top of phosphor. Replaces the prior subjective "sit and look at it" gate so it can be checked by an autonomous agent.
+        Use the instrumentation harness scenario horizontal-sweep (a single bright beam segment moving across the screen at a known speed) with --seed 1 --fixed-dt 0.00694 --capture-frames 60. For pixels along the trailing path behind the beam head, fit exp(-t/tau) to the per-pixel luminance timeline using verify decay-fit. Tau must land in [50ms, 100ms] with r_squared >= 0.95.
+        Verify dwell coupling separately - capture two stills of static high-dwell vs low-dwell lines (extend --scenario static-bright-line with --dwell-us flag, or add scenarios static-bright-line-low-dwell at 10us and static-bright-line-high-dwell at 60us) and confirm peak-luminance and full-width-half-max ratios match the dwell-coupling model.
+        If any check fails (curve is not exponential, tau outside range, peak luminance clipping at MAX_LUMA, dwell coupling missing), do not press on - reopen phosphor-accumulator with the failure measurement recorded in notes and the explicit loop-back target named.
+      status: todo
+      workflow: checkpoint
+      deps:
+        - phosphor-accumulator
+        - instrumentation-harness
+      context_files:
+        - DESIGN.md
+        - PLAN.md
+      acceptance:
+        - 'Verification: cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario horizontal-sweep --capture-frames 60 --frames-out /tmp/phosphor produces frames whose decay fits exp(-t/tau) with tau in [50ms, 100ms] and r_squared >= 0.95, confirmed by cargo run --bin verify -- decay-fit --frames /tmp/phosphor --tau-min 0.05 --tau-max 0.10 --r2-min 0.95 exiting 0.'
+        - 'Verification: peak luminance along the beam head is below MAX_LUMA (8.0) and above 1.0, confirmed by cargo run --bin verify -- line-peak-luminance --frame /tmp/phosphor/frame_00.png --min 1.0 --max 8.0 exiting 0.'
+        - 'Verification: dwell sweep - cargo run --release -- --headless --seed 1 --scenario static-bright-line-low-dwell --screenshot /tmp/dwell-lo.png and --scenario static-bright-line-high-dwell --screenshot /tmp/dwell-hi.png followed by cargo run --bin verify -- line-glow-width --lo /tmp/dwell-lo.png --hi /tmp/dwell-hi.png --fwhm-ratio-min 1.2 exits 0.'
+        - tau default constant in code is recorded as the value chosen from the measured fit (must be inside the [50ms, 100ms] window).
+        - If any verification check fails, the failure measurement is recorded in notes and phosphor-accumulator is the explicit loop-back target - downstream tasks do not start.
+        - Record short notes capturing what was learned in this phase, including the measured tau, sigma values, dwell-coupling observations, and any deviations from the model.
+      verify_commands:
+        - cargo build --release
+        - cargo clippy --all-targets -- -D warnings
+        - cargo test --quiet
+        - cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario horizontal-sweep --capture-frames 60 --frames-out /tmp/phosphor
+        - cargo run --bin verify -- decay-fit --frames /tmp/phosphor --tau-min 0.05 --tau-max 0.10 --r2-min 0.95
+        - cargo run --bin verify -- line-peak-luminance --frame /tmp/phosphor/frame_00.png --min 1.0 --max 8.0
+        - cargo run --release -- --headless --seed 1 --scenario static-bright-line-low-dwell --screenshot /tmp/dwell-lo.png
+        - cargo run --release -- --headless --seed 1 --scenario static-bright-line-high-dwell --screenshot /tmp/dwell-hi.png
+        - cargo run --bin verify -- line-glow-width --lo /tmp/dwell-lo.png --hi /tmp/dwell-hi.png --fwhm-ratio-min 1.2
       commit_message: Checkpoint phosphor trail magic milestone
     - id: bloom-pass
       title: Bloom pass via Gaussian downsample-upsample chain
@@ -202,24 +254,27 @@ tasks:
       acceptance:
         - WGSL shaders implement the Gaussian downsample and upsample passes with at least 3-4 mip levels.
         - Bloom output is added to the phosphor texture in the render graph, ahead of the tone-map.
-        - Bloom intensity and threshold are tunable via debug controls or named constants.
-        - 'Manual verification: cargo run shows glow on a static white test line as visibly soft and gradual, not a hard edge.'
+        - Bloom intensity and threshold are tunable via the documented constants and via runtime --bloom-intensity / --bloom-threshold flags so verification can A/B them.
+        - 'Verification: cargo run --release -- --headless --seed 1 --scenario static-bright-line --bloom-intensity 0 --screenshot /tmp/bloom-off.png and the same command with --bloom-intensity at the chosen default --screenshot /tmp/bloom-on.png followed by cargo run --bin verify -- line-glow-width --lo /tmp/bloom-off.png --hi /tmp/bloom-on.png --fwhm-ratio-min 2.0 --core-peak-tolerance 0.05 exits 0, confirming bloom widens the glow but preserves the line core peak luminance.'
+        - 'Verification: cargo run --bin verify -- banding --frame /tmp/bloom-on.png --max-step-jump 0.05 exits 0, confirming bloom transition is gradual (no hard edges).'
         - Record short notes capturing what was learned in this phase, including default bloom intensity/threshold values and any Open Question 5 (CRT curvature) signal you noticed at this point.
       verify_commands:
         - cargo build
         - cargo clippy --all-targets -- -D warnings
         - cargo test --quiet
+        - cargo run --release -- --headless --seed 1 --scenario static-bright-line --bloom-intensity 0 --screenshot /tmp/bloom-off.png
+        - cargo run --release -- --headless --seed 1 --scenario static-bright-line --screenshot /tmp/bloom-on.png
+        - cargo run --bin verify -- line-glow-width --lo /tmp/bloom-off.png --hi /tmp/bloom-on.png --fwhm-ratio-min 2.0 --core-peak-tolerance 0.05
+        - cargo run --bin verify -- banding --frame /tmp/bloom-on.png --max-step-jump 0.05
       commit_message: Add Gaussian downsample-upsample bloom pass
     - id: aspect-ratio-decision
       title: Aspect-ratio strategy decision and implementation
       details: |
-        DESIGN.md Open Question 1 and PLAN.md step 5 decision point - this decision must be made AFTER bloom is up so a real glowing line is on the user's actual monitor for reference, and BEFORE the spinning ship milestone.
-        Live options:
+        DESIGN.md Open Question 1 and PLAN.md step 5. For the autonomous run the choice is locked to DESIGN.md's default lean (option c) - keep gameplay 4:3 in the center, fill the side margins with vector-art bezels showing score and lives readouts only (no cabinet art). Locking the decision avoids a taste call no agent can make and matches the recorded design preference; the alternatives below are recorded for traceability only.
+        Alternatives considered and rejected:
           - (a) Letterbox the original 4:3 playfield with black bars on the sides.
           - (b) Stretch the playfield to widescreen (more space, asteroids spread out, slightly easier game).
-          - (c) Keep gameplay 4:3 in the center, fill side margins with vector-art bezels (score + lives readouts only for v1; no cabinet art). Default lean per DESIGN.md.
-        Pick one option with the bloom + phosphor view as visual reference.
-        Implement the chosen mapping in the renderer: define a playfield rectangle in screen-space, build any required bezel beam commands for option (c), and route all subsequent gameplay beam commands through the playfield mapping.
+        Implement option (c) in the renderer - define a playfield rectangle centered on the native render target with the original 4:3 aspect ratio, build bezel beam commands for the score and lives readouts in the side margins (stubs until scoring-and-lives lands), and route all subsequent gameplay beam commands through the playfield mapping.
       status: todo
       workflow: implement
       deps:
@@ -228,24 +283,25 @@ tasks:
         - DESIGN.md
         - PLAN.md
       acceptance:
-        - One of the three aspect-ratio options is selected with the chosen option recorded in code comments and notes, with a one-line rationale tied to the on-screen reference.
-        - Renderer maps gameplay coordinates into the chosen playfield rectangle, with letterbox bars or bezel margins drawn as needed.
-        - If option (c) is chosen, vector-art bezels for score and lives readouts are stubbed in (no cabinet art); other options leave that surface empty.
-        - Subsequent beam emitters (ship, asteroids, bullets, UFO) will use the playfield-space coordinate transform installed here.
-        - Record short notes capturing what was learned in this phase, including the chosen option, why it was chosen, and any margin/bezel tuning notes.
+        - Option (c) - 4:3 playfield centered with vector-art bezel margins - is implemented as the locked aspect-ratio strategy, with the rationale (DESIGN.md default lean, autonomous run avoids taste call) recorded in code comments.
+        - Renderer maps gameplay coordinates into the centered 4:3 playfield rectangle with non-zero bezel margins on both sides at any widescreen native resolution.
+        - Vector-art bezels for score and lives readouts are stubbed in; subsequent beam emitters (ship, asteroids, bullets, UFO) use the playfield-space coordinate transform installed here.
+        - 'Verification: cargo run --release -- --headless --seed 1 --scenario idle --screenshot /tmp/playfield.png followed by cargo run --bin verify -- playfield-rect --frame /tmp/playfield.png --aspect 4:3 --centered --bezel-min-fraction 0.05 exits 0, confirming the 4:3 playfield rect is centered and bezel margins are non-zero on both sides.'
+        - Record short notes capturing what was learned in this phase, including any margin/bezel tuning notes and the bezel readout layout chosen.
       verify_commands:
         - cargo build
         - cargo clippy --all-targets -- -D warnings
         - cargo test --quiet
-      commit_message: Decide and implement aspect-ratio strategy for widescreen playfield
+        - cargo run --release -- --headless --seed 1 --scenario idle --screenshot /tmp/playfield.png
+        - cargo run --bin verify -- playfield-rect --frame /tmp/playfield.png --aspect 4:3 --centered --bezel-min-fraction 0.05
+      commit_message: Implement 4:3 centered playfield with vector-art bezel margins
     - id: spinning-ship
       title: One spinning ship - soul-visible milestone
       details: |
         Per PLAN.md step 6, this is the soul-visible milestone. Stop here and look at it before adding gameplay.
         Define the original Asteroids 4-vertex (open triangular) ship outline and emit beam commands per frame to draw it.
-        Rotate the ship around its center on a simple frame-time clock (the full fixed-timestep simulation lands at game-loop-physics).
-        Watch the phosphor trail behind motion - this is the project's soul made visible.
-        DESIGN.md Open Question 2 (color: pure white-on-black vs warm phosphor green/amber tint) is decided here by feel; pick a default and note it.
+        Rotate the ship around its center on a simple frame-time clock (the full fixed-timestep simulation lands at game-loop-physics). Add a scenario ship-spinning that drives the rotation deterministically under --fixed-dt --seed for verification.
+        DESIGN.md Open Question 2 - for the autonomous run, lock the beam color to pure white-on-black (most faithful to original arcade Asteroids monochrome XY display). Record the decision in code comments tied to Open Question 2.
         DESIGN.md Premise 4 soft deadline: ~3-4 weekends to reach this milestone is a planning-time heuristic about expected breadth, not a measured fact. If bloom-and-phosphor work has overrun the budget, course-correct rather than scope-creep further; the deadline is an anti-rabbit-hole guard, not a shipping deadline. If you arrive here over-budget, capture the overrun in notes and consider what to descope rather than expanding.
       status: todo
       workflow: implement
@@ -256,14 +312,18 @@ tasks:
         - PLAN.md
       acceptance:
         - Ship outline beam commands use the dwell defaults from beam-emit-api and route through the playfield transform from aspect-ratio-decision.
-        - Color choice (pure white vs warm phosphor tint) is decided and recorded in code as the default beam color, with a short rationale (DESIGN.md Open Question 2).
-        - 'Manual verification: cargo run --release shows the original 4-vertex Asteroids ship outline rotating smoothly with a visibly trailing phosphor glow on the user''s monitor.'
+        - Beam color is pure white-on-black, recorded in code as the default beam color with rationale tied to DESIGN.md Open Question 2 (autonomous-run lock).
+        - 'Verification: cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario ship-spinning --capture-frames 240 --frames-out /tmp/ship followed by cargo run --bin verify -- ship-outline --frames /tmp/ship --vertex-count 4 --rotation-rate-rad-per-sec 3.0 --tolerance 0.1 exits 0, confirming the 4-vertex ship outline is detected at every frame and the angle change between frames matches the rotation-rate constant.'
+        - 'Verification: cargo run --bin verify -- trail-luminance --frames /tmp/ship --behind-vector --min-luminance 0.5 exits 0, confirming a non-zero phosphor trail exists in the wake of the rotating ship.'
         - Soft-deadline check is acknowledged in notes - if the project arrived here over the 3-4 weekend planning estimate, list what would be descoped rather than expanded.
-        - Record short notes capturing what was learned in this phase, including the color choice, the soft-deadline status, and anything that would change if re-planned in a fresh environment.
+        - Record short notes capturing what was learned in this phase, including the soft-deadline status, scenario tuning notes, and anything that would change if re-planned in a fresh environment.
       verify_commands:
         - cargo build --release
         - cargo clippy --all-targets -- -D warnings
         - cargo test --quiet
+        - cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario ship-spinning --capture-frames 240 --frames-out /tmp/ship
+        - cargo run --bin verify -- ship-outline --frames /tmp/ship --vertex-count 4 --rotation-rate-rad-per-sec 3.0 --tolerance 0.1
+        - cargo run --bin verify -- trail-luminance --frames /tmp/ship --behind-vector --min-luminance 0.5
       commit_message: Render spinning Asteroids ship outline with phosphor trail
     - id: checkpoint-soul-visible
       title: Checkpoint - soul of the project is visible
@@ -278,14 +338,18 @@ tasks:
         - DESIGN.md
         - PLAN.md
       acceptance:
-        - 'Manual verification: cargo run --release verifies the first DESIGN.md success criterion ("Spinning wireframe ship on black background with phosphor glow that visibly trails behind motion").'
-        - The visual identity (color, glow falloff, trail length) is confirmed at the level the user wants to defend in screenshots later.
-        - If gates fail, follow-up loops back to the relevant earlier task instead of pressing on.
-        - Record short notes capturing what was learned in this phase, including any subjective tuning notes and any decisions to revisit during the polish-pass.
+        - 'Verification: cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario ship-spinning --capture-frames 144 --frames-out /tmp/soul produces a frame timeline where ship-outline detection (4 vertices, rotation rate ~3 rad/s) succeeds on every frame and trail-luminance behind the motion vector is non-zero, all confirmed by cargo run --bin verify -- soul-visible --frames /tmp/soul exiting 0.'
+        - 'Verification: cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario ship-spinning --simulate-secs 10 --frame-time-log /tmp/soul-frametimes.log followed by cargo run --bin verify -- frame-time-p99 --log /tmp/soul-frametimes.log --max-ms 7.5 exits 0, confirming the visual side holds the 144Hz frame budget under sustained rendering.'
+        - If any gate fails, the failing measurement is recorded in notes and the explicit loop-back target (phosphor-accumulator, bloom-pass, or spinning-ship) is named - downstream tasks do not start.
+        - Record short notes capturing what was learned in this phase, including the captured frame counts, any frame-time outliers, and decisions to revisit during the polish-pass.
       verify_commands:
         - cargo build --release
         - cargo clippy --all-targets -- -D warnings
         - cargo test --quiet
+        - cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario ship-spinning --capture-frames 144 --frames-out /tmp/soul
+        - cargo run --bin verify -- soul-visible --frames /tmp/soul
+        - cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario ship-spinning --simulate-secs 10 --frame-time-log /tmp/soul-frametimes.log
+        - cargo run --bin verify -- frame-time-p99 --log /tmp/soul-frametimes.log --max-ms 7.5
       commit_message: Checkpoint soul-visible spinning ship milestone
     - id: final-composite
       title: Final composite of phosphor + bloom into the swap-chain
@@ -303,12 +367,16 @@ tasks:
       acceptance:
         - Composite WGSL shader takes phosphor texture + bloom texture, applies Reinhard tone-map then gamma 2.2, and writes to the swap-chain.
         - CRT curvature explicitly deferred per Open Question 5 with a clear comment in the composite shader explaining the reasoning.
-        - 'Manual verification: cargo run shows visual output is consistent and saturated correctly across the playfield with no visible banding.'
+        - 'Verification: cargo run --release -- --headless --seed 1 --scenario gamma-ramp --screenshot /tmp/gamma.png followed by cargo run --bin verify -- gamma-ramp --frame /tmp/gamma.png --gamma 2.2 --tolerance 0.05 exits 0, confirming the 11 luminance bars match the expected gamma 2.2 curve.'
+        - 'Verification: cargo run --bin verify -- banding --frame /tmp/gamma.png --max-step-jump 0.05 exits 0, confirming no banding (no sample-to-sample jumps above the threshold).'
         - Record short notes capturing what was learned in this phase, including final composite ordering and any future-curvature notes.
       verify_commands:
         - cargo build
         - cargo clippy --all-targets -- -D warnings
         - cargo test --quiet
+        - cargo run --release -- --headless --seed 1 --scenario gamma-ramp --screenshot /tmp/gamma.png
+        - cargo run --bin verify -- gamma-ramp --frame /tmp/gamma.png --gamma 2.2 --tolerance 0.05
+        - cargo run --bin verify -- banding --frame /tmp/gamma.png --max-step-jump 0.05
       commit_message: Finalize phosphor-bloom composite into swap-chain
     - id: audio-scaffolding
       title: Wire cpal output stream to the fundsp DSP graph
@@ -336,12 +404,15 @@ tasks:
         - Voice graph is built once at app startup; parameter mutation goes through Var/shared (AtomicF32) cells per DESIGN.md Audio Realtime Contract.
         - Backend selection (PipeWire vs ALSA) reflects the probe finding and is logged at startup.
         - No sample WAV files are loaded; the DSP graph is the only sample source.
-        - 'Manual verification: cargo run idle for ~1 minute reports zero xruns on the user''s machine.'
+        - 'Verification: cargo run --release -- --headless --seed 1 --scenario idle --audio-capture 30 --wav-out /tmp/idle.wav --xrun-log /tmp/idle-xruns.log followed by cargo run --bin verify -- xrun-count --log /tmp/idle-xruns.log --max 0 and cargo run --bin verify -- audio-rms --wav /tmp/idle.wav --max 0.001 both exit 0, confirming a 30-second idle run has zero xruns and produces silence (graph still emits 0.0 samples).'
         - Record short notes capturing what was learned in this phase, including SCHED_FIFO outcome, backend selected, and any callback-thread surprises.
       verify_commands:
         - cargo build
         - cargo clippy --all-targets -- -D warnings
         - cargo test --quiet
+        - cargo run --release -- --headless --seed 1 --scenario idle --audio-capture 30 --wav-out /tmp/idle.wav --xrun-log /tmp/idle-xruns.log
+        - cargo run --bin verify -- xrun-count --log /tmp/idle-xruns.log --max 0
+        - cargo run --bin verify -- audio-rms --wav /tmp/idle.wav --max 0.001
       commit_message: Wire cpal output stream to fundsp DSP graph
     - id: thrust-voice
       title: First voice - thrust - soul-visible-and-audible milestone
@@ -360,13 +431,18 @@ tasks:
       acceptance:
         - Thrust voice is implemented in the fundsp graph as sawtooth -> low-pass -> envelope, pre-allocated at startup.
         - W (and Up arrow) input gates the thrust voice on/off via Trigger/Release messages on the ringbuf, with no allocations in either thread during gating.
-        - DESIGN.md success criterion
-        - 'Manual verification: cargo run produces a clean thrust hum through the speakers when W is held; releasing W lets the envelope decay naturally.'
+        - DESIGN.md success criterion ("Thrust sound humming through speakers as you press up - generated by real synthesis, not sample playback") is satisfied by the verifications below.
+        - 'Verification: cargo run --release -- --headless --seed 1 --scenario thrust-1s --audio-capture 1.5 --wav-out /tmp/thrust.wav followed by cargo run --bin verify -- audio-rms --wav /tmp/thrust.wav --window-start-ms 100 --window-end-ms 900 --min 0.05 and cargo run --bin verify -- audio-band-energy --wav /tmp/thrust.wav --lo-hz 80 --hi-hz 800 --window-start-ms 100 --window-end-ms 900 --min-fraction 0.5 both exit 0, confirming a sustained thrust hum is present in the W-held window with the documented spectral signature.'
+        - 'Verification: cargo run --bin verify -- audio-rms --wav /tmp/thrust.wav --window-start-ms 1300 --window-end-ms 1500 --max 0.005 exits 0, confirming the envelope decays to near-silence after release.'
         - Record short notes capturing what was learned in this phase, including envelope timings, filter cutoff defaults, and any noise/clipping observations.
       verify_commands:
         - cargo build
         - cargo clippy --all-targets -- -D warnings
         - cargo test --quiet
+        - cargo run --release -- --headless --seed 1 --scenario thrust-1s --audio-capture 1.5 --wav-out /tmp/thrust.wav
+        - cargo run --bin verify -- audio-rms --wav /tmp/thrust.wav --window-start-ms 100 --window-end-ms 900 --min 0.05
+        - cargo run --bin verify -- audio-band-energy --wav /tmp/thrust.wav --lo-hz 80 --hi-hz 800 --window-start-ms 100 --window-end-ms 900 --min-fraction 0.5
+        - cargo run --bin verify -- audio-rms --wav /tmp/thrust.wav --window-start-ms 1300 --window-end-ms 1500 --max 0.005
       commit_message: Add thrust synthesis voice gated by W
     - id: checkpoint-soul-audible
       title: Checkpoint - soul-visible-and-audible
@@ -381,14 +457,19 @@ tasks:
         - DESIGN.md
         - PLAN.md
       acceptance:
-        - 'Manual verification: cargo run --release shows the spinning ship with phosphor trail rendering correctly.'
-        - 'Manual verification: pressing W produces the thrust hum without xruns over a ~1 minute test session.'
-        - Frame rate stays at the monitor refresh rate (likely 144Hz on the user's machine) with no judder.
-        - Record short notes capturing what was learned in this phase, including any cross-thread interaction quirks discovered when the audio is running alongside the renderer.
+        - 'Verification: combined run cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario ship-spinning-with-thrust --capture-frames 144 --frames-out /tmp/sa-frames --audio-capture 10 --wav-out /tmp/sa-audio.wav --xrun-log /tmp/sa-xruns.log --frame-time-log /tmp/sa-frametimes.log captures both visual and audio output simultaneously and exits 0.'
+        - 'Verification: cargo run --bin verify -- soul-visible --frames /tmp/sa-frames and cargo run --bin verify -- xrun-count --log /tmp/sa-xruns.log --max 0 and cargo run --bin verify -- frame-time-p99 --log /tmp/sa-frametimes.log --max-ms 7.5 and cargo run --bin verify -- audio-rms --wav /tmp/sa-audio.wav --window-start-ms 500 --window-end-ms 9000 --min 0.05 all exit 0, confirming visuals and audio run together with no xruns and frame budget held.'
+        - If any gate fails, the failing measurement is recorded in notes with the explicit loop-back target named - downstream tasks do not start.
+        - Record short notes capturing what was learned in this phase, including any cross-thread interaction quirks discovered when audio is running alongside the renderer.
       verify_commands:
         - cargo build --release
         - cargo clippy --all-targets -- -D warnings
         - cargo test --quiet
+        - cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario ship-spinning-with-thrust --capture-frames 144 --frames-out /tmp/sa-frames --audio-capture 10 --wav-out /tmp/sa-audio.wav --xrun-log /tmp/sa-xruns.log --frame-time-log /tmp/sa-frametimes.log
+        - cargo run --bin verify -- soul-visible --frames /tmp/sa-frames
+        - cargo run --bin verify -- xrun-count --log /tmp/sa-xruns.log --max 0
+        - cargo run --bin verify -- frame-time-p99 --log /tmp/sa-frametimes.log --max-ms 7.5
+        - cargo run --bin verify -- audio-rms --wav /tmp/sa-audio.wav --window-start-ms 500 --window-end-ms 9000 --min 0.05
       commit_message: Checkpoint soul-visible-and-audible milestone
     - id: game-loop-physics
       title: Game loop, ship physics, and fixed-timestep with spiral-of-death guard
@@ -397,8 +478,8 @@ tasks:
         Fixed-timestep at 1/240s for physics, decoupled from render and interpolated to the display rate.
         Implement spiral-of-death guard with a max-substeps cap of 4 per render frame (covers the reviewer concern from PLAN.md).
         Ship physics: inertia (no friction per original), screen wrap, rotation rate ~3 rad/sec, thrust acceleration ~0.05 units/frame at 60Hz scaled to the 1/240s sim step, max velocity ~6 units/sec (game-world units).
-        Wire input mapping from DESIGN.md: rotate left = A or Left, rotate right = D or Right, thrust = W or Up, fire = Space (placeholder), hyperspace = H or Shift (placeholder), pause = P, quit = Esc.
-        Hyperspace alt-key Shift can stomp platform shortcuts - flag this now, decide whether to keep, drop, or scope to plain Shift only when no modifier-needing key is also pressed; record the decision rather than deferring it to polish-pass.
+        Wire input mapping from DESIGN.md: rotate left = A or Left, rotate right = D or Right, thrust = W or Up, fire = Space (placeholder), hyperspace = H, pause = P, quit = Esc.
+        Hyperspace alt-key - for the autonomous run, drop the Shift binding (H only) to avoid colliding with platform shortcuts. Record this decision in code comments tied to DESIGN.md Input Mapping.
         Gamepad: not in v1, deferred per DESIGN.md Input Mapping. Do not introduce gamepad abstractions.
         Update the GameSnapshot POD pushed to the audio side each tick (asteroid count placeholder until next task).
         Input-latency target: total input-to-feedback budget ~16ms (sim step ~4.2ms + frame ~6.9ms at 144Hz + audio block ~5.3ms) per DESIGN.md "low input latency" constraint - do not add per-frame input batching that defers events.
@@ -413,16 +494,18 @@ tasks:
       acceptance:
         - Physics runs at fixed 1/240s timestep with a max of 4 substeps per render frame (spiral-of-death guard) and is interpolated to the display rate.
         - Ship rotates at ~3 rad/sec, accelerates per the documented thrust constants, caps at ~6 units/sec, has no friction, and wraps at playfield edges.
-        - All input bindings from DESIGN.md Input Mapping are wired (rotate left/right, thrust, fire placeholder, hyperspace placeholder, pause, quit) with the Shift-conflict decision recorded.
+        - All input bindings from DESIGN.md Input Mapping are wired (rotate left/right, thrust, fire placeholder, hyperspace H-only, pause, quit) with the Shift-drop decision recorded in code comments.
         - Gamepad code paths are absent (deferred per DESIGN.md).
         - GameSnapshot is pushed to the audio thread each tick with current alive flag, score (0 for now), and asteroid count placeholder.
         - Unit tests cover substep cap, screen wrap, rotation rate, thrust integration, max velocity cap, and no-friction inertia.
-        - 'Manual verification: cargo run shows frame rate stays at the monitor refresh rate during heavy turning + thrusting.'
-        - Record short notes capturing what was learned in this phase, including substep cap behavior under stress, the Shift-conflict decision, and any timestep tuning notes.
+        - 'Verification: cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario heavy-input --simulate-secs 10 --frame-time-log /tmp/loop-frametimes.log followed by cargo run --bin verify -- frame-time-p99 --log /tmp/loop-frametimes.log --max-ms 7.5 exits 0, confirming the frame budget holds under heavy turning and thrusting.'
+        - Record short notes capturing what was learned in this phase, including substep cap behavior under stress, the Shift-drop decision rationale, and any timestep tuning notes.
       verify_commands:
         - cargo build
         - cargo clippy --all-targets -- -D warnings
         - cargo test --quiet
+        - cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario heavy-input --simulate-secs 10 --frame-time-log /tmp/loop-frametimes.log
+        - cargo run --bin verify -- frame-time-p99 --log /tmp/loop-frametimes.log --max-ms 7.5
       commit_message: Add game loop with fixed-timestep physics and spiral-of-death guard
     - id: asteroids
       title: Asteroids - three size tiers with split-on-hit and original spawn pattern
@@ -449,12 +532,15 @@ tasks:
         - Disassembly-driven tuning of asteroid constants is done in this task per DESIGN.md Game Constants final bullet (not deferred).
         - GameSnapshot.asteroid_count is updated each sim tick and visible to the audio thread via the ringbuf.
         - Unit tests cover the split rule and per-round spawn count progression.
-        - 'Manual verification: cargo run shows asteroids drifting and screen-wrapping at the correct sizes.'
+        - 'Verification: cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario asteroids-round-1 --capture-frames 144 --frames-out /tmp/asteroids --state-log /tmp/asteroids-state.json followed by cargo run --bin verify -- asteroid-count --frames /tmp/asteroids --expected-large 4 --tolerance 0 and cargo run --bin verify -- screen-wrap --state-log /tmp/asteroids-state.json both exit 0, confirming round-1 spawn count matches the disassembly and asteroids wrap at playfield edges.'
         - Record short notes capturing what was learned in this phase, including disassembly reference URLs and any spawn-pattern tuning notes.
       verify_commands:
         - cargo build
         - cargo clippy --all-targets -- -D warnings
         - cargo test --quiet
+        - cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario asteroids-round-1 --capture-frames 144 --frames-out /tmp/asteroids --state-log /tmp/asteroids-state.json
+        - cargo run --bin verify -- asteroid-count --frames /tmp/asteroids --expected-large 4 --tolerance 0
+        - cargo run --bin verify -- screen-wrap --state-log /tmp/asteroids-state.json
       commit_message: Add asteroids with three size tiers, split-on-hit, and original spawn pattern
     - id: bullets-collision-game-over
       title: Bullets, circle-circle collision, and game-over flow
@@ -479,12 +565,20 @@ tasks:
         - Ship death decrements lives and respawns with a brief invulnerability or pause; lives reaching zero triggers the game-over state.
         - GameSnapshot.alive flag flips correctly on death and respawn.
         - Unit tests cover circle-circle collision (overlap, no-overlap, edge-touch), bullet lifetime expiry, and ship-death lives decrement.
-        - 'Manual verification: cargo run plays a basic loop - shoot, hit, split, die at zero lives.'
+        - 'Verification: cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario bullet-hit-asteroid --simulate-secs 5 --state-log /tmp/bullet-state.json followed by cargo run --bin verify -- state-trace --log /tmp/bullet-state.json --expect bullet-fired,bullet-hit-asteroid,asteroid-split exits 0, confirming a bullet fired, hit a large asteroid, and produced two medium asteroids.'
+        - 'Verification: cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario ship-collides-with-asteroid --simulate-secs 10 --state-log /tmp/death-state.json followed by cargo run --bin verify -- state-trace --log /tmp/death-state.json --expect ship-died,lives-decremented,respawn exits 0.'
+        - 'Verification: cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario lose-all-lives --simulate-secs 30 --state-log /tmp/gameover-state.json followed by cargo run --bin verify -- state-trace --log /tmp/gameover-state.json --expect game-over exits 0.'
         - Record short notes capturing what was learned in this phase, including collision-radius tuning notes and respawn timing observations.
       verify_commands:
         - cargo build
         - cargo clippy --all-targets -- -D warnings
         - cargo test --quiet
+        - cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario bullet-hit-asteroid --simulate-secs 5 --state-log /tmp/bullet-state.json
+        - cargo run --bin verify -- state-trace --log /tmp/bullet-state.json --expect bullet-fired,bullet-hit-asteroid,asteroid-split
+        - cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario ship-collides-with-asteroid --simulate-secs 10 --state-log /tmp/death-state.json
+        - cargo run --bin verify -- state-trace --log /tmp/death-state.json --expect ship-died,lives-decremented,respawn
+        - cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario lose-all-lives --simulate-secs 30 --state-log /tmp/gameover-state.json
+        - cargo run --bin verify -- state-trace --log /tmp/gameover-state.json --expect game-over
       commit_message: Add bullets, circle-circle collision, and game-over flow
     - id: synth-voices
       title: Remaining synth voices - fire, explosion, UFO siren, heartbeat
@@ -508,12 +602,23 @@ tasks:
         - Heartbeat tempo is coupled to GameSnapshot.asteroid_count using the documented curve from the original disassembly (Open Question 4 confirmed).
         - Heartbeat continues across ship deaths per the success criteria; only stops at game-over reset.
         - No sample WAV files are loaded; voices are pure synthesis.
-        - 'Manual verification: cargo run with many overlapping explosions reports zero xruns over a ~1 minute play session.'
+        - 'Verification: cargo run --release -- --headless --seed 1 --scenario explosion-storm --audio-capture 10 --wav-out /tmp/explosions.wav --xrun-log /tmp/explosions-xruns.log followed by cargo run --bin verify -- xrun-count --log /tmp/explosions-xruns.log --max 0 and cargo run --bin verify -- audio-rms --wav /tmp/explosions.wav --min 0.05 exit 0, confirming many overlapping explosions produce sustained audible output with no xruns.'
+        - 'Verification: cargo run --release -- --headless --seed 1 --scenario heartbeat-curve --audio-capture 30 --wav-out /tmp/heartbeat.wav --state-log /tmp/heartbeat-state.json followed by cargo run --bin verify -- heartbeat-tempo --wav /tmp/heartbeat.wav --state-log /tmp/heartbeat-state.json --tempo-curve disassembly --tolerance 0.1 exits 0, confirming heartbeat tempo tracks asteroid count per the disassembly curve.'
+        - 'Verification: cargo run --release -- --headless --seed 1 --scenario fire-3 --audio-capture 1 --wav-out /tmp/fire.wav followed by cargo run --bin verify -- audio-band-energy --wav /tmp/fire.wav --lo-hz 400 --hi-hz 4000 --min-fraction 0.5 exits 0; cargo run --release -- --headless --seed 1 --scenario ufo-large --audio-capture 5 --wav-out /tmp/ufo.wav followed by cargo run --bin verify -- audio-band-energy --wav /tmp/ufo.wav --lo-hz 200 --hi-hz 2000 --min-fraction 0.4 exits 0.'
         - Record short notes capturing what was learned in this phase, including the heartbeat tempo curve chosen and any voice-graph allocation gotchas.
       verify_commands:
         - cargo build
         - cargo clippy --all-targets -- -D warnings
         - cargo test --quiet
+        - cargo run --release -- --headless --seed 1 --scenario explosion-storm --audio-capture 10 --wav-out /tmp/explosions.wav --xrun-log /tmp/explosions-xruns.log
+        - cargo run --bin verify -- xrun-count --log /tmp/explosions-xruns.log --max 0
+        - cargo run --bin verify -- audio-rms --wav /tmp/explosions.wav --min 0.05
+        - cargo run --release -- --headless --seed 1 --scenario heartbeat-curve --audio-capture 30 --wav-out /tmp/heartbeat.wav --state-log /tmp/heartbeat-state.json
+        - cargo run --bin verify -- heartbeat-tempo --wav /tmp/heartbeat.wav --state-log /tmp/heartbeat-state.json --tempo-curve disassembly --tolerance 0.1
+        - cargo run --release -- --headless --seed 1 --scenario fire-3 --audio-capture 1 --wav-out /tmp/fire.wav
+        - cargo run --bin verify -- audio-band-energy --wav /tmp/fire.wav --lo-hz 400 --hi-hz 4000 --min-fraction 0.5
+        - cargo run --release -- --headless --seed 1 --scenario ufo-large --audio-capture 5 --wav-out /tmp/ufo.wav
+        - cargo run --bin verify -- audio-band-energy --wav /tmp/ufo.wav --lo-hz 200 --hi-hz 2000 --min-fraction 0.4
       commit_message: Add fire, explosion, UFO, and heartbeat synth voices
     - id: ufo-ai
       title: UFO AI - large and small variants with score-driven spawn rate
@@ -537,12 +642,17 @@ tasks:
         - Spawn rate scales with score per the original disassembly; the rate function is documented in code comments with the disassembly citation.
         - UFO motion (direction changes mid-screen) matches the original feel.
         - UFO siren plays from spawn to despawn/destruction.
-        - 'Manual verification: cargo run shows UFOs appearing, hunting, and being destroyed correctly across both variants by playing past 10k score.'
+        - 'Verification: cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario ufo-large --simulate-secs 20 --state-log /tmp/ufo-large.json followed by cargo run --bin verify -- state-trace --log /tmp/ufo-large.json --expect ufo-spawned,ufo-fired-random,ufo-siren-on,ufo-siren-off exits 0.'
+        - 'Verification: cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario ufo-small --simulate-secs 20 --state-log /tmp/ufo-small.json followed by cargo run --bin verify -- state-trace --log /tmp/ufo-small.json --expect ufo-spawned,ufo-fired-aimed,score-gte-10000 exits 0.'
         - Record short notes capturing what was learned in this phase, including any UFO AI tuning that diverges from the original and the spawn-rate curve chosen.
       verify_commands:
         - cargo build
         - cargo clippy --all-targets -- -D warnings
         - cargo test --quiet
+        - cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario ufo-large --simulate-secs 20 --state-log /tmp/ufo-large.json
+        - cargo run --bin verify -- state-trace --log /tmp/ufo-large.json --expect ufo-spawned,ufo-fired-random,ufo-siren-on,ufo-siren-off
+        - cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario ufo-small --simulate-secs 20 --state-log /tmp/ufo-small.json
+        - cargo run --bin verify -- state-trace --log /tmp/ufo-small.json --expect ufo-spawned,ufo-fired-aimed,score-gte-10000
       commit_message: Add UFO AI with large and small variants and score-driven spawn rate
     - id: scoring-and-lives
       title: Scoring values, extra-life threshold, and lives display
@@ -566,18 +676,23 @@ tasks:
         - Lives display shows up to 6 lives onscreen and clamps higher counts to 6.
         - Score display is beam-rendered and visible during gameplay.
         - Unit tests cover scoring totals, extra-life thresholds (one at 10k, another at 20k, etc), and the max-6 lives display cap.
-        - 'Manual verification: cargo run shows score and lives updating correctly through a few rounds.'
+        - 'Verification: cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario score-progression --simulate-secs 60 --state-log /tmp/score-state.json followed by cargo run --bin verify -- state-trace --log /tmp/score-state.json --expect score-increased,extra-life-at-10000,extra-life-at-20000 exits 0.'
+        - 'Verification: cargo run --release -- --headless --seed 1 --scenario eight-extra-lives --state-log /tmp/lives-state.json --screenshot /tmp/lives.png followed by cargo run --bin verify -- lives-display --frame /tmp/lives.png --max-displayed 6 --state-log /tmp/lives-state.json exits 0, confirming the lives display caps at 6 even when the simulation state holds 8.'
         - Record short notes capturing what was learned in this phase, including the original scoring values and any divergences if the disassembly was ambiguous.
       verify_commands:
         - cargo build
         - cargo clippy --all-targets -- -D warnings
         - cargo test --quiet
+        - cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario score-progression --simulate-secs 60 --state-log /tmp/score-state.json
+        - cargo run --bin verify -- state-trace --log /tmp/score-state.json --expect score-increased,extra-life-at-10000,extra-life-at-20000
+        - cargo run --release -- --headless --seed 1 --scenario eight-extra-lives --state-log /tmp/lives-state.json --screenshot /tmp/lives.png
+        - cargo run --bin verify -- lives-display --frame /tmp/lives.png --max-displayed 6 --state-log /tmp/lives-state.json
       commit_message: Add scoring values, extra-life threshold, and lives display
     - id: hyperspace
       title: Hyperspace teleport with cooldown and 10-percent self-destruct
       details: |
         Per PLAN.md step 14 and DESIGN.md Game Constants + Open Question 6, implement the hyperspace mechanic.
-        H (and Shift as alt, decision recorded in game-loop-physics) teleports the ship to a random screen location.
+        H teleports the ship to a random screen location (Shift binding dropped per the game-loop-physics decision).
         Cooldown: ~1 second between uses (prevents spam).
         Self-destruct chance: ~10% on hyperspace exit per Open Question 6 (faithful, kept). Use a seedable RNG for deterministic testing.
         Self-destruct triggers the same death flow as ship-asteroid collision (lives decrement, respawn or game-over).
@@ -590,17 +705,19 @@ tasks:
         - DESIGN.md
         - PLAN.md
       acceptance:
-        - Hyperspace on H (and Shift if the game-loop-physics decision kept it) teleports the ship to a random in-playfield location.
+        - Hyperspace on H teleports the ship to a random in-playfield location (Shift binding dropped per game-loop-physics).
         - Cooldown of ~1 second is enforced; second invocation within the cooldown is rejected (no teleport, no self-destruct roll).
         - ~10% self-destruct chance on hyperspace exit triggers the standard death flow.
         - RNG used for the dice roll and target placement is seedable to keep tests deterministic.
-        - Unit tests cover cooldown enforcement, self-destruct probability under a fixed seed, and teleport placement bounds.
-        - 'Manual verification: cargo run lets the user trigger hyperspace several times - teleports happen, cooldown is felt, self-destruct fires occasionally.'
-        - Record short notes capturing what was learned in this phase, including how the Shift alt-key decision from game-loop-physics worked out in practice.
+        - Unit tests cover cooldown enforcement, self-destruct probability under a fixed seed (~10% over 1000 rolls within 2%), and teleport placement bounds.
+        - 'Verification: cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario hyperspace-spam --simulate-secs 5 --state-log /tmp/hyper-state.json followed by cargo run --bin verify -- state-trace --log /tmp/hyper-state.json --expect hyperspace-triggered,cooldown-rejected exits 0, confirming the cooldown is enforced in the live game loop.'
+        - Record short notes capturing what was learned in this phase, including the seedable-RNG approach taken.
       verify_commands:
         - cargo build
         - cargo clippy --all-targets -- -D warnings
         - cargo test --quiet
+        - cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario hyperspace-spam --simulate-secs 5 --state-log /tmp/hyper-state.json
+        - cargo run --bin verify -- state-trace --log /tmp/hyper-state.json --expect hyperspace-triggered,cooldown-rejected
       commit_message: Add hyperspace teleport with cooldown and self-destruct chance
     - id: highscore-and-attract
       title: High-score persistence and attract mode
@@ -624,12 +741,21 @@ tasks:
         - No other state persists to disk (only ~/.local/share/asteroids/highscore).
         - Attract mode runs after 30s idle on the title screen with drifting asteroids and a score table that includes the persisted high score; exits on any input.
         - Unit tests cover high-score read of valid, missing, and corrupt files plus write-then-read round-trip.
-        - 'Manual verification: cargo run shows the title screen, idle 30s reaches attract mode, any key returns to the title; high score survives a process restart.'
+        - 'Verification: cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario title-idle --simulate-secs 35 --state-log /tmp/title-state.json followed by cargo run --bin verify -- state-trace --log /tmp/title-state.json --expect attract-mode-entered exits 0.'
+        - 'Verification: cargo run --release -- --headless --seed 1 --scenario attract-then-input --state-log /tmp/attract-state.json followed by cargo run --bin verify -- state-trace --log /tmp/attract-state.json --expect attract-mode-exited-on-input exits 0.'
+        - 'Verification: process restart - cargo run --release -- --headless --seed 1 --scenario set-highscore-12345 then cargo run --release -- --headless --seed 2 --scenario read-highscore --state-log /tmp/hs-state.json followed by cargo run --bin verify -- state-trace --log /tmp/hs-state.json --expect highscore-loaded-12345 exits 0, confirming persistence across processes. The verify binary should also call helper checks for missing-file (returns zero) and corrupt-file (returns zero, no panic) by writing those states under a temp HOME and re-reading.'
         - Record short notes capturing what was learned in this phase, including any persistence-format edge cases (locale, integer overflow) and attract-mode timing notes.
       verify_commands:
         - cargo build
         - cargo clippy --all-targets -- -D warnings
         - cargo test --quiet
+        - cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario title-idle --simulate-secs 35 --state-log /tmp/title-state.json
+        - cargo run --bin verify -- state-trace --log /tmp/title-state.json --expect attract-mode-entered
+        - cargo run --release -- --headless --seed 1 --scenario attract-then-input --state-log /tmp/attract-state.json
+        - cargo run --bin verify -- state-trace --log /tmp/attract-state.json --expect attract-mode-exited-on-input
+        - cargo run --release -- --headless --seed 1 --scenario set-highscore-12345
+        - cargo run --release -- --headless --seed 2 --scenario read-highscore --state-log /tmp/hs-state.json
+        - cargo run --bin verify -- state-trace --log /tmp/hs-state.json --expect highscore-loaded-12345
       commit_message: Add high-score persistence and attract mode
     - id: polish-pass
       title: Polish pass - tune phosphor, bloom, beam dwell, and audio mix
@@ -655,12 +781,16 @@ tasks:
         - Code is warning-free under cargo clippy --all-targets -- -D warnings; no dead code or stale TODOs from earlier tasks remain (or remaining ones are explicitly marked v2).
         - Existing unit tests still pass under cargo test --quiet.
         - Any Open Questions that were not closed inline are explicitly closed here in notes (color choice, persistence-of-vision tau, CRT curvature, hyperspace randomness, collision model, disassembly references).
-        - 'Manual verification: cargo run --release plays well end-to-end with the tuned defaults.'
+        - 'Verification: re-run the full numeric battery from earlier checkpoints (decay-fit, line-glow-width, gamma-ramp, soul-visible, frame-time-p99, xrun-count, audio-rms/audio-band-energy for each voice, heartbeat-tempo, state-trace for gameplay scenarios) end-to-end and confirm every check still exits 0 against the tuned defaults.'
+        - 'Verification: long-form 5-minute scripted play session - cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario long-play-5min --simulate-secs 300 --audio-capture 300 --wav-out /tmp/polish.wav --xrun-log /tmp/polish-xruns.log --frame-time-log /tmp/polish-frametimes.log followed by cargo run --bin verify -- frame-time-p99 --log /tmp/polish-frametimes.log --max-ms 7.5 and cargo run --bin verify -- xrun-count --log /tmp/polish-xruns.log --max 0 exit 0.'
         - Record short notes capturing what was learned in this phase, including the final tuned values and any Open Question closures so a fresh re-plan can start from the right defaults.
       verify_commands:
         - cargo build --release
         - cargo clippy --all-targets -- -D warnings
         - cargo test --quiet
+        - cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario long-play-5min --simulate-secs 300 --audio-capture 300 --wav-out /tmp/polish.wav --xrun-log /tmp/polish-xruns.log --frame-time-log /tmp/polish-frametimes.log
+        - cargo run --bin verify -- frame-time-p99 --log /tmp/polish-frametimes.log --max-ms 7.5
+        - cargo run --bin verify -- xrun-count --log /tmp/polish-xruns.log --max 0
       commit_message: Polish pass - tune phosphor, bloom, dwell, and audio mix
     - id: checkpoint-success-criteria
       title: Checkpoint - DESIGN.md success criteria verified end-to-end
@@ -676,16 +806,22 @@ tasks:
         - DESIGN.md
         - PLAN.md
       acceptance:
-        - 'Spinning wireframe ship on black background with phosphor glow that visibly trails behind motion: verified by manual cargo run --release.'
-        - 'Thrust sound humming through speakers on Up press, generated by real synthesis: verified by manual play.'
-        - 'Asteroids breaking into smaller asteroids correctly (3 size tiers per the original): verified by manual play.'
-        - 'UFO appears, hunts the player with original-feeling AI, makes the iconic siren sound: verified by manual play.'
-        - 'Heartbeat audio tempo speeds up as round progresses, stays running between deaths: verified by manual play.'
-        - 'Frame rate sits at 144Hz on the user''s monitor with no judder during gameplay: verified by manual observation (the build/test gate cannot measure realtime framerate).'
-        - The user can sit down and play it for 10 minutes straight without the museum-piece illusion breaking - the real test - is verified or the failure is documented with a clear loop-back target.
+        - 'Verification: spinning wireframe ship with phosphor trail - re-run the soul-visible battery from checkpoint-soul-visible end-to-end and confirm cargo run --bin verify -- soul-visible exits 0.'
+        - 'Verification: thrust hum on W - re-run the thrust-voice battery (audio-rms in the held window plus audio-band-energy in the documented band) and confirm both exit 0.'
+        - 'Verification: asteroids 3-tier split - re-run asteroid-count, screen-wrap, and state-trace bullet-hit-asteroid (large -> 2 medium, medium -> 2 small, small -> destroyed) and confirm all exit 0.'
+        - 'Verification: UFO siren and AI - re-run the ufo-large and ufo-small batteries (state-trace for spawn/fire/siren events plus audio-band-energy on the captured WAV for the descending-ascending wail signature) and confirm all exit 0.'
+        - 'Verification: heartbeat tempo - re-run heartbeat-tempo verification with the disassembly tempo curve and a state log spanning multiple deaths; confirm tempo correlates with asteroid_count and continues across ship-death events without resetting until game-over.'
+        - 'Verification: 144Hz frame budget - cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario long-play-10min --simulate-secs 600 --frame-time-log /tmp/final-frametimes.log followed by cargo run --bin verify -- frame-time-p99 --log /tmp/final-frametimes.log --max-ms 7.5 exits 0 (frame budget for 144Hz is ~6.94ms; 7.5ms gives small headroom).'
+        - 'Verification: 10-minute autonomous play - cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario autonomous-play-10min --simulate-secs 600 --audio-capture 600 --wav-out /tmp/final.wav --xrun-log /tmp/final-xruns.log --frame-time-log /tmp/final-frametimes.log --state-log /tmp/final-state.json followed by cargo run --bin verify -- xrun-count --log /tmp/final-xruns.log --max 0 and frame-time-p99 --log /tmp/final-frametimes.log --max-ms 7.5 and state-trace --log /tmp/final-state.json --expect no-panics,score-increased,asteroids-cleared,heartbeat-active all exit 0. This is the autonomous replacement for the "10 minutes without the illusion breaking" gate.'
+        - If any criterion fails, the failure measurement is recorded in notes and the explicit loop-back target is named; the project does not close.
         - Record short notes capturing what was learned in this phase, including any criteria that needed loop-back, final tuning values, and any v2 follow-ups worth noting before the project is closed or re-planned.
       verify_commands:
         - cargo build --release
         - cargo clippy --all-targets -- -D warnings
         - cargo test --quiet
+        - cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario long-play-10min --simulate-secs 600 --frame-time-log /tmp/final-frametimes.log
+        - cargo run --bin verify -- frame-time-p99 --log /tmp/final-frametimes.log --max-ms 7.5
+        - cargo run --release -- --headless --seed 1 --fixed-dt 0.00694 --scenario autonomous-play-10min --simulate-secs 600 --audio-capture 600 --wav-out /tmp/final.wav --xrun-log /tmp/final-xruns.log --state-log /tmp/final-state.json
+        - cargo run --bin verify -- xrun-count --log /tmp/final-xruns.log --max 0
+        - cargo run --bin verify -- state-trace --log /tmp/final-state.json --expect no-panics,score-increased,asteroids-cleared,heartbeat-active
       commit_message: Checkpoint final success criteria verification
