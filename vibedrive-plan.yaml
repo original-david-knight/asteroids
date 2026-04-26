@@ -630,7 +630,7 @@ tasks:
         UFO crosses the screen with periodic direction changes per the original; despawns when off-screen if not destroyed.
         UFO collisions wire into the existing circle-circle collision system from bullets-collision-game-over.
         UFO siren voice from synth-voices triggers on UFO spawn and releases on UFO despawn or destruction.
-      status: todo
+      status: done
       workflow: implement
       deps:
         - synth-voices

@@ -25,6 +25,22 @@ pub const BULLET_RADIUS_NDC: f32 = 0.012;
 pub const SHIP_COLLISION_RADIUS_NDC: f32 = 0.44 * tuning::SHIP_SPINNING_SCALE;
 pub const SHIP_RESPAWN_DELAY_SECONDS: f32 = 1.25;
 pub const SHIP_RESPAWN_INVULNERABILITY_SECONDS: f32 = 1.25;
+pub const UFO_SMALL_SCORE_THRESHOLD: u32 = 10_000;
+pub const UFO_SPAWN_SCORE_STEP_POINTS: u32 = 2_500;
+pub const UFO_BULLET_SPEED_NDC_PER_SEC: f32 = 1.25;
+
+const UFO_ORIGINAL_TIMER_TICK_SECONDS: f32 = 4.0 / tuning::ASTEROID_ORIGINAL_FPS;
+const UFO_SPAWN_RELOAD_INITIAL_TICKS: u32 = 0x92;
+const UFO_SPAWN_RELOAD_DECREMENT_TICKS: u32 = 0x06;
+const UFO_SPAWN_RELOAD_MIN_TICKS: u32 = 0x20;
+const UFO_SHOT_RELOAD_TICKS: u32 = 0x0A;
+const UFO_DIRECTION_CHANGE_SECONDS: f32 = 128.0 / tuning::ASTEROID_ORIGINAL_FPS;
+const UFO_EDGE_MARGIN_NDC: f32 = 0.12;
+const UFO_VERTICAL_BOUND_NDC: f32 = 0.86;
+const UFO_LARGE_RADIUS_NDC: f32 = 0.092;
+const UFO_SMALL_RADIUS_NDC: f32 = 0.062;
+const UFO_RAW_HORIZONTAL_SPEED: f32 = 16.0;
+const UFO_RAW_VERTICAL_SPEEDS: [f32; 4] = [-16.0, 0.0, 0.0, 16.0];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ControlState {
@@ -198,6 +214,85 @@ impl Bullet {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UfoVariant {
+    Large,
+    Small,
+}
+
+impl UfoVariant {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Large => "large",
+            Self::Small => "small",
+        }
+    }
+
+    pub fn audio_variant(self) -> f32 {
+        match self {
+            Self::Large => 0.0,
+            Self::Small => 1.0,
+        }
+    }
+
+    pub fn score_value(self) -> u32 {
+        match self {
+            Self::Large => 200,
+            Self::Small => 1_000,
+        }
+    }
+
+    pub fn radius_ndc(self) -> f32 {
+        match self {
+            Self::Large => UFO_LARGE_RADIUS_NDC,
+            Self::Small => UFO_SMALL_RADIUS_NDC,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Ufo {
+    pub id: u32,
+    pub variant: UfoVariant,
+    pub position: Vec2,
+    pub velocity: Vec2,
+    pub shot_timer_seconds: f32,
+    pub direction_timer_seconds: f32,
+}
+
+impl Ufo {
+    fn new(id: u32, variant: UfoVariant, position: Vec2, velocity: Vec2) -> Self {
+        Self {
+            id,
+            variant,
+            position,
+            velocity,
+            shot_timer_seconds: UFO_ORIGINAL_TIMER_TICK_SECONDS,
+            direction_timer_seconds: UFO_DIRECTION_CHANGE_SECONDS,
+        }
+    }
+
+    fn integrate(&mut self, dt: f32) {
+        self.position = self.position + self.velocity * dt;
+        if self.position.y < -UFO_VERTICAL_BOUND_NDC {
+            self.position.y = -UFO_VERTICAL_BOUND_NDC;
+            self.velocity.y = self.velocity.y.abs();
+        } else if self.position.y > UFO_VERTICAL_BOUND_NDC {
+            self.position.y = UFO_VERTICAL_BOUND_NDC;
+            self.velocity.y = -self.velocity.y.abs();
+        }
+    }
+
+    pub fn radius_ndc(self) -> f32 {
+        self.variant.radius_ndc()
+    }
+
+    fn is_offscreen(self) -> bool {
+        self.position.x < PLAYFIELD_MIN.x - UFO_EDGE_MARGIN_NDC
+            || self.position.x > PLAYFIELD_MAX.x + UFO_EDGE_MARGIN_NDC
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RenderAsteroid {
     pub id: u32,
@@ -210,6 +305,14 @@ pub struct RenderAsteroid {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RenderBullet {
     pub id: u32,
+    pub position: Vec2,
+    pub radius: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RenderUfo {
+    pub id: u32,
+    pub variant: UfoVariant,
     pub position: Vec2,
     pub radius: f32,
 }
@@ -228,6 +331,14 @@ pub enum GameEventKind {
     BulletHitAsteroid,
     AsteroidSplit,
     AsteroidDestroyed,
+    UfoSpawned,
+    UfoSirenOn,
+    UfoSirenOff,
+    UfoDespawned,
+    UfoDestroyed,
+    UfoFiredRandom,
+    UfoFiredAimed,
+    ScoreGte10000,
     ShipDied,
     LivesDecremented,
     Respawn,
@@ -242,6 +353,14 @@ impl GameEventKind {
             Self::BulletHitAsteroid => "bullet-hit-asteroid",
             Self::AsteroidSplit => "asteroid-split",
             Self::AsteroidDestroyed => "asteroid-destroyed",
+            Self::UfoSpawned => "ufo-spawned",
+            Self::UfoSirenOn => "ufo-siren-on",
+            Self::UfoSirenOff => "ufo-siren-off",
+            Self::UfoDespawned => "ufo-despawned",
+            Self::UfoDestroyed => "ufo-destroyed",
+            Self::UfoFiredRandom => "ufo-fired-random",
+            Self::UfoFiredAimed => "ufo-fired-aimed",
+            Self::ScoreGte10000 => "score-gte-10000",
             Self::ShipDied => "ship-died",
             Self::LivesDecremented => "lives-decremented",
             Self::Respawn => "respawn",
@@ -254,6 +373,7 @@ impl GameEventKind {
 pub struct GameEvent {
     pub kind: GameEventKind,
     pub asteroid_size: Option<AsteroidSize>,
+    pub ufo_variant: Option<UfoVariant>,
 }
 
 impl GameEvent {
@@ -261,6 +381,7 @@ impl GameEvent {
         Self {
             kind,
             asteroid_size: None,
+            ufo_variant: None,
         }
     }
 
@@ -268,6 +389,15 @@ impl GameEvent {
         Self {
             kind,
             asteroid_size: Some(asteroid_size),
+            ufo_variant: None,
+        }
+    }
+
+    fn ufo(kind: GameEventKind, ufo_variant: UfoVariant) -> Self {
+        Self {
+            kind,
+            asteroid_size: None,
+            ufo_variant: Some(ufo_variant),
         }
     }
 
@@ -287,10 +417,14 @@ pub struct GameState {
     pub round: u32,
     pub asteroids: Vec<Asteroid>,
     pub bullets: Vec<Bullet>,
+    pub ufo: Option<Ufo>,
+    pub ufo_bullets: Vec<Bullet>,
     next_asteroid_id: u32,
     next_bullet_id: u32,
+    next_ufo_id: u32,
     respawn_timer_seconds: f32,
     invulnerability_timer_seconds: f32,
+    ufo_spawn_timer_seconds: f32,
     fire_was_down: bool,
     events: Vec<GameEvent>,
     rng: SeededRng,
@@ -348,6 +482,21 @@ impl GameState {
         state
     }
 
+    pub fn ufo_large_scenario(seed: Option<u64>) -> Self {
+        let mut state = Self::empty_seeded(seed);
+        state.score = 0;
+        state.reset_ufo_spawn_timer();
+        state
+    }
+
+    pub fn ufo_small_scenario(seed: Option<u64>) -> Self {
+        let mut state = Self::empty_seeded(seed);
+        state.score = UFO_SMALL_SCORE_THRESHOLD;
+        state.ship.position = Vec2::new(0.18, -0.12);
+        state.reset_ufo_spawn_timer();
+        state
+    }
+
     fn empty_seeded(seed: Option<u64>) -> Self {
         Self {
             ship: ShipState::default(),
@@ -359,10 +508,14 @@ impl GameState {
             round: 1,
             asteroids: Vec::new(),
             bullets: Vec::new(),
+            ufo: None,
+            ufo_bullets: Vec::new(),
             next_asteroid_id: 1,
             next_bullet_id: 1,
+            next_ufo_id: 1,
             respawn_timer_seconds: 0.0,
             invulnerability_timer_seconds: 0.0,
+            ufo_spawn_timer_seconds: ufo_spawn_interval_seconds_for_score(SCORE_PLACEHOLDER),
             fire_was_down: false,
             events: Vec::new(),
             rng: rng_for_seed(seed),
@@ -378,15 +531,23 @@ impl GameState {
         for asteroid in &mut self.asteroids {
             asteroid.integrate(dt);
         }
+        self.update_ufo(dt);
         self.update_fire(input);
         for bullet in &mut self.bullets {
             bullet.integrate(dt);
         }
+        for bullet in &mut self.ufo_bullets {
+            bullet.integrate(dt);
+        }
         self.despawn_expired_bullets();
+        self.despawn_expired_ufo_bullets();
+        self.resolve_bullet_ufo_collisions();
         self.resolve_bullet_asteroid_collisions();
-        // UFO collision is intentionally deferred until the UFO task adds UFO
-        // actors and score rules; bullet-vs-UFO will use the same circle model.
+        self.resolve_ufo_bullet_asteroid_collisions();
         self.resolve_ship_asteroid_collisions();
+        self.resolve_ship_ufo_collisions();
+        self.resolve_ufo_bullet_ship_collisions();
+        self.resolve_asteroid_ufo_collisions();
         if self.invulnerability_timer_seconds > 0.0 {
             self.invulnerability_timer_seconds = (self.invulnerability_timer_seconds - dt).max(0.0);
         }
@@ -466,6 +627,26 @@ impl GameState {
             .collect()
     }
 
+    pub fn render_ufo(&self) -> Option<RenderUfo> {
+        self.ufo.map(|ufo| RenderUfo {
+            id: ufo.id,
+            variant: ufo.variant,
+            position: ufo.position,
+            radius: ufo.radius_ndc(),
+        })
+    }
+
+    pub fn render_ufo_bullets(&self) -> Vec<RenderBullet> {
+        self.ufo_bullets
+            .iter()
+            .map(|bullet| RenderBullet {
+                id: bullet.id,
+                position: bullet.position,
+                radius: BULLET_RADIUS_NDC,
+            })
+            .collect()
+    }
+
     pub fn any_asteroid_wrapped_last_tick(&self) -> bool {
         self.asteroids
             .iter()
@@ -474,6 +655,12 @@ impl GameState {
 
     pub fn any_bullet_wrapped_last_tick(&self) -> bool {
         self.bullets.iter().any(|bullet| bullet.wrapped_last_tick)
+    }
+
+    pub fn any_ufo_bullet_wrapped_last_tick(&self) -> bool {
+        self.ufo_bullets
+            .iter()
+            .any(|bullet| bullet.wrapped_last_tick)
     }
 
     pub fn events(&self) -> &[GameEvent] {
@@ -504,8 +691,7 @@ impl GameState {
     fn fire_bullet(&mut self) {
         let (angle_sin, angle_cos) = self.ship.angle.sin_cos();
         let forward = Vec2::new(angle_cos, angle_sin);
-        let id = self.next_bullet_id;
-        self.next_bullet_id = self.next_bullet_id.wrapping_add(1).max(1);
+        let id = self.allocate_bullet_id();
         let position = wrap_position(
             self.ship.position + forward * (SHIP_COLLISION_RADIUS_NDC + BULLET_RADIUS_NDC),
         );
@@ -514,11 +700,123 @@ impl GameState {
         self.push_event(GameEventKind::BulletFired);
     }
 
+    fn update_ufo(&mut self, dt: f32) {
+        if self.ufo.is_some() {
+            self.update_active_ufo(dt);
+        } else {
+            self.update_ufo_spawn_timer(dt);
+        }
+    }
+
+    fn update_ufo_spawn_timer(&mut self, dt: f32) {
+        if !self.alive || self.game_over {
+            return;
+        }
+        self.ufo_spawn_timer_seconds -= dt;
+        if self.ufo_spawn_timer_seconds <= 0.0 {
+            self.spawn_ufo();
+        }
+    }
+
+    fn update_active_ufo(&mut self, dt: f32) {
+        let mut shot_request = None;
+        let mut should_despawn = false;
+        if let Some(ufo) = self.ufo.as_mut() {
+            ufo.integrate(dt);
+            ufo.direction_timer_seconds -= dt;
+            if ufo.direction_timer_seconds <= 0.0 {
+                ufo.velocity.y = random_ufo_vertical_velocity(&mut self.rng);
+                ufo.direction_timer_seconds += UFO_DIRECTION_CHANGE_SECONDS;
+            }
+            ufo.shot_timer_seconds -= dt;
+            if ufo.shot_timer_seconds <= 0.0 {
+                shot_request = Some((ufo.variant, ufo.position, ufo.radius_ndc()));
+                ufo.shot_timer_seconds += ufo_shot_interval_seconds();
+            }
+            should_despawn = ufo.is_offscreen();
+        }
+
+        if let Some((variant, position, radius)) = shot_request {
+            self.fire_ufo_bullet(variant, position, radius);
+        }
+        if should_despawn {
+            self.clear_ufo(GameEventKind::UfoDespawned, false);
+        }
+    }
+
+    fn spawn_ufo(&mut self) {
+        let variant = ufo_variant_for_score(self.score);
+        let from_left = self.rng.next_f32() < 0.5;
+        let x = if from_left {
+            PLAYFIELD_MIN.x - UFO_EDGE_MARGIN_NDC
+        } else {
+            PLAYFIELD_MAX.x + UFO_EDGE_MARGIN_NDC
+        };
+        let horizontal_sign = if from_left { 1.0 } else { -1.0 };
+        let y = -0.78 + self.rng.next_f32() * 1.56;
+        let velocity = Vec2::new(
+            horizontal_sign
+                * UFO_RAW_HORIZONTAL_SPEED
+                * tuning::ASTEROID_RAW_VELOCITY_TO_NDC_PER_SEC,
+            random_ufo_vertical_velocity(&mut self.rng),
+        );
+        let id = self.next_ufo_id;
+        self.next_ufo_id = self.next_ufo_id.wrapping_add(1).max(1);
+        self.ufo = Some(Ufo::new(id, variant, Vec2::new(x, y), velocity));
+        if self.score >= UFO_SMALL_SCORE_THRESHOLD {
+            self.push_event(GameEventKind::ScoreGte10000);
+        }
+        self.push_ufo_event(GameEventKind::UfoSpawned, variant);
+        self.push_ufo_event(GameEventKind::UfoSirenOn, variant);
+    }
+
+    fn fire_ufo_bullet(&mut self, variant: UfoVariant, ufo_position: Vec2, ufo_radius: f32) {
+        let direction = match variant {
+            UfoVariant::Large => random_direction(&mut self.rng),
+            UfoVariant::Small => {
+                wrapped_delta(self.ship.position, ufo_position).normalized_or(Vec2::X)
+            }
+        };
+        let id = self.allocate_bullet_id();
+        let position = wrap_position(ufo_position + direction * (ufo_radius + BULLET_RADIUS_NDC));
+        let velocity = direction * UFO_BULLET_SPEED_NDC_PER_SEC;
+        self.ufo_bullets.push(Bullet::new(id, position, velocity));
+        self.push_ufo_event(
+            match variant {
+                UfoVariant::Large => GameEventKind::UfoFiredRandom,
+                UfoVariant::Small => GameEventKind::UfoFiredAimed,
+            },
+            variant,
+        );
+    }
+
     fn despawn_expired_bullets(&mut self) {
         let before = self.bullets.len();
         self.bullets.retain(|bullet| !bullet.is_expired());
         for _ in self.bullets.len()..before {
             self.push_event(GameEventKind::BulletExpired);
+        }
+    }
+
+    fn despawn_expired_ufo_bullets(&mut self) {
+        self.ufo_bullets.retain(|bullet| !bullet.is_expired());
+    }
+
+    fn resolve_bullet_ufo_collisions(&mut self) {
+        let Some(ufo) = self.ufo else {
+            return;
+        };
+        let hit_bullet_index = self.bullets.iter().position(|bullet| {
+            playfield_circles_overlap(
+                bullet.position,
+                BULLET_RADIUS_NDC,
+                ufo.position,
+                ufo.radius_ndc(),
+            )
+        });
+        if let Some(index) = hit_bullet_index {
+            self.bullets.remove(index);
+            self.clear_ufo(GameEventKind::UfoDestroyed, true);
         }
     }
 
@@ -548,6 +846,32 @@ impl GameState {
         }
     }
 
+    fn resolve_ufo_bullet_asteroid_collisions(&mut self) {
+        let mut bullet_index = 0;
+        while bullet_index < self.ufo_bullets.len() {
+            let bullet = self.ufo_bullets[bullet_index];
+            let hit_asteroid_id = self
+                .asteroids
+                .iter()
+                .find(|asteroid| {
+                    playfield_circles_overlap(
+                        bullet.position,
+                        BULLET_RADIUS_NDC,
+                        asteroid.position,
+                        asteroid.radius_ndc(),
+                    )
+                })
+                .map(|asteroid| asteroid.id);
+
+            if let Some(asteroid_id) = hit_asteroid_id {
+                self.ufo_bullets.remove(bullet_index);
+                self.hit_asteroid_by_id(asteroid_id);
+            } else {
+                bullet_index += 1;
+            }
+        }
+    }
+
     fn resolve_ship_asteroid_collisions(&mut self) {
         if !self.alive || self.game_over || self.invulnerability_timer_seconds > 0.0 {
             return;
@@ -563,6 +887,80 @@ impl GameState {
         if hit_ship {
             self.kill_ship();
         }
+    }
+
+    fn resolve_ship_ufo_collisions(&mut self) {
+        if !self.alive || self.game_over || self.invulnerability_timer_seconds > 0.0 {
+            return;
+        }
+        let hit_ship = self.ufo.is_some_and(|ufo| {
+            playfield_circles_overlap(
+                self.ship.position,
+                SHIP_COLLISION_RADIUS_NDC,
+                ufo.position,
+                ufo.radius_ndc(),
+            )
+        });
+        if hit_ship {
+            self.kill_ship();
+            self.clear_ufo(GameEventKind::UfoDestroyed, false);
+        }
+    }
+
+    fn resolve_ufo_bullet_ship_collisions(&mut self) {
+        if !self.alive || self.game_over || self.invulnerability_timer_seconds > 0.0 {
+            return;
+        }
+        let hit_bullet_index = self.ufo_bullets.iter().position(|bullet| {
+            playfield_circles_overlap(
+                self.ship.position,
+                SHIP_COLLISION_RADIUS_NDC,
+                bullet.position,
+                BULLET_RADIUS_NDC,
+            )
+        });
+        if let Some(index) = hit_bullet_index {
+            self.ufo_bullets.remove(index);
+            self.kill_ship();
+        }
+    }
+
+    fn resolve_asteroid_ufo_collisions(&mut self) {
+        let Some(ufo) = self.ufo else {
+            return;
+        };
+        let hit_asteroid_id = self
+            .asteroids
+            .iter()
+            .find(|asteroid| {
+                playfield_circles_overlap(
+                    ufo.position,
+                    ufo.radius_ndc(),
+                    asteroid.position,
+                    asteroid.radius_ndc(),
+                )
+            })
+            .map(|asteroid| asteroid.id);
+        if let Some(asteroid_id) = hit_asteroid_id {
+            self.hit_asteroid_by_id(asteroid_id);
+            self.clear_ufo(GameEventKind::UfoDestroyed, false);
+        }
+    }
+
+    fn clear_ufo(&mut self, kind: GameEventKind, award_score: bool) {
+        let Some(ufo) = self.ufo.take() else {
+            return;
+        };
+        if award_score {
+            self.score = self.score.saturating_add(ufo.variant.score_value());
+        }
+        self.push_ufo_event(kind, ufo.variant);
+        self.push_ufo_event(GameEventKind::UfoSirenOff, ufo.variant);
+        self.reset_ufo_spawn_timer();
+    }
+
+    fn reset_ufo_spawn_timer(&mut self) {
+        self.ufo_spawn_timer_seconds = ufo_spawn_interval_seconds_for_score(self.score);
     }
 
     fn kill_ship(&mut self) {
@@ -593,6 +991,10 @@ impl GameState {
         self.events.push(GameEvent::asteroid(kind, asteroid_size));
     }
 
+    fn push_ufo_event(&mut self, kind: GameEventKind, ufo_variant: UfoVariant) {
+        self.events.push(GameEvent::ufo(kind, ufo_variant));
+    }
+
     fn spawn_large_asteroid(&mut self, index: u32) -> Asteroid {
         let side = index % 4;
         let position = edge_spawn_position(side, &mut self.rng);
@@ -611,6 +1013,12 @@ impl GameState {
         let id = self.next_asteroid_id;
         self.next_asteroid_id = self.next_asteroid_id.wrapping_add(1).max(1);
         Asteroid::new(id, size, position, velocity, hull)
+    }
+
+    fn allocate_bullet_id(&mut self) -> u32 {
+        let id = self.next_bullet_id;
+        self.next_bullet_id = self.next_bullet_id.wrapping_add(1).max(1);
+        id
     }
 
     fn sync_asteroid_count(&mut self) {
@@ -639,6 +1047,45 @@ pub fn asteroid_spawn_count_for_round(round: u32) -> u32 {
     ASTEROIDS_PER_WAVE_BOOTSTRAP
         .saturating_add(ASTEROIDS_PER_WAVE_INCREMENT.saturating_mul(round))
         .min(ASTEROIDS_PER_WAVE_MAX)
+}
+
+pub fn ufo_variant_for_score(score: u32) -> UfoVariant {
+    if score >= UFO_SMALL_SCORE_THRESHOLD {
+        UfoVariant::Small
+    } else {
+        UfoVariant::Large
+    }
+}
+
+/// UFO spawn-rate curve for this score-driven step-14 slice.
+///
+/// The original saucer code is documented in Norbert Kehrer's Asteroids
+/// disassembly and the Computer Archeology annotated listing:
+/// https://computerarcheology.com/Arcade/Asteroids/Code.html#6B93
+/// https://6502disassembly.com/va-asteroids/Asteroids.html#SymUpdateScr
+///
+/// Relevant original values:
+/// - new-game `ScrTmrReload` is `#$92` at $68f8,
+/// - saucer logic runs only every 4th 60 Hz frame at $6b93-$6bb7,
+/// - each saucer appearance subtracts `#$06` at $6bd0-$6bda,
+/// - reload bottoms out at `#$20`, so the interval is 146..32 saucer ticks.
+///
+/// This build keeps those exact reload values and the 15 Hz saucer tick cadence,
+/// but indexes the curve by score in 2,500-point steps so the task's
+/// score-driven spawn-rate requirement is deterministic and testable.
+pub fn ufo_spawn_reload_ticks_for_score(score: u32) -> u32 {
+    let speedup_steps = score / UFO_SPAWN_SCORE_STEP_POINTS;
+    UFO_SPAWN_RELOAD_INITIAL_TICKS
+        .saturating_sub(UFO_SPAWN_RELOAD_DECREMENT_TICKS.saturating_mul(speedup_steps))
+        .max(UFO_SPAWN_RELOAD_MIN_TICKS)
+}
+
+pub fn ufo_spawn_interval_seconds_for_score(score: u32) -> f32 {
+    ufo_spawn_reload_ticks_for_score(score) as f32 * UFO_ORIGINAL_TIMER_TICK_SECONDS
+}
+
+fn ufo_shot_interval_seconds() -> f32 {
+    UFO_SHOT_RELOAD_TICKS as f32 * UFO_ORIGINAL_TIMER_TICK_SECONDS
 }
 
 /// DESIGN.md Open Question 7 decision: gameplay collisions use circle-vs-circle
@@ -723,6 +1170,17 @@ fn split_child_velocity(parent_velocity: Vec2, child_index: usize) -> Vec2 {
         parent_direction.x * sin + parent_direction.y * cos,
     );
     direction * (base_speed * 1.08).min(tuning::ASTEROID_DRIFT_SPEED_MAX_NDC_PER_SEC)
+}
+
+fn random_ufo_vertical_velocity(rng: &mut SeededRng) -> f32 {
+    let index = (rng.next_u64() as usize) & 0x03;
+    UFO_RAW_VERTICAL_SPEEDS[index] * tuning::ASTEROID_RAW_VELOCITY_TO_NDC_PER_SEC
+}
+
+fn random_direction(rng: &mut SeededRng) -> Vec2 {
+    let angle = rng.next_f32() * TAU;
+    let (sin, cos) = angle.sin_cos();
+    Vec2::new(cos, sin)
 }
 
 impl ShipState {
@@ -947,6 +1405,64 @@ impl GameLoop {
                 let position = self
                     .previous
                     .bullets
+                    .iter()
+                    .find(|previous| previous.id == current.id)
+                    .map(|previous| {
+                        Vec2::new(
+                            lerp_wrapped_coordinate(
+                                previous.position.x,
+                                current.position.x,
+                                alpha,
+                                PLAYFIELD_MIN.x,
+                                PLAYFIELD_MAX.x,
+                            ),
+                            lerp_wrapped_coordinate(
+                                previous.position.y,
+                                current.position.y,
+                                alpha,
+                                PLAYFIELD_MIN.y,
+                                PLAYFIELD_MAX.y,
+                            ),
+                        )
+                    })
+                    .unwrap_or(current.position);
+                RenderBullet {
+                    id: current.id,
+                    position,
+                    radius: BULLET_RADIUS_NDC,
+                }
+            })
+            .collect()
+    }
+
+    pub fn interpolated_ufo(&self) -> Option<RenderUfo> {
+        let current = self.current.ufo?;
+        let position = self
+            .previous
+            .ufo
+            .filter(|previous| previous.id == current.id)
+            .map(|previous| {
+                previous.position
+                    + (current.position - previous.position) * self.interpolation_alpha()
+            })
+            .unwrap_or(current.position);
+        Some(RenderUfo {
+            id: current.id,
+            variant: current.variant,
+            position,
+            radius: current.radius_ndc(),
+        })
+    }
+
+    pub fn interpolated_ufo_bullets(&self) -> Vec<RenderBullet> {
+        let alpha = self.interpolation_alpha();
+        self.current
+            .ufo_bullets
+            .iter()
+            .map(|current| {
+                let position = self
+                    .previous
+                    .ufo_bullets
                     .iter()
                     .find(|previous| previous.id == current.id)
                     .map(|previous| {
@@ -1308,8 +1824,76 @@ mod tests {
         assert_eq!(snapshots[0].asteroid_count, 4);
     }
 
+    #[test]
+    fn ufo_spawn_rate_uses_original_reload_curve_values() {
+        assert_eq!(
+            ufo_spawn_reload_ticks_for_score(0),
+            UFO_SPAWN_RELOAD_INITIAL_TICKS
+        );
+        assert_eq!(
+            ufo_spawn_reload_ticks_for_score(UFO_SPAWN_SCORE_STEP_POINTS),
+            UFO_SPAWN_RELOAD_INITIAL_TICKS - UFO_SPAWN_RELOAD_DECREMENT_TICKS
+        );
+        assert_eq!(
+            ufo_spawn_reload_ticks_for_score(1_000_000),
+            UFO_SPAWN_RELOAD_MIN_TICKS
+        );
+    }
+
+    #[test]
+    fn ufo_variant_switches_at_design_score_threshold() {
+        assert_eq!(
+            ufo_variant_for_score(UFO_SMALL_SCORE_THRESHOLD - 1),
+            UfoVariant::Large
+        );
+        assert_eq!(
+            ufo_variant_for_score(UFO_SMALL_SCORE_THRESHOLD),
+            UfoVariant::Small
+        );
+    }
+
+    #[test]
+    fn ufo_large_scenario_spawns_and_fires_randomly() {
+        let mut state = GameState::ufo_large_scenario(Some(1));
+        let events = step_for_seconds(&mut state, ufo_spawn_interval_seconds_for_score(0) + 0.8);
+
+        assert!(events.iter().any(|event| {
+            event.kind == GameEventKind::UfoFiredRandom
+                && event.ufo_variant == Some(UfoVariant::Large)
+        }));
+    }
+
+    #[test]
+    fn ufo_small_scenario_spawns_and_fires_at_ship() {
+        let mut state = GameState::ufo_small_scenario(Some(1));
+        let events = step_for_seconds(
+            &mut state,
+            ufo_spawn_interval_seconds_for_score(UFO_SMALL_SCORE_THRESHOLD) + 0.8,
+        );
+
+        assert!(events.iter().any(|event| {
+            event.kind == GameEventKind::UfoFiredAimed
+                && event.ufo_variant == Some(UfoVariant::Small)
+        }));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == GameEventKind::ScoreGte10000)
+        );
+    }
+
     fn empty_test_state() -> GameState {
         GameState::empty_seeded(Some(7))
+    }
+
+    fn step_for_seconds(state: &mut GameState, seconds: f32) -> Vec<GameEvent> {
+        let ticks = (seconds / FIXED_TIMESTEP_SECONDS).ceil() as usize;
+        let mut events = Vec::new();
+        for _ in 0..ticks {
+            state.step(&ControlState::default(), FIXED_TIMESTEP_SECONDS);
+            events.extend_from_slice(state.events());
+        }
+        events
     }
 
     fn state_with_one_asteroid(size: AsteroidSize) -> GameState {

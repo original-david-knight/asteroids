@@ -2,8 +2,8 @@ use std::{error::Error, sync::Arc};
 
 use asteroids::{
     audio::{
-        AudioMsg, AudioMsgSender, AudioRuntime, AudioScaffold, VOICE_EXPLOSION, VOICE_FIRE,
-        VOICE_THRUST,
+        AudioMsg, AudioMsgSender, AudioRuntime, AudioScaffold, PARAM_UFO_VARIANT, VOICE_EXPLOSION,
+        VOICE_FIRE, VOICE_THRUST, VOICE_UFO,
     },
     game::{AsteroidSize, ControlState, GameEvent, GameEventKind, GameLoop},
     renderer::{self, FrameParams, Renderer, Scenario},
@@ -442,6 +442,8 @@ impl ApplicationHandler for AsteroidsApp {
                     FrameParams::new(Scenario::Idle, self.game.render_time_seconds(), frame_dt)
                         .with_asteroids(self.game.interpolated_asteroids())
                         .with_bullets(self.game.interpolated_bullets())
+                        .with_ufo(self.game.interpolated_ufo())
+                        .with_ufo_bullets(self.game.interpolated_ufo_bullets())
                         .with_game_over(self.game.current().game_over);
                 if let Some(ship) = self.game.interpolated_ship_if_alive() {
                     params = params.with_ship(ship);
@@ -476,6 +478,20 @@ fn send_game_event_audio(audio_sender: &mut Option<AudioMsgSender>, event: GameE
                 .map(asteroid_size_audio_variant)
                 .unwrap_or(0);
             let _ = sender.try_push(AudioMsg::TriggerVariant(VOICE_EXPLOSION, variant));
+        }
+        GameEventKind::UfoSirenOn => {
+            let variant = event
+                .ufo_variant
+                .map(|variant| variant.audio_variant())
+                .unwrap_or(0.0);
+            let _ = sender.try_push(AudioMsg::SetParam(VOICE_UFO, PARAM_UFO_VARIANT, variant));
+            let _ = sender.try_push(AudioMsg::Trigger(VOICE_UFO));
+        }
+        GameEventKind::UfoSirenOff => {
+            let _ = sender.try_push(AudioMsg::Release(VOICE_UFO));
+        }
+        GameEventKind::UfoDestroyed => {
+            let _ = sender.try_push(AudioMsg::TriggerVariant(VOICE_EXPLOSION, 1));
         }
         _ => {}
     }

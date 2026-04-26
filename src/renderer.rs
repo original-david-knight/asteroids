@@ -11,7 +11,7 @@ use winit::{dpi::PhysicalSize, window::Window};
 
 use crate::{
     beam::{self, BeamCommand, BeamEmitter, BeamVertex, Vec2},
-    game::{ASTEROID_HULL_VERTEX_COUNT, RenderAsteroid, RenderBullet, RenderShip},
+    game::{ASTEROID_HULL_VERTEX_COUNT, RenderAsteroid, RenderBullet, RenderShip, RenderUfo},
     tuning,
 };
 
@@ -100,6 +100,8 @@ impl Scenario {
                 | Self::BulletHitAsteroid
                 | Self::ShipCollidesWithAsteroid
                 | Self::LoseAllLives
+                | Self::UfoLarge
+                | Self::UfoSmall
         )
     }
 
@@ -123,6 +125,8 @@ pub struct FrameParams {
     pub ship: Option<RenderShip>,
     pub asteroids: Vec<RenderAsteroid>,
     pub bullets: Vec<RenderBullet>,
+    pub ufo: Option<RenderUfo>,
+    pub ufo_bullets: Vec<RenderBullet>,
     pub game_over: bool,
 }
 
@@ -135,6 +139,8 @@ impl FrameParams {
             ship: None,
             asteroids: Vec::new(),
             bullets: Vec::new(),
+            ufo: None,
+            ufo_bullets: Vec::new(),
             game_over: false,
         }
     }
@@ -151,6 +157,16 @@ impl FrameParams {
 
     pub fn with_bullets(mut self, bullets: Vec<RenderBullet>) -> Self {
         self.bullets = bullets;
+        self
+    }
+
+    pub fn with_ufo(mut self, ufo: Option<RenderUfo>) -> Self {
+        self.ufo = ufo;
+        self
+    }
+
+    pub fn with_ufo_bullets(mut self, bullets: Vec<RenderBullet>) -> Self {
+        self.ufo_bullets = bullets;
         self
     }
 
@@ -915,20 +931,10 @@ fn emit_frame_beams(
 
     emit_bezel_readouts(frame_emitter, playfield, size);
     if let Some(ship) = params.ship {
-        for asteroid in &params.asteroids {
-            emit_asteroid_outline(gameplay_emitter, *asteroid);
-        }
-        for bullet in &params.bullets {
-            emit_bullet_dot(gameplay_emitter, *bullet);
-        }
+        emit_gameplay_objects(gameplay_emitter, params);
         emit_ship_outline(gameplay_emitter, ship.position, ship.angle, ship.scale, 1.0);
-    } else if !params.asteroids.is_empty() || !params.bullets.is_empty() || params.game_over {
-        for asteroid in &params.asteroids {
-            emit_asteroid_outline(gameplay_emitter, *asteroid);
-        }
-        for bullet in &params.bullets {
-            emit_bullet_dot(gameplay_emitter, *bullet);
-        }
+    } else if params.has_gameplay_objects() || params.game_over {
+        emit_gameplay_objects(gameplay_emitter, params);
         if params.game_over {
             emit_game_over_text(gameplay_emitter);
         }
@@ -938,6 +944,30 @@ fn emit_frame_beams(
 
     for command in gameplay_emitter.commands() {
         frame_emitter.emit(playfield.map_command(*command));
+    }
+}
+
+impl FrameParams {
+    fn has_gameplay_objects(&self) -> bool {
+        !self.asteroids.is_empty()
+            || !self.bullets.is_empty()
+            || self.ufo.is_some()
+            || !self.ufo_bullets.is_empty()
+    }
+}
+
+fn emit_gameplay_objects(emitter: &mut BeamEmitter, params: &FrameParams) {
+    for asteroid in &params.asteroids {
+        emit_asteroid_outline(emitter, *asteroid);
+    }
+    for bullet in &params.bullets {
+        emit_bullet_dot(emitter, *bullet);
+    }
+    for bullet in &params.ufo_bullets {
+        emit_bullet_dot(emitter, *bullet);
+    }
+    if let Some(ufo) = params.ufo {
+        emit_ufo_outline(emitter, ufo);
     }
 }
 
@@ -1166,6 +1196,57 @@ fn emit_asteroid_outline(emitter: &mut BeamEmitter, asteroid: RenderAsteroid) {
         let start = vertices[index];
         let end = vertices[(index + 1) % vertices.len()];
         emitter.emit_asteroid_hull_segment(start, end, 1.0);
+    }
+}
+
+fn emit_ufo_outline(emitter: &mut BeamEmitter, ufo: RenderUfo) {
+    let width = ufo.radius * 2.2;
+    let body_half_width = width * 0.42;
+    let body_half_height = ufo.radius * 0.34;
+    let dome_half_width = width * 0.20;
+    let dome_height = ufo.radius * 0.38;
+    let base_y = ufo.position.y - body_half_height;
+    let mid_y = ufo.position.y;
+    let top_y = ufo.position.y + body_half_height;
+    let dome_top_y = top_y + dome_height;
+
+    let segments = [
+        (
+            Vec2::new(ufo.position.x - width * 0.5, mid_y),
+            Vec2::new(ufo.position.x - body_half_width, top_y),
+        ),
+        (
+            Vec2::new(ufo.position.x - body_half_width, top_y),
+            Vec2::new(ufo.position.x + body_half_width, top_y),
+        ),
+        (
+            Vec2::new(ufo.position.x + body_half_width, top_y),
+            Vec2::new(ufo.position.x + width * 0.5, mid_y),
+        ),
+        (
+            Vec2::new(ufo.position.x + width * 0.5, mid_y),
+            Vec2::new(ufo.position.x + body_half_width, base_y),
+        ),
+        (
+            Vec2::new(ufo.position.x + body_half_width, base_y),
+            Vec2::new(ufo.position.x - body_half_width, base_y),
+        ),
+        (
+            Vec2::new(ufo.position.x - body_half_width, base_y),
+            Vec2::new(ufo.position.x - width * 0.5, mid_y),
+        ),
+        (
+            Vec2::new(ufo.position.x - dome_half_width, top_y),
+            Vec2::new(ufo.position.x, dome_top_y),
+        ),
+        (
+            Vec2::new(ufo.position.x, dome_top_y),
+            Vec2::new(ufo.position.x + dome_half_width, top_y),
+        ),
+    ];
+
+    for (start, end) in segments {
+        emitter.emit_ship_outline_segment_with_endpoint_bonus(start, end, 1.0);
     }
 }
 

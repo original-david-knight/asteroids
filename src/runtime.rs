@@ -465,16 +465,18 @@ fn start_automated_audio_capture(
             } else {
                 0.0
             };
-            enqueue_audio_msg(
-                &mut sender,
-                audio::AudioMsg::SetParam(audio::VOICE_UFO, audio::PARAM_UFO_VARIANT, variant),
-                "ufo variant",
-            )?;
-            enqueue_audio_msg(
-                &mut sender,
-                audio::AudioMsg::Trigger(audio::VOICE_UFO),
-                "ufo trigger",
-            )?;
+            if config.simulate_secs.is_none() {
+                enqueue_audio_msg(
+                    &mut sender,
+                    audio::AudioMsg::SetParam(audio::VOICE_UFO, audio::PARAM_UFO_VARIANT, variant),
+                    "ufo variant",
+                )?;
+                enqueue_audio_msg(
+                    &mut sender,
+                    audio::AudioMsg::Trigger(audio::VOICE_UFO),
+                    "ufo trigger",
+                )?;
+            }
         }
         _ => {}
     }
@@ -519,6 +521,24 @@ fn send_game_event_audio(sender: &mut audio::AudioMsgSender, event: GameEvent) {
                 audio::VOICE_EXPLOSION,
                 variant,
             ));
+        }
+        GameEventKind::UfoSirenOn => {
+            let variant = event
+                .ufo_variant
+                .map(|variant| variant.audio_variant())
+                .unwrap_or(0.0);
+            let _ = sender.try_push(audio::AudioMsg::SetParam(
+                audio::VOICE_UFO,
+                audio::PARAM_UFO_VARIANT,
+                variant,
+            ));
+            let _ = sender.try_push(audio::AudioMsg::Trigger(audio::VOICE_UFO));
+        }
+        GameEventKind::UfoSirenOff => {
+            let _ = sender.try_push(audio::AudioMsg::Release(audio::VOICE_UFO));
+        }
+        GameEventKind::UfoDestroyed => {
+            let _ = sender.try_push(audio::AudioMsg::TriggerVariant(audio::VOICE_EXPLOSION, 1));
         }
         _ => {}
     }
@@ -575,6 +595,8 @@ fn game_loop_for_scenario(scenario: Scenario, seed: Option<u64>) -> GameLoop {
         Scenario::LoseAllLives => {
             GameLoop::from_state(game::GameState::lose_all_lives_scenario(seed))
         }
+        Scenario::UfoLarge => GameLoop::from_state(game::GameState::ufo_large_scenario(seed)),
+        Scenario::UfoSmall => GameLoop::from_state(game::GameState::ufo_small_scenario(seed)),
         _ => GameLoop::new_seeded(seed),
     }
 }
@@ -604,6 +626,8 @@ fn render_tick(
         params = params
             .with_asteroids(game_loop.interpolated_asteroids())
             .with_bullets(game_loop.interpolated_bullets())
+            .with_ufo(game_loop.interpolated_ufo())
+            .with_ufo_bullets(game_loop.interpolated_ufo_bullets())
             .with_game_over(game_loop.current().game_over);
         if let Some(ship) = game_loop.interpolated_ship_if_alive() {
             params = params.with_ship(ship);
@@ -738,12 +762,15 @@ fn write_gameplay_fields(
 ) -> std::io::Result<()> {
     write!(
         writer,
-        ",\"alive\":{},\"lives\":{},\"game_over\":{},\"bullet_count\":{},\"bullet_wrapped\":{},\"bullets\":[",
+        ",\"alive\":{},\"lives\":{},\"score\":{},\"game_over\":{},\"bullet_count\":{},\"bullet_wrapped\":{},\"ufo_bullet_count\":{},\"ufo_bullet_wrapped\":{},\"bullets\":[",
         state.alive,
         state.lives,
+        state.score,
         state.game_over,
         state.bullets.len(),
         state.any_bullet_wrapped_last_tick(),
+        state.ufo_bullets.len(),
+        state.any_ufo_bullet_wrapped_last_tick(),
     )?;
     for (index, bullet) in state.bullets.iter().enumerate() {
         if index > 0 {
@@ -761,7 +788,38 @@ fn write_gameplay_fields(
             bullet.wrapped_last_tick,
         )?;
     }
-    write!(writer, "]")
+    write!(writer, "],\"ufo_bullets\":[")?;
+    for (index, bullet) in state.ufo_bullets.iter().enumerate() {
+        if index > 0 {
+            write!(writer, ",")?;
+        }
+        write!(
+            writer,
+            "{{\"id\":{},\"x\":{:.6},\"y\":{:.6},\"vx\":{:.6},\"vy\":{:.6},\"age\":{:.6},\"wrapped\":{}}}",
+            bullet.id,
+            bullet.position.x,
+            bullet.position.y,
+            bullet.velocity.x,
+            bullet.velocity.y,
+            bullet.age_seconds,
+            bullet.wrapped_last_tick,
+        )?;
+    }
+    write!(writer, "]")?;
+    if let Some(ufo) = state.ufo {
+        write!(
+            writer,
+            ",\"ufo\":{{\"id\":{},\"variant\":\"{}\",\"x\":{:.6},\"y\":{:.6},\"vx\":{:.6},\"vy\":{:.6}}}",
+            ufo.id,
+            ufo.variant.name(),
+            ufo.position.x,
+            ufo.position.y,
+            ufo.velocity.x,
+            ufo.velocity.y,
+        )
+    } else {
+        write!(writer, ",\"ufo\":null")
+    }
 }
 
 fn write_asteroid_fields(

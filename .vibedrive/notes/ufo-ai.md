@@ -1,0 +1,1 @@
+UFO actors, bullets, collisions, renderer/audio events, and ufo-large/ufo-small state-trace scenarios are implemented. Spawn timing uses the original #$92 - #$06 to #$20 saucer timer curve at the 4-frame saucer update cadence, indexed by 2,500-point score steps for this score-driven slice; vertical motion is clamped as a tuning divergence.
