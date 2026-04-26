@@ -56,6 +56,7 @@ pub const BULLET_RENDER_RADIUS_NDC: f32 = 0.0045;
 pub const SHIP_COLLISION_RADIUS_NDC: f32 = 0.44 * tuning::SHIP_GAMEPLAY_SCALE;
 pub const SHIP_RESPAWN_DELAY_SECONDS: f32 = 1.25;
 pub const SHIP_RESPAWN_INVULNERABILITY_SECONDS: f32 = 1.25;
+pub const LEVEL_START_ASTEROID_DELAY_SECONDS: f32 = 1.0;
 pub const HYPERSPACE_COOLDOWN_SECONDS: f32 = 1.0;
 pub const HYPERSPACE_SELF_DESTRUCT_CHANCE: f32 = 0.10;
 /// DESIGN.md fixes the small-saucer transition at 10,000 points for v1.
@@ -385,6 +386,7 @@ pub enum GameEventKind {
     ScoreIncreased,
     ExtraLifeAwarded,
     ScoreGte10000,
+    LevelStarted,
     ShipDied,
     LivesDecremented,
     Respawn,
@@ -413,6 +415,7 @@ impl GameEventKind {
             Self::ScoreIncreased => "score-increased",
             Self::ExtraLifeAwarded => "extra-life-awarded",
             Self::ScoreGte10000 => "score-gte-10000",
+            Self::LevelStarted => "level-started",
             Self::ShipDied => "ship-died",
             Self::LivesDecremented => "lives-decremented",
             Self::Respawn => "respawn",
@@ -540,6 +543,8 @@ pub struct GameState {
     pub ufo: Option<Ufo>,
     pub ufo_bullets: Vec<Bullet>,
     advance_rounds_on_clear: bool,
+    pending_round: Option<u32>,
+    level_start_delay_timer_seconds: f32,
     next_asteroid_id: u32,
     next_bullet_id: u32,
     next_ufo_id: u32,
@@ -675,6 +680,8 @@ impl GameState {
             ufo: None,
             ufo_bullets: Vec::new(),
             advance_rounds_on_clear: false,
+            pending_round: None,
+            level_start_delay_timer_seconds: 0.0,
             next_asteroid_id: 1,
             next_bullet_id: 1,
             next_ufo_id: 1,
@@ -696,7 +703,11 @@ impl GameState {
 
     fn step(&mut self, input: &ControlState, dt: f32) {
         self.events.clear();
-        self.start_next_round_if_cleared();
+        if self.start_next_round_if_cleared() || self.update_level_start_delay(dt) {
+            self.latch_edge_inputs(input);
+            self.sync_asteroid_count();
+            return;
+        }
         self.update_scripted_scenario();
         self.update_respawn(dt);
         self.update_hyperspace_cooldown(dt);
@@ -806,6 +817,50 @@ impl GameState {
 
     pub fn start_round(&mut self, round: u32) {
         self.advance_rounds_on_clear = true;
+        self.pending_round = None;
+        self.level_start_delay_timer_seconds = 0.0;
+        self.spawn_round_asteroids(round);
+    }
+
+    fn start_next_round_if_cleared(&mut self) -> bool {
+        if self.advance_rounds_on_clear
+            && !self.game_over
+            && self.pending_round.is_none()
+            && self.asteroids.is_empty()
+            && self.ufo.is_none()
+        {
+            self.begin_level_start_delay(self.round.saturating_add(1));
+            return true;
+        }
+        false
+    }
+
+    fn begin_level_start_delay(&mut self, round: u32) {
+        let round = round.max(1);
+        self.round = round;
+        self.pending_round = Some(round);
+        self.level_start_delay_timer_seconds = LEVEL_START_ASTEROID_DELAY_SECONDS;
+        self.ship = ShipState::default();
+        self.bullets.clear();
+        self.ufo_bullets.clear();
+        self.reset_ufo_spawn_timer();
+        self.push_event(GameEventKind::LevelStarted);
+    }
+
+    fn update_level_start_delay(&mut self, dt: f32) -> bool {
+        let Some(round) = self.pending_round else {
+            return false;
+        };
+
+        self.level_start_delay_timer_seconds = (self.level_start_delay_timer_seconds - dt).max(0.0);
+        if self.level_start_delay_timer_seconds <= 0.0 {
+            self.pending_round = None;
+            self.spawn_round_asteroids(round);
+        }
+        true
+    }
+
+    fn spawn_round_asteroids(&mut self, round: u32) {
         self.round = round.max(1);
         self.asteroids.clear();
         let count = asteroid_spawn_count_for_round(self.round);
@@ -817,14 +872,9 @@ impl GameState {
         self.sync_asteroid_count();
     }
 
-    fn start_next_round_if_cleared(&mut self) {
-        if self.advance_rounds_on_clear
-            && !self.game_over
-            && self.asteroids.is_empty()
-            && self.ufo.is_none()
-        {
-            self.start_round(self.round.saturating_add(1));
-        }
+    fn latch_edge_inputs(&mut self, input: &ControlState) {
+        self.fire_was_down = input.fire;
+        self.hyperspace_was_down = input.hyperspace;
     }
 
     pub fn hit_asteroid_by_id(&mut self, id: u32) -> bool {
@@ -1670,11 +1720,12 @@ impl GameLoop {
                     .events
                     .push(GameEvent::high_score(self.high_score));
             }
-            let instant_ship_reposition = self
-                .current
-                .events()
-                .iter()
-                .any(|event| event.kind == GameEventKind::HyperspaceTriggered);
+            let instant_ship_reposition = self.current.events().iter().any(|event| {
+                matches!(
+                    event.kind,
+                    GameEventKind::HyperspaceTriggered | GameEventKind::LevelStarted
+                )
+            });
             self.pending_events.extend_from_slice(self.current.events());
             if instant_ship_reposition {
                 self.previous = self.current.clone();
@@ -2222,14 +2273,56 @@ mod tests {
     }
 
     #[test]
-    fn cleared_normal_round_starts_next_tick_with_more_asteroids() {
+    fn cleared_normal_round_recenters_ship_then_spawns_more_asteroids_after_delay() {
         let mut state = GameState::new_seeded(Some(1));
         assert_eq!(state.round, 1);
         assert_eq!(state.asteroid_count, 4);
+        state.ship = ShipState {
+            position: Vec2::new(0.42, -0.31),
+            velocity: Vec2::new(0.8, -0.6),
+            angle: 1.25,
+        };
+        state.bullets.push(Bullet::new(
+            1,
+            Vec2::new(0.1, 0.2),
+            Vec2::new(BULLET_SPEED_NDC_PER_SEC, 0.0),
+        ));
+        state.ufo_bullets.push(Bullet::new(
+            2,
+            Vec2::new(-0.2, -0.1),
+            Vec2::new(-UFO_BULLET_SPEED_NDC_PER_SEC, 0.0),
+        ));
 
         state.asteroids.clear();
         state.sync_asteroid_count();
-        state.step(&ControlState::default(), FIXED_TIMESTEP_SECONDS);
+        let held_input = ControlState {
+            thrust: true,
+            fire: true,
+            hyperspace: true,
+            ..ControlState::default()
+        };
+        state.step(&held_input, FIXED_TIMESTEP_SECONDS);
+
+        assert_eq!(state.round, 2);
+        assert_eq!(state.asteroid_count, 0);
+        assert_eq!(state.ship, ShipState::default());
+        assert!(state.bullets.is_empty());
+        assert!(state.ufo_bullets.is_empty());
+        assert!(
+            state
+                .events()
+                .iter()
+                .any(|event| event.kind == GameEventKind::LevelStarted)
+        );
+
+        for _ in 0..8 {
+            state.step(&held_input, FIXED_TIMESTEP_SECONDS);
+        }
+        assert_eq!(state.asteroid_count, 0);
+        assert_eq!(state.ship, ShipState::default());
+        assert!(state.bullets.is_empty());
+
+        advance_until_asteroids_spawn(&mut state);
 
         assert_eq!(state.round, 2);
         assert_eq!(state.asteroid_count, 6);
@@ -2237,8 +2330,13 @@ mod tests {
     }
 
     #[test]
-    fn cleared_round_waits_for_ufo_before_next_wave() {
+    fn cleared_round_waits_for_ufo_before_level_delay() {
         let mut state = GameState::new_seeded(Some(1));
+        state.ship = ShipState {
+            position: Vec2::new(-0.4, 0.25),
+            velocity: Vec2::new(-0.3, 0.2),
+            angle: 2.5,
+        };
         state.asteroids.clear();
         state.sync_asteroid_count();
         state.ufo = Some(Ufo::new(
@@ -2258,8 +2356,13 @@ mod tests {
         state.step(&ControlState::default(), FIXED_TIMESTEP_SECONDS);
 
         assert_eq!(state.round, 2);
-        assert_eq!(state.asteroid_count, 6);
+        assert_eq!(state.asteroid_count, 0);
         assert!(state.ufo.is_none());
+        assert_eq!(state.ship, ShipState::default());
+
+        advance_until_asteroids_spawn(&mut state);
+
+        assert_eq!(state.asteroid_count, 6);
     }
 
     #[test]
@@ -2643,6 +2746,18 @@ mod tests {
             events.extend_from_slice(state.events());
         }
         events
+    }
+
+    fn advance_until_asteroids_spawn(state: &mut GameState) {
+        let max_ticks =
+            (LEVEL_START_ASTEROID_DELAY_SECONDS / FIXED_TIMESTEP_SECONDS).ceil() as usize + 2;
+        for _ in 0..max_ticks {
+            state.step(&ControlState::default(), FIXED_TIMESTEP_SECONDS);
+            if state.asteroid_count > 0 {
+                return;
+            }
+        }
+        panic!("asteroids did not spawn after level start delay");
     }
 
     fn state_with_one_asteroid(size: AsteroidSize) -> GameState {
