@@ -551,7 +551,7 @@ tasks:
         Detect bullet-asteroid hits (split or remove asteroid), bullet-UFO hits (defer until the UFO task), and ship-asteroid hits (decrement lives, respawn after a short delay, persistent score across deaths).
         Implement game-over state when lives reach zero. Display a minimal vector text "GAME OVER" using beam-drawn glyphs or a placeholder (polish-pass replaces placeholders).
         Add unit tests for: circle-circle collision (overlap and non-overlap cases, edge-touching), bullet lifetime expiry (despawn after the lifetime budget), and ship-death lives decrement.
-      status: todo
+      status: done
       workflow: implement
       deps:
         - asteroids

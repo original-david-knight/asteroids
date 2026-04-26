@@ -18,6 +18,13 @@ pub const ASTEROIDS_PER_WAVE_BOOTSTRAP: u32 = 2;
 pub const ASTEROIDS_PER_WAVE_INCREMENT: u32 = 2;
 pub const ASTEROIDS_PER_WAVE_MAX: u32 = 11;
 pub const ASTEROID_HULL_VERTEX_COUNT: usize = 10;
+pub const INITIAL_LIVES: u32 = 3;
+pub const BULLET_LIFETIME_SECONDS: f32 = 1.0;
+pub const BULLET_SPEED_NDC_PER_SEC: f32 = 1.65;
+pub const BULLET_RADIUS_NDC: f32 = 0.012;
+pub const SHIP_COLLISION_RADIUS_NDC: f32 = 0.44 * tuning::SHIP_SPINNING_SCALE;
+pub const SHIP_RESPAWN_DELAY_SECONDS: f32 = 1.25;
+pub const SHIP_RESPAWN_INVULNERABILITY_SECONDS: f32 = 1.25;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ControlState {
@@ -160,12 +167,51 @@ impl Asteroid {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Bullet {
+    pub id: u32,
+    pub position: Vec2,
+    pub velocity: Vec2,
+    pub age_seconds: f32,
+    pub wrapped_last_tick: bool,
+}
+
+impl Bullet {
+    fn new(id: u32, position: Vec2, velocity: Vec2) -> Self {
+        Self {
+            id,
+            position,
+            velocity,
+            age_seconds: 0.0,
+            wrapped_last_tick: false,
+        }
+    }
+
+    fn integrate(&mut self, dt: f32) {
+        let (position, wrapped) = wrap_position_with_report(self.position + self.velocity * dt);
+        self.position = position;
+        self.age_seconds += dt;
+        self.wrapped_last_tick = wrapped;
+    }
+
+    pub fn is_expired(self) -> bool {
+        self.age_seconds >= BULLET_LIFETIME_SECONDS
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RenderAsteroid {
     pub id: u32,
     pub size: AsteroidSize,
     pub position: Vec2,
     pub radius: f32,
     pub hull: AsteroidHull,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RenderBullet {
+    pub id: u32,
+    pub position: Vec2,
+    pub radius: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -175,15 +221,67 @@ pub struct AsteroidSizeCounts {
     pub small: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GameEventKind {
+    BulletFired,
+    BulletExpired,
+    BulletHitAsteroid,
+    AsteroidSplit,
+    AsteroidDestroyed,
+    ShipDied,
+    LivesDecremented,
+    Respawn,
+    GameOver,
+}
+
+impl GameEventKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::BulletFired => "bullet-fired",
+            Self::BulletExpired => "bullet-expired",
+            Self::BulletHitAsteroid => "bullet-hit-asteroid",
+            Self::AsteroidSplit => "asteroid-split",
+            Self::AsteroidDestroyed => "asteroid-destroyed",
+            Self::ShipDied => "ship-died",
+            Self::LivesDecremented => "lives-decremented",
+            Self::Respawn => "respawn",
+            Self::GameOver => "game-over",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GameEvent {
+    pub kind: GameEventKind,
+}
+
+impl GameEvent {
+    fn new(kind: GameEventKind) -> Self {
+        Self { kind }
+    }
+
+    pub fn name(self) -> &'static str {
+        self.kind.name()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct GameState {
     pub ship: ShipState,
     pub alive: bool,
+    pub game_over: bool,
+    pub lives: u32,
     pub score: u32,
     pub asteroid_count: u32,
     pub round: u32,
     pub asteroids: Vec<Asteroid>,
+    pub bullets: Vec<Bullet>,
     next_asteroid_id: u32,
+    next_bullet_id: u32,
+    respawn_timer_seconds: f32,
+    invulnerability_timer_seconds: f32,
+    fire_was_down: bool,
+    events: Vec<GameEvent>,
     rng: SeededRng,
 }
 
@@ -195,24 +293,91 @@ impl Default for GameState {
 
 impl GameState {
     pub fn new_seeded(seed: Option<u64>) -> Self {
-        let mut state = Self {
-            ship: ShipState::default(),
-            alive: true,
-            score: SCORE_PLACEHOLDER,
-            asteroid_count: 0,
-            round: 0,
-            asteroids: Vec::new(),
-            next_asteroid_id: 1,
-            rng: rng_for_seed(seed),
-        };
+        let mut state = Self::empty_seeded(seed);
         state.start_round(1);
         state
     }
 
+    pub fn bullet_hit_asteroid_scenario(seed: Option<u64>) -> Self {
+        let mut state = Self::empty_seeded(seed);
+        let asteroid = state.allocate_asteroid(
+            AsteroidSize::Large,
+            Vec2::new(0.55, 0.0),
+            Vec2::ZERO,
+            AsteroidHull::regular(),
+        );
+        state.asteroids.push(asteroid);
+        state.sync_asteroid_count();
+        state
+    }
+
+    pub fn ship_collides_with_asteroid_scenario(seed: Option<u64>) -> Self {
+        let mut state = Self::empty_seeded(seed);
+        let asteroid = state.allocate_asteroid(
+            AsteroidSize::Large,
+            Vec2::new(0.18, 0.0),
+            Vec2::new(0.22, 0.0),
+            AsteroidHull::regular(),
+        );
+        state.asteroids.push(asteroid);
+        state.sync_asteroid_count();
+        state
+    }
+
+    pub fn lose_all_lives_scenario(seed: Option<u64>) -> Self {
+        let mut state = Self::empty_seeded(seed);
+        let asteroid = state.allocate_asteroid(
+            AsteroidSize::Large,
+            Vec2::ZERO,
+            Vec2::ZERO,
+            AsteroidHull::regular(),
+        );
+        state.asteroids.push(asteroid);
+        state.sync_asteroid_count();
+        state
+    }
+
+    fn empty_seeded(seed: Option<u64>) -> Self {
+        Self {
+            ship: ShipState::default(),
+            alive: true,
+            game_over: false,
+            lives: INITIAL_LIVES,
+            score: SCORE_PLACEHOLDER,
+            asteroid_count: 0,
+            round: 1,
+            asteroids: Vec::new(),
+            bullets: Vec::new(),
+            next_asteroid_id: 1,
+            next_bullet_id: 1,
+            respawn_timer_seconds: 0.0,
+            invulnerability_timer_seconds: 0.0,
+            fire_was_down: false,
+            events: Vec::new(),
+            rng: rng_for_seed(seed),
+        }
+    }
+
     fn step(&mut self, input: &ControlState, dt: f32) {
-        self.ship.integrate(input, dt);
+        self.events.clear();
+        self.update_respawn(dt);
+        if self.alive {
+            self.ship.integrate(input, dt);
+        }
         for asteroid in &mut self.asteroids {
             asteroid.integrate(dt);
+        }
+        self.update_fire(input);
+        for bullet in &mut self.bullets {
+            bullet.integrate(dt);
+        }
+        self.despawn_expired_bullets();
+        self.resolve_bullet_asteroid_collisions();
+        // UFO collision is intentionally deferred until the UFO task adds UFO
+        // actors and score rules; bullet-vs-UFO will use the same circle model.
+        self.resolve_ship_asteroid_collisions();
+        if self.invulnerability_timer_seconds > 0.0 {
+            self.invulnerability_timer_seconds = (self.invulnerability_timer_seconds - dt).max(0.0);
         }
         self.sync_asteroid_count();
     }
@@ -245,6 +410,9 @@ impl GameState {
                 let child = self.allocate_asteroid(child_size, parent.position, velocity, hull);
                 self.asteroids.push(child);
             }
+            self.push_event(GameEventKind::AsteroidSplit);
+        } else {
+            self.push_event(GameEventKind::AsteroidDestroyed);
         }
         self.sync_asteroid_count();
         true
@@ -275,10 +443,139 @@ impl GameState {
             .collect()
     }
 
+    pub fn render_bullets(&self) -> Vec<RenderBullet> {
+        self.bullets
+            .iter()
+            .map(|bullet| RenderBullet {
+                id: bullet.id,
+                position: bullet.position,
+                radius: BULLET_RADIUS_NDC,
+            })
+            .collect()
+    }
+
     pub fn any_asteroid_wrapped_last_tick(&self) -> bool {
         self.asteroids
             .iter()
             .any(|asteroid| asteroid.wrapped_last_tick)
+    }
+
+    pub fn any_bullet_wrapped_last_tick(&self) -> bool {
+        self.bullets.iter().any(|bullet| bullet.wrapped_last_tick)
+    }
+
+    pub fn events(&self) -> &[GameEvent] {
+        &self.events
+    }
+
+    fn update_respawn(&mut self, dt: f32) {
+        if self.game_over || self.alive || self.lives == 0 {
+            return;
+        }
+        self.respawn_timer_seconds = (self.respawn_timer_seconds - dt).max(0.0);
+        if self.respawn_timer_seconds <= 0.0 {
+            self.ship = ShipState::default();
+            self.alive = true;
+            self.invulnerability_timer_seconds = SHIP_RESPAWN_INVULNERABILITY_SECONDS;
+            self.push_event(GameEventKind::Respawn);
+        }
+    }
+
+    fn update_fire(&mut self, input: &ControlState) {
+        let fire_pressed = input.fire && !self.fire_was_down;
+        self.fire_was_down = input.fire;
+        if self.alive && !self.game_over && fire_pressed {
+            self.fire_bullet();
+        }
+    }
+
+    fn fire_bullet(&mut self) {
+        let (angle_sin, angle_cos) = self.ship.angle.sin_cos();
+        let forward = Vec2::new(angle_cos, angle_sin);
+        let id = self.next_bullet_id;
+        self.next_bullet_id = self.next_bullet_id.wrapping_add(1).max(1);
+        let position = wrap_position(
+            self.ship.position + forward * (SHIP_COLLISION_RADIUS_NDC + BULLET_RADIUS_NDC),
+        );
+        let velocity = self.ship.velocity + forward * BULLET_SPEED_NDC_PER_SEC;
+        self.bullets.push(Bullet::new(id, position, velocity));
+        self.push_event(GameEventKind::BulletFired);
+    }
+
+    fn despawn_expired_bullets(&mut self) {
+        let before = self.bullets.len();
+        self.bullets.retain(|bullet| !bullet.is_expired());
+        for _ in self.bullets.len()..before {
+            self.push_event(GameEventKind::BulletExpired);
+        }
+    }
+
+    fn resolve_bullet_asteroid_collisions(&mut self) {
+        let mut bullet_index = 0;
+        while bullet_index < self.bullets.len() {
+            let bullet = self.bullets[bullet_index];
+            let hit_asteroid_id = self
+                .asteroids
+                .iter()
+                .find(|asteroid| {
+                    playfield_circles_overlap(
+                        bullet.position,
+                        BULLET_RADIUS_NDC,
+                        asteroid.position,
+                        asteroid.radius_ndc(),
+                    )
+                })
+                .map(|asteroid| asteroid.id);
+
+            if let Some(asteroid_id) = hit_asteroid_id {
+                self.bullets.remove(bullet_index);
+                self.push_event(GameEventKind::BulletHitAsteroid);
+                self.hit_asteroid_by_id(asteroid_id);
+            } else {
+                bullet_index += 1;
+            }
+        }
+    }
+
+    fn resolve_ship_asteroid_collisions(&mut self) {
+        if !self.alive || self.game_over || self.invulnerability_timer_seconds > 0.0 {
+            return;
+        }
+        let hit_ship = self.asteroids.iter().any(|asteroid| {
+            playfield_circles_overlap(
+                self.ship.position,
+                SHIP_COLLISION_RADIUS_NDC,
+                asteroid.position,
+                asteroid.radius_ndc(),
+            )
+        });
+        if hit_ship {
+            self.kill_ship();
+        }
+    }
+
+    fn kill_ship(&mut self) {
+        if !self.alive || self.game_over {
+            return;
+        }
+        self.alive = false;
+        self.lives = self.lives.saturating_sub(1);
+        self.respawn_timer_seconds = if self.lives > 0 {
+            SHIP_RESPAWN_DELAY_SECONDS
+        } else {
+            0.0
+        };
+        self.invulnerability_timer_seconds = 0.0;
+        self.push_event(GameEventKind::ShipDied);
+        self.push_event(GameEventKind::LivesDecremented);
+        if self.lives == 0 {
+            self.game_over = true;
+            self.push_event(GameEventKind::GameOver);
+        }
+    }
+
+    fn push_event(&mut self, kind: GameEventKind) {
+        self.events.push(GameEvent::new(kind));
     }
 
     fn spawn_large_asteroid(&mut self, index: u32) -> Asteroid {
@@ -327,6 +624,39 @@ pub fn asteroid_spawn_count_for_round(round: u32) -> u32 {
     ASTEROIDS_PER_WAVE_BOOTSTRAP
         .saturating_add(ASTEROIDS_PER_WAVE_INCREMENT.saturating_mul(round))
         .min(ASTEROIDS_PER_WAVE_MAX)
+}
+
+/// DESIGN.md Open Question 7 decision: gameplay collisions use circle-vs-circle
+/// tests with sprite-extent radii. This is modern, fast, deterministic at edge
+/// touch, and accurate enough for the wireframe sprites used in this build.
+pub fn circles_overlap(center_a: Vec2, radius_a: f32, center_b: Vec2, radius_b: f32) -> bool {
+    let combined_radius = radius_a.max(0.0) + radius_b.max(0.0);
+    (center_a - center_b).length_squared() <= combined_radius * combined_radius
+}
+
+fn playfield_circles_overlap(center_a: Vec2, radius_a: f32, center_b: Vec2, radius_b: f32) -> bool {
+    let delta = wrapped_delta(center_a, center_b);
+    let combined_radius = radius_a.max(0.0) + radius_b.max(0.0);
+    delta.length_squared() <= combined_radius * combined_radius
+}
+
+fn wrapped_delta(a: Vec2, b: Vec2) -> Vec2 {
+    Vec2::new(
+        wrapped_axis_delta(a.x - b.x, PLAYFIELD_MIN.x, PLAYFIELD_MAX.x),
+        wrapped_axis_delta(a.y - b.y, PLAYFIELD_MIN.y, PLAYFIELD_MAX.y),
+    )
+}
+
+fn wrapped_axis_delta(delta: f32, min: f32, max: f32) -> f32 {
+    let width = max - min;
+    if width <= 0.0 {
+        return delta;
+    }
+    if delta.abs() > width * 0.5 {
+        delta - delta.signum() * width
+    } else {
+        delta
+    }
 }
 
 fn edge_spawn_position(side: u32, rng: &mut SeededRng) -> Vec2 {
@@ -422,6 +752,7 @@ impl AdvanceReport {
 pub struct GameLoop {
     previous: GameState,
     current: GameState,
+    pending_events: Vec<GameEvent>,
     accumulator_seconds: f32,
     tick: u64,
     paused: bool,
@@ -433,6 +764,7 @@ impl Default for GameLoop {
         Self {
             previous: state.clone(),
             current: state,
+            pending_events: Vec::new(),
             accumulator_seconds: 0.0,
             tick: 0,
             paused: false,
@@ -450,6 +782,18 @@ impl GameLoop {
         Self {
             previous: state.clone(),
             current: state,
+            pending_events: Vec::new(),
+            accumulator_seconds: 0.0,
+            tick: 0,
+            paused: false,
+        }
+    }
+
+    pub fn from_state(state: GameState) -> Self {
+        Self {
+            previous: state.clone(),
+            current: state,
+            pending_events: Vec::new(),
             accumulator_seconds: 0.0,
             tick: 0,
             paused: false,
@@ -465,6 +809,7 @@ impl GameLoop {
     where
         F: FnMut(GameSnapshot),
     {
+        self.pending_events.clear();
         if self.paused {
             return AdvanceReport {
                 substeps: 0,
@@ -482,6 +827,7 @@ impl GameLoop {
         {
             self.previous = self.current.clone();
             self.current.step(input, FIXED_TIMESTEP_SECONDS);
+            self.pending_events.extend_from_slice(self.current.events());
             self.tick += 1;
             substeps += 1;
             self.accumulator_seconds -= FIXED_TIMESTEP_SECONDS;
@@ -502,6 +848,10 @@ impl GameLoop {
             dropped_accumulator_seconds,
             interpolation_alpha: self.interpolation_alpha(),
         }
+    }
+
+    pub fn drain_events(&mut self) -> Vec<GameEvent> {
+        std::mem::take(&mut self.pending_events)
     }
 
     pub fn interpolated_ship(&self) -> RenderShip {
@@ -526,6 +876,10 @@ impl GameLoop {
             angle: lerp_angle(self.previous.ship.angle, self.current.ship.angle, alpha),
             scale: tuning::SHIP_SPINNING_SCALE,
         }
+    }
+
+    pub fn interpolated_ship_if_alive(&self) -> Option<RenderShip> {
+        self.current.alive.then(|| self.interpolated_ship())
     }
 
     pub fn interpolated_asteroids(&self) -> Vec<RenderAsteroid> {
@@ -564,6 +918,45 @@ impl GameLoop {
                     position,
                     radius: current.radius_ndc(),
                     hull: current.hull,
+                }
+            })
+            .collect()
+    }
+
+    pub fn interpolated_bullets(&self) -> Vec<RenderBullet> {
+        let alpha = self.interpolation_alpha();
+        self.current
+            .bullets
+            .iter()
+            .map(|current| {
+                let position = self
+                    .previous
+                    .bullets
+                    .iter()
+                    .find(|previous| previous.id == current.id)
+                    .map(|previous| {
+                        Vec2::new(
+                            lerp_wrapped_coordinate(
+                                previous.position.x,
+                                current.position.x,
+                                alpha,
+                                PLAYFIELD_MIN.x,
+                                PLAYFIELD_MAX.x,
+                            ),
+                            lerp_wrapped_coordinate(
+                                previous.position.y,
+                                current.position.y,
+                                alpha,
+                                PLAYFIELD_MIN.y,
+                                PLAYFIELD_MAX.y,
+                            ),
+                        )
+                    })
+                    .unwrap_or(current.position);
+                RenderBullet {
+                    id: current.id,
+                    position,
+                    radius: BULLET_RADIUS_NDC,
                 }
             })
             .collect()
@@ -800,6 +1193,90 @@ mod tests {
     }
 
     #[test]
+    fn circle_collision_counts_overlap_and_edge_touch_but_not_separation() {
+        assert!(circles_overlap(Vec2::ZERO, 0.5, Vec2::new(0.75, 0.0), 0.3));
+        assert!(circles_overlap(Vec2::ZERO, 0.5, Vec2::new(0.8, 0.0), 0.3));
+        assert!(!circles_overlap(Vec2::ZERO, 0.5, Vec2::new(0.81, 0.0), 0.3));
+    }
+
+    #[test]
+    fn bullet_expires_after_lifetime_budget() {
+        let mut state = empty_test_state();
+        state.bullets.push(Bullet::new(
+            1,
+            Vec2::ZERO,
+            Vec2::new(BULLET_SPEED_NDC_PER_SEC, 0.0),
+        ));
+        state.bullets[0].age_seconds = BULLET_LIFETIME_SECONDS - FIXED_TIMESTEP_SECONDS * 0.5;
+
+        state.step(&ControlState::default(), FIXED_TIMESTEP_SECONDS);
+
+        assert!(state.bullets.is_empty());
+        assert!(
+            state
+                .events()
+                .iter()
+                .any(|event| event.kind == GameEventKind::BulletExpired)
+        );
+    }
+
+    #[test]
+    fn ship_death_decrements_lives_and_flips_snapshot_alive_flag() {
+        let mut state = empty_test_state();
+        state.asteroids.push(Asteroid::new(
+            1,
+            AsteroidSize::Large,
+            Vec2::ZERO,
+            Vec2::ZERO,
+            AsteroidHull::regular(),
+        ));
+        state.sync_asteroid_count();
+
+        state.step(&ControlState::default(), FIXED_TIMESTEP_SECONDS);
+
+        assert_eq!(state.lives, INITIAL_LIVES - 1);
+        assert!(!state.alive);
+        assert!(!state.snapshot().is_alive());
+        assert!(
+            state
+                .events()
+                .iter()
+                .any(|event| event.kind == GameEventKind::ShipDied)
+        );
+        assert!(
+            state
+                .events()
+                .iter()
+                .any(|event| event.kind == GameEventKind::LivesDecremented)
+        );
+    }
+
+    #[test]
+    fn respawn_flips_snapshot_alive_flag_back_on() {
+        let mut state = empty_test_state();
+        state.asteroids.push(Asteroid::new(
+            1,
+            AsteroidSize::Large,
+            Vec2::ZERO,
+            Vec2::ZERO,
+            AsteroidHull::regular(),
+        ));
+        state.sync_asteroid_count();
+
+        state.step(&ControlState::default(), FIXED_TIMESTEP_SECONDS);
+        assert!(!state.snapshot().is_alive());
+
+        state.asteroids.clear();
+        state.sync_asteroid_count();
+        for _ in 0..=((SHIP_RESPAWN_DELAY_SECONDS / FIXED_TIMESTEP_SECONDS).ceil() as usize) {
+            state.step(&ControlState::default(), FIXED_TIMESTEP_SECONDS);
+        }
+
+        assert!(state.alive);
+        assert!(state.snapshot().is_alive());
+    }
+
+    #[test]
     fn snapshot_reports_live_asteroid_count_after_each_tick() {
         let mut game = GameLoop::new_seeded(Some(1));
         let mut snapshots = Vec::new();
@@ -816,17 +1293,13 @@ mod tests {
         assert_eq!(snapshots[0].asteroid_count, 4);
     }
 
+    fn empty_test_state() -> GameState {
+        GameState::empty_seeded(Some(7))
+    }
+
     fn state_with_one_asteroid(size: AsteroidSize) -> GameState {
-        let mut state = GameState {
-            ship: ShipState::default(),
-            alive: true,
-            score: 0,
-            asteroid_count: 0,
-            round: 1,
-            asteroids: Vec::new(),
-            next_asteroid_id: 2,
-            rng: rng_for_seed(Some(7)),
-        };
+        let mut state = empty_test_state();
+        state.next_asteroid_id = 2;
         state.asteroids.push(Asteroid::new(
             1,
             size,

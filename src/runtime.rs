@@ -171,7 +171,7 @@ pub async fn run_automated(config: &RuntimeConfig) -> Result<(), String> {
     let mut frame_time_log = optional_writer(config.frame_time_log.as_deref())?;
     let mut state_log = optional_writer(config.state_log.as_deref())?;
     let mut tick_state = TickState::new(config.seed);
-    let mut game_loop = GameLoop::new_seeded(config.seed);
+    let mut game_loop = game_loop_for_scenario(config.scenario, config.seed);
 
     if let Some(writer) = state_log.as_mut() {
         write_state_event(writer, &mut tick_state, config, "scenario-start")?;
@@ -382,7 +382,22 @@ fn enqueue_audio_msg(
 }
 
 pub fn runtime_usage() -> String {
-    "Usage: asteroids [--headless] [--screenshot <path>] [--capture-frames <N> --frames-out <dir>] [--audio-capture <secs> --wav-out <path>] [--seed <u64>] [--fixed-dt <secs>] [--simulate-secs <secs>] [--scenario <name>] [--xrun-log <path>] [--frame-time-log <path>] [--state-log <path>] [--bloom-intensity <value>] [--bloom-threshold <value>]\n\nScenarios: demo, idle, ship-spinning, horizontal-sweep, static-bright-line, static-bright-line-low-dwell, static-bright-line-high-dwell, gamma-ramp, thrust-1s, ship-spinning-with-thrust, heavy-input, asteroids-round-1".to_string()
+    "Usage: asteroids [--headless] [--screenshot <path>] [--capture-frames <N> --frames-out <dir>] [--audio-capture <secs> --wav-out <path>] [--seed <u64>] [--fixed-dt <secs>] [--simulate-secs <secs>] [--scenario <name>] [--xrun-log <path>] [--frame-time-log <path>] [--state-log <path>] [--bloom-intensity <value>] [--bloom-threshold <value>]\n\nScenarios: demo, idle, ship-spinning, horizontal-sweep, static-bright-line, static-bright-line-low-dwell, static-bright-line-high-dwell, gamma-ramp, thrust-1s, ship-spinning-with-thrust, heavy-input, asteroids-round-1, bullet-hit-asteroid, ship-collides-with-asteroid, lose-all-lives".to_string()
+}
+
+fn game_loop_for_scenario(scenario: Scenario, seed: Option<u64>) -> GameLoop {
+    match scenario {
+        Scenario::BulletHitAsteroid => {
+            GameLoop::from_state(game::GameState::bullet_hit_asteroid_scenario(seed))
+        }
+        Scenario::ShipCollidesWithAsteroid => {
+            GameLoop::from_state(game::GameState::ship_collides_with_asteroid_scenario(seed))
+        }
+        Scenario::LoseAllLives => {
+            GameLoop::from_state(game::GameState::lose_all_lives_scenario(seed))
+        }
+        _ => GameLoop::new_seeded(seed),
+    }
 }
 
 fn render_tick(
@@ -408,8 +423,12 @@ fn render_tick(
         substeps = report.substeps;
         dropped_accumulator_seconds = report.dropped_accumulator_seconds;
         params = params
-            .with_ship(game_loop.interpolated_ship())
-            .with_asteroids(game_loop.interpolated_asteroids());
+            .with_asteroids(game_loop.interpolated_asteroids())
+            .with_bullets(game_loop.interpolated_bullets())
+            .with_game_over(game_loop.current().game_over);
+        if let Some(ship) = game_loop.interpolated_ship_if_alive() {
+            params = params.with_ship(ship);
+        }
     }
 
     renderer.render(params)?;
@@ -429,6 +448,11 @@ fn render_tick(
             substeps,
             dropped_accumulator_seconds,
         )?;
+        for event in game_loop.drain_events() {
+            write_state_event(writer, tick_state, config, event.name())?;
+        }
+    } else {
+        let _ = game_loop.drain_events();
     }
     Ok(())
 }
@@ -442,6 +466,10 @@ struct TickIo<'a> {
 fn scripted_controls(scenario: Scenario, time_seconds: f32) -> ControlState {
     match scenario {
         Scenario::HeavyInput => game::heavy_input_controls(time_seconds),
+        Scenario::BulletHitAsteroid => ControlState {
+            fire: time_seconds < 0.02,
+            ..ControlState::default()
+        },
         _ => ControlState::default(),
     }
 }
@@ -489,6 +517,7 @@ fn write_state_tick_event(
             ship_vx = state.ship.velocity.x,
             ship_vy = state.ship.velocity.y,
         )?;
+        write_gameplay_fields(writer, state)?;
         write_asteroid_fields(writer, state)?;
         writeln!(writer, "}}")
     })()
@@ -510,10 +539,43 @@ fn write_frame_metadata(
             config.seed.unwrap_or(0),
             game_loop.tick(),
         )?;
+        write_gameplay_fields(writer, state)?;
         write_asteroid_fields(writer, state)?;
         writeln!(writer, "}}")
     })()
     .map_err(|error| format!("failed to write frame metadata: {error}"))
+}
+
+fn write_gameplay_fields(
+    writer: &mut BufWriter<File>,
+    state: &game::GameState,
+) -> std::io::Result<()> {
+    write!(
+        writer,
+        ",\"alive\":{},\"lives\":{},\"game_over\":{},\"bullet_count\":{},\"bullet_wrapped\":{},\"bullets\":[",
+        state.alive,
+        state.lives,
+        state.game_over,
+        state.bullets.len(),
+        state.any_bullet_wrapped_last_tick(),
+    )?;
+    for (index, bullet) in state.bullets.iter().enumerate() {
+        if index > 0 {
+            write!(writer, ",")?;
+        }
+        write!(
+            writer,
+            "{{\"id\":{},\"x\":{:.6},\"y\":{:.6},\"vx\":{:.6},\"vy\":{:.6},\"age\":{:.6},\"wrapped\":{}}}",
+            bullet.id,
+            bullet.position.x,
+            bullet.position.y,
+            bullet.velocity.x,
+            bullet.velocity.y,
+            bullet.age_seconds,
+            bullet.wrapped_last_tick,
+        )?;
+    }
+    write!(writer, "]")
 }
 
 fn write_asteroid_fields(
@@ -772,5 +834,23 @@ mod tests {
 
         assert_eq!(config.scenario, Scenario::AsteroidsRound1);
         assert!(config.scenario.uses_game_simulation());
+    }
+
+    #[test]
+    fn parses_gameplay_verification_scenarios() {
+        for name in [
+            "bullet-hit-asteroid",
+            "ship-collides-with-asteroid",
+            "lose-all-lives",
+        ] {
+            let config = RuntimeConfig::from_args(
+                ["--headless", "--scenario", name]
+                    .into_iter()
+                    .map(str::to_string),
+            )
+            .unwrap();
+
+            assert!(config.scenario.uses_game_simulation());
+        }
     }
 }

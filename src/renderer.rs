@@ -11,7 +11,7 @@ use winit::{dpi::PhysicalSize, window::Window};
 
 use crate::{
     beam::{self, BeamCommand, BeamEmitter, BeamVertex, Vec2},
-    game::{ASTEROID_HULL_VERTEX_COUNT, RenderAsteroid, RenderShip},
+    game::{ASTEROID_HULL_VERTEX_COUNT, RenderAsteroid, RenderBullet, RenderShip},
     tuning,
 };
 
@@ -30,6 +30,9 @@ pub enum Scenario {
     ShipSpinningWithThrust,
     HeavyInput,
     AsteroidsRound1,
+    BulletHitAsteroid,
+    ShipCollidesWithAsteroid,
+    LoseAllLives,
 }
 
 impl Scenario {
@@ -47,6 +50,9 @@ impl Scenario {
             "ship-spinning-with-thrust" => Some(Self::ShipSpinningWithThrust),
             "heavy-input" => Some(Self::HeavyInput),
             "asteroids-round-1" => Some(Self::AsteroidsRound1),
+            "bullet-hit-asteroid" => Some(Self::BulletHitAsteroid),
+            "ship-collides-with-asteroid" => Some(Self::ShipCollidesWithAsteroid),
+            "lose-all-lives" => Some(Self::LoseAllLives),
             _ => None,
         }
     }
@@ -65,11 +71,21 @@ impl Scenario {
             Self::ShipSpinningWithThrust => "ship-spinning-with-thrust",
             Self::HeavyInput => "heavy-input",
             Self::AsteroidsRound1 => "asteroids-round-1",
+            Self::BulletHitAsteroid => "bullet-hit-asteroid",
+            Self::ShipCollidesWithAsteroid => "ship-collides-with-asteroid",
+            Self::LoseAllLives => "lose-all-lives",
         }
     }
 
     pub fn uses_game_simulation(self) -> bool {
-        matches!(self, Self::HeavyInput | Self::AsteroidsRound1)
+        matches!(
+            self,
+            Self::HeavyInput
+                | Self::AsteroidsRound1
+                | Self::BulletHitAsteroid
+                | Self::ShipCollidesWithAsteroid
+                | Self::LoseAllLives
+        )
     }
 }
 
@@ -80,6 +96,8 @@ pub struct FrameParams {
     pub frame_dt_seconds: f32,
     pub ship: Option<RenderShip>,
     pub asteroids: Vec<RenderAsteroid>,
+    pub bullets: Vec<RenderBullet>,
+    pub game_over: bool,
 }
 
 impl FrameParams {
@@ -90,6 +108,8 @@ impl FrameParams {
             frame_dt_seconds,
             ship: None,
             asteroids: Vec::new(),
+            bullets: Vec::new(),
+            game_over: false,
         }
     }
 
@@ -100,6 +120,16 @@ impl FrameParams {
 
     pub fn with_asteroids(mut self, asteroids: Vec<RenderAsteroid>) -> Self {
         self.asteroids = asteroids;
+        self
+    }
+
+    pub fn with_bullets(mut self, bullets: Vec<RenderBullet>) -> Self {
+        self.bullets = bullets;
+        self
+    }
+
+    pub fn with_game_over(mut self, game_over: bool) -> Self {
+        self.game_over = game_over;
         self
     }
 }
@@ -330,10 +360,7 @@ impl Renderer {
         emit_frame_beams(
             &mut self.beam_emitter,
             &mut self.gameplay_beam_emitter,
-            params.scenario,
-            params.time_seconds,
-            params.ship,
-            &params.asteroids,
+            &params,
             self.size,
         );
 
@@ -532,10 +559,7 @@ impl HeadlessRenderer {
         emit_frame_beams(
             &mut self.beam_emitter,
             &mut self.gameplay_beam_emitter,
-            params.scenario,
-            params.time_seconds,
-            params.ship,
-            &params.asteroids,
+            &params,
             self.size,
         );
 
@@ -855,10 +879,7 @@ impl NdcRect {
 fn emit_frame_beams(
     frame_emitter: &mut BeamEmitter,
     gameplay_emitter: &mut BeamEmitter,
-    scenario: Scenario,
-    time_s: f32,
-    ship: Option<RenderShip>,
-    asteroids: &[RenderAsteroid],
+    params: &FrameParams,
     size: PhysicalSize<u32>,
 ) {
     let playfield = PlayfieldRect::centered_4_3(size);
@@ -867,17 +888,26 @@ fn emit_frame_beams(
     gameplay_emitter.clear();
 
     emit_bezel_readouts(frame_emitter, playfield, size);
-    if let Some(ship) = ship {
-        for asteroid in asteroids {
+    if let Some(ship) = params.ship {
+        for asteroid in &params.asteroids {
             emit_asteroid_outline(gameplay_emitter, *asteroid);
+        }
+        for bullet in &params.bullets {
+            emit_bullet_dot(gameplay_emitter, *bullet);
         }
         emit_ship_outline(gameplay_emitter, ship.position, ship.angle, ship.scale, 1.0);
-    } else if !asteroids.is_empty() {
-        for asteroid in asteroids {
+    } else if !params.asteroids.is_empty() || !params.bullets.is_empty() || params.game_over {
+        for asteroid in &params.asteroids {
             emit_asteroid_outline(gameplay_emitter, *asteroid);
         }
+        for bullet in &params.bullets {
+            emit_bullet_dot(gameplay_emitter, *bullet);
+        }
+        if params.game_over {
+            emit_game_over_text(gameplay_emitter);
+        }
     } else {
-        emit_scenario_beams(gameplay_emitter, scenario, time_s);
+        emit_scenario_beams(gameplay_emitter, params.scenario, params.time_seconds);
     }
 
     for command in gameplay_emitter.commands() {
@@ -1014,9 +1044,12 @@ fn emit_scenario_beams(emitter: &mut BeamEmitter, scenario: Scenario, time_s: f3
             emit_static_bright_line(emitter, tuning::PHOSPHOR_TRAIL_HIGH_DWELL_US)
         }
         Scenario::GammaRamp => emit_gamma_ramp_beams(emitter),
-        Scenario::Thrust1s | Scenario::HeavyInput | Scenario::AsteroidsRound1 => {
-            emit_idle_beams(emitter)
-        }
+        Scenario::Thrust1s
+        | Scenario::HeavyInput
+        | Scenario::AsteroidsRound1
+        | Scenario::BulletHitAsteroid
+        | Scenario::ShipCollidesWithAsteroid
+        | Scenario::LoseAllLives => emit_idle_beams(emitter),
     }
 }
 
@@ -1102,6 +1135,97 @@ fn emit_asteroid_outline(emitter: &mut BeamEmitter, asteroid: RenderAsteroid) {
         let start = vertices[index];
         let end = vertices[(index + 1) % vertices.len()];
         emitter.emit_asteroid_hull_segment(start, end, 1.0);
+    }
+}
+
+fn emit_bullet_dot(emitter: &mut BeamEmitter, bullet: RenderBullet) {
+    emitter.emit_bullet_dot(bullet.position, bullet.radius, 1.0);
+}
+
+fn emit_game_over_text(emitter: &mut BeamEmitter) {
+    let text = "GAME OVER";
+    let glyph_width = 0.105;
+    let glyph_height = 0.16;
+    let gap = 0.028;
+    let total_width = text.chars().fold(0.0, |width, ch| {
+        width
+            + if ch == ' ' {
+                glyph_width * 0.55
+            } else {
+                glyph_width
+            }
+            + gap
+    }) - gap;
+    let mut x = -total_width * 0.5;
+    for ch in text.chars() {
+        if ch == ' ' {
+            x += glyph_width * 0.55 + gap;
+            continue;
+        }
+        emit_block_glyph(
+            emitter,
+            ch,
+            Vec2::new(x, -glyph_height * 0.5),
+            Vec2::new(glyph_width, glyph_height),
+        );
+        x += glyph_width + gap;
+    }
+}
+
+fn emit_block_glyph(emitter: &mut BeamEmitter, ch: char, origin: Vec2, size: Vec2) {
+    let x0 = origin.x;
+    let x1 = origin.x + size.x;
+    let y0 = origin.y;
+    let y1 = origin.y + size.y;
+    let ym = (y0 + y1) * 0.5;
+    let xm = (x0 + x1) * 0.5;
+    let segments = match ch {
+        'A' => vec![
+            (Vec2::new(x0, y0), Vec2::new(x0, y1)),
+            (Vec2::new(x1, y0), Vec2::new(x1, y1)),
+            (Vec2::new(x0, y1), Vec2::new(x1, y1)),
+            (Vec2::new(x0, ym), Vec2::new(x1, ym)),
+        ],
+        'E' => vec![
+            (Vec2::new(x0, y0), Vec2::new(x0, y1)),
+            (Vec2::new(x0, y1), Vec2::new(x1, y1)),
+            (Vec2::new(x0, ym), Vec2::new(x0 + size.x * 0.96, ym)),
+            (Vec2::new(x0, y0), Vec2::new(x1, y0)),
+        ],
+        'G' => vec![
+            (Vec2::new(x1, y1), Vec2::new(x0, y1)),
+            (Vec2::new(x0, y1), Vec2::new(x0, y0)),
+            (Vec2::new(x0, y0), Vec2::new(x1, y0)),
+            (Vec2::new(x1, y0), Vec2::new(x1, ym)),
+            (Vec2::new(xm, ym), Vec2::new(x1, ym)),
+        ],
+        'M' => vec![
+            (Vec2::new(x0, y0), Vec2::new(x0, y1)),
+            (Vec2::new(x0, y1), Vec2::new(xm, ym)),
+            (Vec2::new(xm, ym), Vec2::new(x1, y1)),
+            (Vec2::new(x1, y1), Vec2::new(x1, y0)),
+        ],
+        'O' => vec![
+            (Vec2::new(x0, y0), Vec2::new(x0, y1)),
+            (Vec2::new(x0, y1), Vec2::new(x1, y1)),
+            (Vec2::new(x1, y1), Vec2::new(x1, y0)),
+            (Vec2::new(x1, y0), Vec2::new(x0, y0)),
+        ],
+        'R' => vec![
+            (Vec2::new(x0, y0), Vec2::new(x0, y1)),
+            (Vec2::new(x0, y1), Vec2::new(x1, y1)),
+            (Vec2::new(x1, y1), Vec2::new(x1, ym)),
+            (Vec2::new(x1, ym), Vec2::new(x0, ym)),
+            (Vec2::new(x0, ym), Vec2::new(x1, y0)),
+        ],
+        'V' => vec![
+            (Vec2::new(x0, y1), Vec2::new(xm, y0)),
+            (Vec2::new(xm, y0), Vec2::new(x1, y1)),
+        ],
+        _ => Vec::new(),
+    };
+    for (start, end) in segments {
+        emitter.emit_ship_outline_segment_with_endpoint_bonus(start, end, 0.9);
     }
 }
 

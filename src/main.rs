@@ -431,10 +431,14 @@ impl ApplicationHandler for AsteroidsApp {
                         let _ = sender.try_push(AudioMsg::GameState(snapshot));
                     }
                 });
-                let params =
+                let mut params =
                     FrameParams::new(Scenario::Idle, self.game.render_time_seconds(), frame_dt)
-                        .with_ship(self.game.interpolated_ship())
-                        .with_asteroids(self.game.interpolated_asteroids());
+                        .with_asteroids(self.game.interpolated_asteroids())
+                        .with_bullets(self.game.interpolated_bullets())
+                        .with_game_over(self.game.current().game_over);
+                if let Some(ship) = self.game.interpolated_ship_if_alive() {
+                    params = params.with_ship(ship);
+                }
 
                 if let Some(window) = self.window.as_ref() {
                     window.pre_present_notify();
