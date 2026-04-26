@@ -1766,13 +1766,13 @@ struct PhosphorBlendUniforms {
 
 impl PhosphorBlendUniforms {
     fn new(frame_dt_seconds: f32, tau_seconds: f32, max_luma: f32) -> Self {
+        let tau_seconds = if tau_seconds.is_finite() && tau_seconds > 0.0 {
+            tau_seconds
+        } else {
+            0.0
+        };
         Self {
-            frame_dt_tau_max_luma: [
-                frame_dt_seconds.max(0.0),
-                tau_seconds.max(0.0001),
-                max_luma,
-                0.0,
-            ],
+            frame_dt_tau_max_luma: [frame_dt_seconds.max(0.0), tau_seconds, max_luma, 0.0],
         }
     }
 }
@@ -3065,9 +3065,12 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let previous = textureLoad(previous_phosphor, coord, 0).rgb;
     let beam = textureLoad(current_beam, coord, 0).rgb;
     let frame_dt = max(phosphor.frame_dt_tau_max_luma.x, 0.0);
-    let tau = max(phosphor.frame_dt_tau_max_luma.y, 0.0001);
+    let tau = phosphor.frame_dt_tau_max_luma.y;
     let max_luma = phosphor.frame_dt_tau_max_luma.z;
-    let decay = exp(-frame_dt / tau);
+    var decay = 0.0;
+    if tau > 0.0 {
+        decay = exp(-frame_dt / max(tau, 0.000001));
+    }
     let combined = clamp(beam + previous * decay, vec3<f32>(0.0), vec3<f32>(max_luma));
 
     return vec4<f32>(combined, 1.0);
@@ -3332,5 +3335,12 @@ mod tests {
         assert_eq!(score_digits(0), [0, 0, 0, 0, 0, 0]);
         assert_eq!(score_digits(20_990), [0, 2, 0, 9, 9, 0]);
         assert_eq!(score_digits(1_234_567), [2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn zero_phosphor_tau_reaches_shader_uniform() {
+        let uniforms = PhosphorBlendUniforms::new(1.0 / 144.0, 0.0, tuning::PHOSPHOR_MAX_LUMA);
+
+        assert_eq!(uniforms.frame_dt_tau_max_luma[1], 0.0);
     }
 }

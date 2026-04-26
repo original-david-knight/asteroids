@@ -60,10 +60,11 @@ pub const PHOSPHOR_TRAIL_LOW_DWELL_US: f32 = 10.0;
 pub const PHOSPHOR_TRAIL_MID_DWELL_US: f32 = SHIP_OUTLINE_SEGMENT_DWELL_US;
 pub const PHOSPHOR_TRAIL_HIGH_DWELL_US: f32 = 60.0;
 
-/// Final v1 phosphor decay time constant. Kept inside the 50-100ms DESIGN
-/// band after decay-fit and soul-visible captures.
-pub const PHOSPHOR_TAU_DEFAULT_MS: f32 = 70.0;
-pub const PHOSPHOR_TAU_MIN_MS: f32 = 50.0;
+/// Phosphor history is disabled by default so moving gameplay objects render
+/// only at their current positions. Debug controls can raise this for decay
+/// verification and intentional trail captures.
+pub const PHOSPHOR_TAU_DEFAULT_MS: f32 = 0.0;
+pub const PHOSPHOR_TAU_MIN_MS: f32 = 0.0;
 pub const PHOSPHOR_TAU_MAX_MS: f32 = 100.0;
 pub const PHOSPHOR_TAU_STEP_MS: f32 = 5.0;
 pub const PHOSPHOR_MAX_LUMA: f32 = 8.0;
