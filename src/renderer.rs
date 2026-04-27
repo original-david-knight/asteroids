@@ -12,8 +12,8 @@ use winit::{dpi::PhysicalSize, window::Window};
 use crate::{
     beam::{self, BeamCommand, BeamEmitter, BeamVertex, Vec2},
     game::{
-        ASTEROID_HULL_VERTEX_COUNT, AsteroidSize, INITIAL_LIVES, RenderAsteroid, RenderBullet,
-        RenderShip, RenderUfo, displayed_lives, ufo_outline_segments,
+        AsteroidSize, INITIAL_LIVES, RenderAsteroid, RenderBullet, RenderShip, RenderUfo,
+        displayed_lives, ufo_outline_segments,
     },
     tuning,
 };
@@ -1331,14 +1331,19 @@ fn emit_ship_outline(
 }
 
 fn emit_asteroid_outline(emitter: &mut BeamEmitter, asteroid: RenderAsteroid, local_x_scale: f32) {
-    let hull_vertices = asteroid.hull.vertices();
-    let vertices: [Vec2; ASTEROID_HULL_VERTEX_COUNT] = std::array::from_fn(|index| {
-        asteroid.position
-            + aspect_correct_local(hull_vertices[index] * asteroid.radius, local_x_scale)
-    });
-    for index in 0..vertices.len() {
-        let start = vertices[index];
-        let end = vertices[(index + 1) % vertices.len()];
+    let mut first = None;
+    let mut previous = None;
+    for local in asteroid.hull.vertices().iter().copied() {
+        let point =
+            asteroid.position + aspect_correct_local(local * asteroid.radius, local_x_scale);
+        if let Some(start) = previous {
+            emitter.emit_asteroid_hull_segment(start, point, 1.0);
+        } else {
+            first = Some(point);
+        }
+        previous = Some(point);
+    }
+    if let (Some(start), Some(end)) = (previous, first) {
         emitter.emit_asteroid_hull_segment(start, end, 1.0);
     }
 }

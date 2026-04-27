@@ -1,4 +1,4 @@
-use std::{array, f32::consts::TAU};
+use std::f32::consts::TAU;
 
 use crate::{
     audio::GameSnapshot,
@@ -47,7 +47,8 @@ pub const MAX_DISPLAYED_LIVES: u32 = 6;
 pub const ASTEROIDS_PER_WAVE_BOOTSTRAP: u32 = 2;
 pub const ASTEROIDS_PER_WAVE_INCREMENT: u32 = 2;
 pub const ASTEROIDS_PER_WAVE_MAX: u32 = 11;
-pub const ASTEROID_HULL_VERTEX_COUNT: usize = 10;
+pub const ASTEROID_HULL_VERTEX_COUNT: usize = 12;
+pub const ASTEROID_ORIGINAL_PATTERN_COUNT: usize = 4;
 pub const INITIAL_LIVES: u32 = 3;
 pub const BULLET_SPEED_NDC_PER_SEC: f32 = 1.65;
 pub const BULLET_RADIUS_NDC: f32 = 0.012;
@@ -60,6 +61,13 @@ pub const PLAYER_SHOT_TIMER_TICK_SECONDS: f32 = 4.0 / tuning::ASTEROID_ORIGINAL_
 pub const BULLET_LIFETIME_SECONDS: f32 =
     PLAYER_SHOT_TIMER_RELOAD_TICKS * PLAYER_SHOT_TIMER_TICK_SECONDS;
 pub const SHIP_COLLISION_RADIUS_NDC: f32 = 0.44 * tuning::SHIP_GAMEPLAY_SCALE;
+/// Original hit detection compares object deltas after reducing raw object
+/// coordinates to one quarter visible-game units.
+const ORIGINAL_COLLISION_BYTE_TO_NDC: f32 = 0.25 * tuning::ASTEROID_ORIGINAL_VISIBLE_UNITS_TO_NDC;
+const ASTEROID_SMALL_ORIGINAL_HITBOX_NDC: f32 = 42.0 * ORIGINAL_COLLISION_BYTE_TO_NDC;
+const ASTEROID_MEDIUM_ORIGINAL_HITBOX_NDC: f32 = 72.0 * ORIGINAL_COLLISION_BYTE_TO_NDC;
+const ASTEROID_LARGE_ORIGINAL_HITBOX_NDC: f32 = 132.0 * ORIGINAL_COLLISION_BYTE_TO_NDC;
+const SHIP_ORIGINAL_HITBOX_ADDITION_NDC: f32 = 28.0 * ORIGINAL_COLLISION_BYTE_TO_NDC;
 pub const SHIP_RESPAWN_DELAY_SECONDS: f32 = 1.25;
 pub const SHIP_RESPAWN_INVULNERABILITY_SECONDS: f32 = 1.25;
 pub const LEVEL_START_ASTEROID_DELAY_SECONDS: f32 = 1.0;
@@ -80,8 +88,23 @@ const PLAYER_SHOT_COMPONENT_SPEED_MAX_NDC_PER_SEC: f32 =
 const UFO_SPAWN_RELOAD_INITIAL_TICKS: u32 = 0x92;
 const UFO_SPAWN_RELOAD_DECREMENT_TICKS: u32 = 0x06;
 const UFO_SPAWN_RELOAD_MIN_TICKS: u32 = 0x20;
+/// Gameplay pacing multiplier over the original saucer reload timer.
+const UFO_SPAWN_INTERVAL_SCALE: f32 = 4.0;
 const UFO_SMALL_VARIANT_CHECK_RELOAD_TICKS: u32 = 0x80;
+const UFO_FIRST_SHOT_RELOAD_TICKS: u32 = 0x12;
 const UFO_SHOT_RELOAD_TICKS: u32 = 0x0A;
+/// Original small-saucer shot error at $6CAC-$6CC2: below 35,000 points the
+/// random direction offset is +/-16 direction bytes; from 35,000 it tightens
+/// to +/-8 direction bytes.
+const UFO_AIM_HIGH_SCORE_THRESHOLD: u32 = 35_000;
+const UFO_AIM_LOW_SCORE_RANDOM_MASK: u8 = 0x8F;
+const UFO_AIM_HIGH_SCORE_RANDOM_MASK: u8 = 0x87;
+const UFO_AIM_LOW_SCORE_NEGATIVE_OR: u8 = 0x70;
+const UFO_AIM_HIGH_SCORE_NEGATIVE_OR: u8 = 0x78;
+/// Small gameplay tuning over the arcade's raw offset. A direction byte is
+/// 360/256 degrees, so this changes the original max error from 22.5/11.25
+/// degrees to roughly 45.0/22.5 degrees.
+const UFO_SMALL_AIM_ERROR_SCALE: f32 = 2.0;
 const UFO_DIRECTION_CHANGE_SECONDS: f32 = 128.0 / tuning::ASTEROID_ORIGINAL_FPS;
 const UFO_EDGE_MARGIN_NDC: f32 = 0.12;
 const UFO_VERTICAL_BOUND_NDC: f32 = 0.86;
@@ -89,6 +112,10 @@ const UFO_LARGE_RADIUS_NDC: f32 = 0.092;
 const UFO_SMALL_RADIUS_NDC: f32 = 0.062;
 const UFO_RAW_HORIZONTAL_SPEED: f32 = 16.0;
 const UFO_RAW_VERTICAL_SPEEDS: [f32; 4] = [-16.0, 0.0, 0.0, 16.0];
+/// The arcade small-saucer aim subtracts half the saucer velocity after
+/// multiplying the ship/saucer position delta by four. In this NDC port that
+/// is approximately 0.4 seconds of saucer travel.
+const UFO_SMALL_AIM_VELOCITY_BIAS_SECONDS: f32 = 0.4;
 pub const UFO_OUTLINE_SEGMENT_COUNT: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -151,6 +178,14 @@ impl AsteroidSize {
         self.original_radius_units() * tuning::ASTEROID_ORIGINAL_VISIBLE_UNITS_TO_NDC
     }
 
+    pub fn original_hitbox_ndc(self) -> f32 {
+        match self {
+            Self::Large => ASTEROID_LARGE_ORIGINAL_HITBOX_NDC,
+            Self::Medium => ASTEROID_MEDIUM_ORIGINAL_HITBOX_NDC,
+            Self::Small => ASTEROID_SMALL_ORIGINAL_HITBOX_NDC,
+        }
+    }
+
     pub fn next_smaller(self) -> Option<Self> {
         match self {
             Self::Large => Some(Self::Medium),
@@ -179,32 +214,24 @@ impl AsteroidSize {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AsteroidHull {
     vertices: [Vec2; ASTEROID_HULL_VERTEX_COUNT],
+    vertex_count: usize,
 }
 
 impl AsteroidHull {
     fn random(rng: &mut SeededRng) -> Self {
-        let step = TAU / ASTEROID_HULL_VERTEX_COUNT as f32;
-        let vertices = array::from_fn(|index| {
-            let angle = index as f32 * step + (rng.next_f32() - 0.5) * step * 0.36;
-            let radius = 0.78 + rng.next_f32() * 0.40;
-            let (sin, cos) = angle.sin_cos();
-            Vec2::new(cos, sin) * radius
-        });
-        Self { vertices }
+        Self::original_pattern((rng.next_u64() as usize) & (ASTEROID_ORIGINAL_PATTERN_COUNT - 1))
     }
 
     fn regular() -> Self {
-        let step = TAU / ASTEROID_HULL_VERTEX_COUNT as f32;
-        Self {
-            vertices: array::from_fn(|index| {
-                let (sin, cos) = (index as f32 * step).sin_cos();
-                Vec2::new(cos, sin)
-            }),
-        }
+        Self::original_pattern(0)
     }
 
-    pub fn vertices(&self) -> &[Vec2; ASTEROID_HULL_VERTEX_COUNT] {
-        &self.vertices
+    fn original_pattern(index: usize) -> Self {
+        ORIGINAL_ASTEROID_HULLS[index % ASTEROID_ORIGINAL_PATTERN_COUNT]
+    }
+
+    pub fn vertices(&self) -> &[Vec2] {
+        &self.vertices[..self.vertex_count]
     }
 }
 
@@ -213,6 +240,80 @@ impl Default for AsteroidHull {
         Self::regular()
     }
 }
+
+/// Four asteroid outlines from the original Vector ROM rock pattern table.
+/// The first dark SVEC in each pattern positions the beam; the points below are
+/// the cumulative drawn endpoints, normalized by the original +/-32 local span.
+const ORIGINAL_ASTEROID_HULLS: [AsteroidHull; ASTEROID_ORIGINAL_PATTERN_COUNT] = [
+    AsteroidHull {
+        vertex_count: 10,
+        vertices: [
+            Vec2::new(0.0, 0.5),
+            Vec2::new(0.5, 1.0),
+            Vec2::new(1.0, 0.5),
+            Vec2::new(0.75, 0.0),
+            Vec2::new(1.0, -0.5),
+            Vec2::new(0.25, -1.0),
+            Vec2::new(-0.5, -1.0),
+            Vec2::new(-1.0, -0.5),
+            Vec2::new(-1.0, 0.5),
+            Vec2::new(-0.5, 1.0),
+            Vec2::ZERO,
+            Vec2::ZERO,
+        ],
+    },
+    AsteroidHull {
+        vertex_count: 12,
+        vertices: [
+            Vec2::new(0.5, 0.25),
+            Vec2::new(1.0, 0.5),
+            Vec2::new(0.5, 1.0),
+            Vec2::new(0.0, 0.75),
+            Vec2::new(-0.5, 1.0),
+            Vec2::new(-1.0, 0.5),
+            Vec2::new(-0.75, 0.0),
+            Vec2::new(-1.0, -0.5),
+            Vec2::new(-0.5, -1.0),
+            Vec2::new(-0.25, -0.75),
+            Vec2::new(0.5, -1.0),
+            Vec2::new(1.0, -0.25),
+        ],
+    },
+    AsteroidHull {
+        vertex_count: 11,
+        vertices: [
+            Vec2::new(-0.5, 0.0),
+            Vec2::new(-1.0, -0.25),
+            Vec2::new(-0.5, -1.0),
+            Vec2::new(0.0, -0.25),
+            Vec2::new(0.0, -1.0),
+            Vec2::new(0.5, -1.0),
+            Vec2::new(1.0, -0.25),
+            Vec2::new(1.0, 0.25),
+            Vec2::new(0.5, 1.0),
+            Vec2::new(-0.25, 1.0),
+            Vec2::new(-1.0, 0.25),
+            Vec2::ZERO,
+        ],
+    },
+    AsteroidHull {
+        vertex_count: 12,
+        vertices: [
+            Vec2::new(0.25, 0.0),
+            Vec2::new(1.0, 0.25),
+            Vec2::new(1.0, 0.5),
+            Vec2::new(0.25, 1.0),
+            Vec2::new(-0.5, 1.0),
+            Vec2::new(-0.25, 0.5),
+            Vec2::new(-1.0, 0.5),
+            Vec2::new(-1.0, -0.25),
+            Vec2::new(-0.5, -1.0),
+            Vec2::new(0.25, -0.75),
+            Vec2::new(0.5, -1.0),
+            Vec2::new(1.0, -0.5),
+        ],
+    },
+];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Asteroid {
@@ -404,7 +505,7 @@ impl Ufo {
             variant,
             position,
             velocity,
-            shot_timer_seconds: UFO_ORIGINAL_TIMER_TICK_SECONDS,
+            shot_timer_seconds: ufo_first_shot_interval_seconds(),
             direction_timer_seconds: UFO_DIRECTION_CHANGE_SECONDS,
         }
     }
@@ -1183,6 +1284,7 @@ impl GameState {
     fn update_active_ufo(&mut self, dt: f32) {
         let mut shot_request = None;
         let mut should_despawn = false;
+        let saucer_can_shoot = self.alive && !self.game_over;
         if let Some(ufo) = self.ufo.as_mut() {
             ufo.integrate(dt);
             ufo.direction_timer_seconds -= dt;
@@ -1190,16 +1292,19 @@ impl GameState {
                 ufo.velocity.y = random_ufo_vertical_velocity(&mut self.rng);
                 ufo.direction_timer_seconds += UFO_DIRECTION_CHANGE_SECONDS;
             }
-            ufo.shot_timer_seconds -= dt;
-            if ufo.shot_timer_seconds <= 0.0 {
-                shot_request = Some((ufo.variant, ufo.position, ufo.radius_ndc()));
-                ufo.shot_timer_seconds += ufo_shot_interval_seconds();
+            if saucer_can_shoot {
+                ufo.shot_timer_seconds -= dt;
+                if ufo.shot_timer_seconds <= 0.0 {
+                    shot_request =
+                        Some((ufo.variant, ufo.position, ufo.velocity, ufo.radius_ndc()));
+                    ufo.shot_timer_seconds += ufo_shot_interval_seconds();
+                }
             }
             should_despawn = ufo.is_offscreen();
         }
 
-        if let Some((variant, position, radius)) = shot_request {
-            self.fire_ufo_bullet(variant, position, radius);
+        if let Some((variant, position, velocity, radius)) = shot_request {
+            self.fire_ufo_bullet(variant, position, velocity, radius);
         }
         if should_despawn {
             self.clear_ufo(GameEventKind::UfoDespawned, false);
@@ -1244,12 +1349,22 @@ impl GameState {
         ufo_variant_for_spawn(self.score, self.ufo_spawn_reload_ticks, self.rng.next_f32())
     }
 
-    fn fire_ufo_bullet(&mut self, variant: UfoVariant, ufo_position: Vec2, ufo_radius: f32) {
+    fn fire_ufo_bullet(
+        &mut self,
+        variant: UfoVariant,
+        ufo_position: Vec2,
+        ufo_velocity: Vec2,
+        ufo_radius: f32,
+    ) {
         let direction = match variant {
             UfoVariant::Large => random_direction(&mut self.rng),
-            UfoVariant::Small => {
-                wrapped_delta(self.ship.position, ufo_position).normalized_or(Vec2::X)
-            }
+            UfoVariant::Small => small_ufo_shot_direction(
+                self.ship.position,
+                ufo_position,
+                ufo_velocity,
+                self.score,
+                random_byte(&mut self.rng),
+            ),
         };
         let id = self.allocate_bullet_id();
         let position = wrap_position(ufo_position + direction * (ufo_radius + BULLET_RADIUS_NDC));
@@ -1301,14 +1416,7 @@ impl GameState {
             let hit_asteroid_id = self
                 .asteroids
                 .iter()
-                .find(|asteroid| {
-                    playfield_circles_overlap(
-                        bullet.position,
-                        BULLET_RADIUS_NDC,
-                        asteroid.position,
-                        asteroid.radius_ndc(),
-                    )
-                })
+                .find(|asteroid| playfield_point_asteroid_hitbox_overlap(bullet.position, asteroid))
                 .map(|asteroid| asteroid.id);
 
             if let Some(asteroid_id) = hit_asteroid_id {
@@ -1327,14 +1435,7 @@ impl GameState {
             let hit_asteroid_id = self
                 .asteroids
                 .iter()
-                .find(|asteroid| {
-                    playfield_circles_overlap(
-                        bullet.position,
-                        BULLET_RADIUS_NDC,
-                        asteroid.position,
-                        asteroid.radius_ndc(),
-                    )
-                })
+                .find(|asteroid| playfield_point_asteroid_hitbox_overlap(bullet.position, asteroid))
                 .map(|asteroid| asteroid.id);
 
             if let Some(asteroid_id) = hit_asteroid_id {
@@ -1351,11 +1452,10 @@ impl GameState {
             return;
         }
         let hit_ship = self.asteroids.iter().any(|asteroid| {
-            playfield_circles_overlap(
+            playfield_original_hitbox_overlap(
                 self.ship.position,
-                SHIP_COLLISION_RADIUS_NDC,
                 asteroid.position,
-                asteroid.radius_ndc(),
+                asteroid.size.original_hitbox_ndc() + SHIP_ORIGINAL_HITBOX_ADDITION_NDC,
             )
         });
         if hit_ship {
@@ -1399,7 +1499,7 @@ impl GameState {
         }
     }
 
-    fn resolve_asteroid_ufo_collisions(&mut self, local_x_scale: f32) {
+    fn resolve_asteroid_ufo_collisions(&mut self, _local_x_scale: f32) {
         let Some(ufo) = self.ufo else {
             return;
         };
@@ -1407,11 +1507,10 @@ impl GameState {
             .asteroids
             .iter()
             .find(|asteroid| {
-                playfield_circle_ufo_outline_overlap(
+                playfield_original_hitbox_overlap(
+                    ufo.position,
                     asteroid.position,
-                    asteroid.radius_ndc(),
-                    ufo,
-                    local_x_scale,
+                    asteroid.size.original_hitbox_ndc(),
                 )
             })
             .map(|asteroid| asteroid.id);
@@ -1595,7 +1694,11 @@ fn next_ufo_spawn_reload_ticks(current_ticks: u32) -> u32 {
 }
 
 fn ufo_spawn_interval_seconds_from_ticks(ticks: u32) -> f32 {
-    ticks as f32 * UFO_ORIGINAL_TIMER_TICK_SECONDS
+    ticks as f32 * UFO_ORIGINAL_TIMER_TICK_SECONDS * UFO_SPAWN_INTERVAL_SCALE
+}
+
+fn ufo_first_shot_interval_seconds() -> f32 {
+    UFO_FIRST_SHOT_RELOAD_TICKS as f32 * UFO_ORIGINAL_TIMER_TICK_SECONDS
 }
 
 pub fn displayed_lives(lives: u32) -> u32 {
@@ -1613,10 +1716,7 @@ fn ufo_shot_interval_seconds() -> f32 {
     UFO_SHOT_RELOAD_TICKS as f32 * UFO_ORIGINAL_TIMER_TICK_SECONDS
 }
 
-/// Closed DESIGN collision-model question: most gameplay collisions use
-/// circle-vs-circle tests with sprite-extent radii. The UFO uses its rendered
-/// outline segments so near misses above and below the shallow saucer do not
-/// register as hits.
+/// Basic circle helper retained for non-asteroid cases and tests.
 pub fn circles_overlap(center_a: Vec2, radius_a: f32, center_b: Vec2, radius_b: f32) -> bool {
     let combined_radius = radius_a.max(0.0) + radius_b.max(0.0);
     (center_a - center_b).length_squared() <= combined_radius * combined_radius
@@ -1626,6 +1726,28 @@ fn playfield_circles_overlap(center_a: Vec2, radius_a: f32, center_b: Vec2, radi
     let delta = wrapped_delta(center_a, center_b);
     let combined_radius = radius_a.max(0.0) + radius_b.max(0.0);
     delta.length_squared() <= combined_radius * combined_radius
+}
+
+fn playfield_point_asteroid_hitbox_overlap(point: Vec2, asteroid: &Asteroid) -> bool {
+    playfield_original_hitbox_overlap(
+        point,
+        asteroid.position,
+        asteroid.size.original_hitbox_ndc(),
+    )
+}
+
+/// Original asteroid hit detection at $69F0-$6A91 first checks a square
+/// hitbox, then rejects corners with `abs(dx) + abs(dy) >= 1.5 * hitbox`.
+fn playfield_original_hitbox_overlap(center_a: Vec2, center_b: Vec2, hitbox: f32) -> bool {
+    let delta = wrapped_delta(center_a, center_b);
+    original_hitbox_overlap(delta, hitbox)
+}
+
+fn original_hitbox_overlap(delta: Vec2, hitbox: f32) -> bool {
+    let hitbox = hitbox.max(0.0);
+    let dx = delta.x.abs();
+    let dy = delta.y.abs();
+    dx <= hitbox && dy <= hitbox && dx + dy < hitbox * 1.5
 }
 
 fn playfield_circle_ufo_outline_overlap(
@@ -1771,7 +1893,62 @@ fn random_ufo_vertical_velocity(rng: &mut SeededRng) -> f32 {
 }
 
 fn random_direction(rng: &mut SeededRng) -> Vec2 {
-    let angle = rng.next_f32() * TAU;
+    direction_from_byte(random_byte(rng))
+}
+
+fn random_byte(rng: &mut SeededRng) -> u8 {
+    rng.next_u64() as u8
+}
+
+fn small_ufo_shot_direction(
+    ship_position: Vec2,
+    ufo_position: Vec2,
+    ufo_velocity: Vec2,
+    score: u32,
+    random_byte: u8,
+) -> Vec2 {
+    let target = wrapped_delta(ship_position, ufo_position)
+        - ufo_velocity * UFO_SMALL_AIM_VELOCITY_BIAS_SECONDS;
+    let base_direction = target.normalized_or(Vec2::X);
+    rotate_direction_by_byte_offset(
+        base_direction,
+        small_ufo_scaled_aim_error_direction_units(score, random_byte),
+    )
+}
+
+fn small_ufo_scaled_aim_error_direction_units(score: u32, random_byte: u8) -> f32 {
+    small_ufo_aim_error_direction_units(score, random_byte) as f32 * UFO_SMALL_AIM_ERROR_SCALE
+}
+
+fn small_ufo_aim_error_direction_units(score: u32, random_byte: u8) -> i8 {
+    let (mask, negative_or) = if score >= UFO_AIM_HIGH_SCORE_THRESHOLD {
+        (
+            UFO_AIM_HIGH_SCORE_RANDOM_MASK,
+            UFO_AIM_HIGH_SCORE_NEGATIVE_OR,
+        )
+    } else {
+        (UFO_AIM_LOW_SCORE_RANDOM_MASK, UFO_AIM_LOW_SCORE_NEGATIVE_OR)
+    };
+    let masked = random_byte & mask;
+    let offset = if masked & 0x80 != 0 {
+        masked | negative_or
+    } else {
+        masked
+    };
+    offset as i8
+}
+
+fn rotate_direction_by_byte_offset(direction: Vec2, offset: f32) -> Vec2 {
+    let angle = offset * TAU / 256.0;
+    let (sin, cos) = angle.sin_cos();
+    Vec2::new(
+        direction.x * cos - direction.y * sin,
+        direction.x * sin + direction.y * cos,
+    )
+}
+
+fn direction_from_byte(direction: u8) -> Vec2 {
+    let angle = direction as f32 * TAU / 256.0;
     let (sin, cos) = angle.sin_cos();
     Vec2::new(cos, sin)
 }
@@ -2642,6 +2819,48 @@ mod tests {
     }
 
     #[test]
+    fn asteroid_hulls_use_original_vector_rom_rock_patterns() {
+        let first = AsteroidHull::original_pattern(0);
+        assert_eq!(first.vertices().len(), 10);
+        assert_eq!(first.vertices()[0], Vec2::new(0.0, 0.5));
+        assert_eq!(first.vertices()[1], Vec2::new(0.5, 1.0));
+        assert_eq!(first.vertices()[9], Vec2::new(-0.5, 1.0));
+
+        let fourth = AsteroidHull::original_pattern(3);
+        assert_eq!(fourth.vertices().len(), 12);
+        assert_eq!(fourth.vertices()[0], Vec2::new(0.25, 0.0));
+        assert_eq!(fourth.vertices()[11], Vec2::new(1.0, -0.5));
+    }
+
+    #[test]
+    fn original_asteroid_hitbox_rejects_square_corners() {
+        let hitbox = AsteroidSize::Large.original_hitbox_ndc();
+
+        assert!(original_hitbox_overlap(Vec2::new(hitbox, 0.0), hitbox));
+        assert!(original_hitbox_overlap(Vec2::new(0.0, hitbox), hitbox));
+        assert!(!original_hitbox_overlap(
+            Vec2::new(hitbox * 0.9, hitbox * 0.7),
+            hitbox
+        ));
+    }
+
+    #[test]
+    fn bullet_asteroid_collision_uses_original_size_hitbox() {
+        let mut state = state_with_one_asteroid(AsteroidSize::Large);
+        let hitbox = AsteroidSize::Large.original_hitbox_ndc();
+        state.bullets.push(Bullet::new(
+            1,
+            Vec2::new(hitbox * 0.9, hitbox * 0.7),
+            Vec2::ZERO,
+        ));
+
+        state.resolve_bullet_asteroid_collisions();
+
+        assert_eq!(state.asteroids.len(), 1);
+        assert_eq!(state.bullets.len(), 1);
+    }
+
+    #[test]
     fn circle_collision_counts_overlap_and_edge_touch_but_not_separation() {
         assert!(circles_overlap(Vec2::ZERO, 0.5, Vec2::new(0.75, 0.0), 0.3));
         assert!(circles_overlap(Vec2::ZERO, 0.5, Vec2::new(0.8, 0.0), 0.3));
@@ -3097,6 +3316,16 @@ mod tests {
     }
 
     #[test]
+    fn ufo_spawn_interval_applies_gameplay_pacing_scale() {
+        assert!(
+            (ufo_spawn_interval_seconds_from_ticks(1)
+                - UFO_ORIGINAL_TIMER_TICK_SECONDS * UFO_SPAWN_INTERVAL_SCALE)
+                .abs()
+                < EPSILON
+        );
+    }
+
+    #[test]
     fn ufo_spawn_decrements_reload_before_resetting_timer() {
         let mut state = empty_test_state();
 
@@ -3114,6 +3343,52 @@ mod tests {
                 - ufo_spawn_interval_seconds_from_ticks(state.ufo_spawn_reload_ticks))
             .abs()
                 < EPSILON
+        );
+    }
+
+    #[test]
+    fn ufo_first_shot_uses_original_initial_timer_reload() {
+        let ufo = Ufo::new(1, UfoVariant::Large, Vec2::ZERO, Vec2::ZERO);
+
+        assert!(
+            (ufo_first_shot_interval_seconds()
+                - UFO_FIRST_SHOT_RELOAD_TICKS as f32 * UFO_ORIGINAL_TIMER_TICK_SECONDS)
+                .abs()
+                < EPSILON
+        );
+        assert!((ufo.shot_timer_seconds - ufo_first_shot_interval_seconds()).abs() < EPSILON);
+        assert!(ufo_first_shot_interval_seconds() > ufo_shot_interval_seconds());
+    }
+
+    #[test]
+    fn newly_spawned_ufo_waits_before_first_shot() {
+        let mut state = empty_test_state();
+        state.ship.position = Vec2::new(-0.6, 0.0);
+        state.ufo = Some(Ufo::new(
+            1,
+            UfoVariant::Large,
+            Vec2::new(0.4, 0.0),
+            Vec2::ZERO,
+        ));
+        let first_shot_tick =
+            (ufo_first_shot_interval_seconds() / FIXED_TIMESTEP_SECONDS).round() as usize;
+
+        for _ in 0..first_shot_tick.saturating_sub(1) {
+            state.step(&ControlState::default(), FIXED_TIMESTEP_SECONDS);
+        }
+        assert!(state.ufo_bullets.is_empty());
+
+        state.step(&ControlState::default(), FIXED_TIMESTEP_SECONDS);
+        if state.ufo_bullets.is_empty() {
+            state.step(&ControlState::default(), FIXED_TIMESTEP_SECONDS);
+        }
+
+        assert_eq!(state.ufo_bullets.len(), 1);
+        assert!(
+            state
+                .events()
+                .iter()
+                .any(|event| event.kind == GameEventKind::UfoFiredRandom)
         );
     }
 
@@ -3150,11 +3425,56 @@ mod tests {
     }
 
     #[test]
+    fn small_ufo_aim_error_matches_original_score_masks() {
+        assert_eq!(small_ufo_aim_error_direction_units(0, 0x00), 0);
+        assert_eq!(small_ufo_aim_error_direction_units(0, 0x0F), 15);
+        assert_eq!(small_ufo_aim_error_direction_units(0, 0x80), -16);
+        assert_eq!(small_ufo_aim_error_direction_units(0, 0x8F), -1);
+
+        assert_eq!(
+            small_ufo_aim_error_direction_units(UFO_AIM_HIGH_SCORE_THRESHOLD, 0x0F),
+            7
+        );
+        assert_eq!(
+            small_ufo_aim_error_direction_units(UFO_AIM_HIGH_SCORE_THRESHOLD, 0x80),
+            -8
+        );
+        assert_eq!(
+            small_ufo_aim_error_direction_units(UFO_AIM_HIGH_SCORE_THRESHOLD, 0x87),
+            -1
+        );
+    }
+
+    #[test]
+    fn small_ufo_aim_applies_score_gated_tuned_random_offset() {
+        let low_score_direction =
+            small_ufo_shot_direction(Vec2::X, Vec2::ZERO, Vec2::ZERO, 0, 0x0F);
+        let high_score_direction = small_ufo_shot_direction(
+            Vec2::X,
+            Vec2::ZERO,
+            Vec2::ZERO,
+            UFO_AIM_HIGH_SCORE_THRESHOLD,
+            0x0F,
+        );
+
+        assert_vec2_close(
+            low_score_direction,
+            rotate_direction_by_byte_offset(Vec2::X, 15.0 * UFO_SMALL_AIM_ERROR_SCALE),
+        );
+        assert_vec2_close(
+            high_score_direction,
+            rotate_direction_by_byte_offset(Vec2::X, 7.0 * UFO_SMALL_AIM_ERROR_SCALE),
+        );
+    }
+
+    #[test]
     fn ufo_large_scenario_spawns_and_fires_randomly() {
         let mut state = GameState::ufo_large_scenario(Some(1));
         let events = step_for_seconds(
             &mut state,
-            ufo_spawn_interval_seconds_from_ticks(UFO_SPAWN_RELOAD_INITIAL_TICKS) + 0.8,
+            ufo_spawn_interval_seconds_from_ticks(UFO_SPAWN_RELOAD_INITIAL_TICKS)
+                + ufo_first_shot_interval_seconds()
+                + 0.1,
         );
 
         assert!(events.iter().any(|event| {
@@ -3168,7 +3488,9 @@ mod tests {
         let mut state = GameState::ufo_small_scenario(Some(1));
         let events = step_for_seconds(
             &mut state,
-            ufo_spawn_interval_seconds_from_ticks(UFO_SMALL_VARIANT_CHECK_RELOAD_TICKS) + 0.8,
+            ufo_spawn_interval_seconds_from_ticks(UFO_SMALL_VARIANT_CHECK_RELOAD_TICKS)
+                + ufo_first_shot_interval_seconds()
+                + 0.1,
         );
 
         assert!(events.iter().any(|event| {
@@ -3251,6 +3573,21 @@ mod tests {
             }
         }
         panic!("asteroids did not spawn after level start delay");
+    }
+
+    fn assert_vec2_close(actual: Vec2, expected: Vec2) {
+        assert!(
+            (actual.x - expected.x).abs() < EPSILON,
+            "actual.x={}, expected.x={}",
+            actual.x,
+            expected.x
+        );
+        assert!(
+            (actual.y - expected.y).abs() < EPSILON,
+            "actual.y={}, expected.y={}",
+            actual.y,
+            expected.y
+        );
     }
 
     fn state_with_one_asteroid(size: AsteroidSize) -> GameState {
