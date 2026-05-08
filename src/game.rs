@@ -50,7 +50,11 @@ pub const ASTEROIDS_PER_WAVE_MAX: u32 = 11;
 pub const ASTEROID_HULL_VERTEX_COUNT: usize = 12;
 pub const ASTEROID_ORIGINAL_PATTERN_COUNT: usize = 4;
 pub const INITIAL_LIVES: u32 = 3;
-pub const BULLET_SPEED_NDC_PER_SEC: f32 = 1.65;
+/// Original player shot generation at $6D04-$6D27 uses the thrust table's
+/// maximum `$7f` component, then rotates right once before storing velocity.
+const ORIGINAL_PLAYER_SHOT_RAW_SPEED: f32 = 0x3f as f32;
+pub const BULLET_SPEED_NDC_PER_SEC: f32 =
+    ORIGINAL_PLAYER_SHOT_RAW_SPEED * tuning::ASTEROID_RAW_VELOCITY_TO_NDC_PER_SEC;
 pub const BULLET_RADIUS_NDC: f32 = 0.012;
 pub const BULLET_RENDER_RADIUS_NDC: f32 = 0.0045;
 /// Original player fire state has four ship-shot timer slots at $021F-$0222,
@@ -89,7 +93,7 @@ const UFO_SPAWN_RELOAD_INITIAL_TICKS: u32 = 0x92;
 const UFO_SPAWN_RELOAD_DECREMENT_TICKS: u32 = 0x06;
 const UFO_SPAWN_RELOAD_MIN_TICKS: u32 = 0x20;
 /// Gameplay pacing multiplier over the original saucer reload timer.
-const UFO_SPAWN_INTERVAL_SCALE: f32 = 4.0;
+const UFO_SPAWN_INTERVAL_SCALE: f32 = 2.0;
 const UFO_SMALL_VARIANT_CHECK_RELOAD_TICKS: u32 = 0x80;
 const UFO_FIRST_SHOT_RELOAD_TICKS: u32 = 0x12;
 const UFO_SHOT_RELOAD_TICKS: u32 = 0x0A;
@@ -2945,6 +2949,17 @@ mod tests {
         assert!((PLAYER_SHOT_TIMER_RELOAD_TICKS - 18.0).abs() < EPSILON);
         assert!((PLAYER_SHOT_TIMER_TICK_SECONDS - 4.0 / 60.0).abs() < EPSILON);
         assert!((BULLET_LIFETIME_SECONDS - 1.2).abs() < EPSILON);
+    }
+
+    #[test]
+    fn player_shot_range_matches_original_velocity_scale() {
+        assert!(
+            (BULLET_SPEED_NDC_PER_SEC
+                - ORIGINAL_PLAYER_SHOT_RAW_SPEED * tuning::ASTEROID_RAW_VELOCITY_TO_NDC_PER_SEC)
+                .abs()
+                < EPSILON
+        );
+        assert!((BULLET_SPEED_NDC_PER_SEC * BULLET_LIFETIME_SECONDS - 1.4765625).abs() < EPSILON);
     }
 
     #[test]
